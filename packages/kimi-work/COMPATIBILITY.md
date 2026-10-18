@@ -1,5 +1,20 @@
 # macOS compatibility record
 
+## Upgrade 0.1.5: membership renewal and monthly usage
+
+Observed on Apple-silicon macOS at **2026-10-18 01:43 UTC**, using official Magpie **0.1.1279** and Bun **1.4.3**. This run used a disposable HOME and XDG profile. Only the local desktop Work/membership credential fields were copied into that private test home; the everyday Magpie profile and Kimi desktop files were not changed.
+
+- The saved desktop membership access token returned HTTP **401** before the test.
+- `magpie plugin add <local-kimi-work-folder>` and `magpie plugin login kimi-work 1` succeeded in the isolated profile.
+- The plugin renewed the membership session directly with Kimi and saved a changed access token **and** refresh token into the isolated host's `plugin-auth.json`. Its observed mode was **0600**. The Work API key was absent from that store.
+- The saved new access token read `GetSubscriptionStats` with HTTP **200**. `magpie quota kimi-work --json` showed **月度共享额度** and **其中 Kimi Code（月度总额占比）**. The live Code fraction was nested at `subscriptionBalance.kimiCodeUsedRatio`; no account-specific usage values are included in this record.
+- A separate Magpie process ran `magpie quota refresh kimi-work --json`, explicitly asking for a fresh read, and returned the monthly window without an error. It reused the saved new access/refresh pair. No browser, cookies, desktop IPC or new human login was used.
+- Content hashes of the existing Magpie providers, settings, plugin list and plugin auth, and the existing Kimi desktop configuration, were unchanged. The disposable home and its credentials were removed afterward.
+
+The renewal RPC/rotation format was also checked against Kimi's current public [web token module](https://statics.moonshot.cn/kimi-web-seo/assets/token-Cpryl615.js). This is an undocumented service. One successful rotation and a separate-process fresh quota read do not establish months of session survival or the server's revocation policy. This upgrade did not send a new inference request; earlier live Work streaming evidence remains below.
+
+Local checks: **38 provider tests passed**, **1803 full-repository tests passed**, and `bun scripts/check.mjs` passed for every provider. Synthetic cases cover concurrent host/usage renewal, one retry after a 401, persistence failure and recovery, process restart, legacy import/account binding, rejected/transient renewal, account replacement and metadata changes during an exchange, and missing monthly data. Existing Work inference/stream/tool/header/error regression cases continue to pass.
+
 ## Upgrade 0.1.4
 
 On Windows 11, 2026-10-17, the upgraded provider read the existing ordinary desktop Work sign-in and live model catalog/usage. An isolated adapter inserted a shared instruction and passed its messages through this provider unchanged to the real Work service. The streamed response was HTTP 200 with `[DONE]` and the exact marker present only in that instruction. The live desktop applications and their configurations were not switched for this request. Synthetic regression tests cover credential rotation, account binding, Request bodies, prompt/tool/stream preservation, expired sign-in, unchanged concurrency/quota/5xx responses, network diagnostics, cancellation and read-only desktop import.

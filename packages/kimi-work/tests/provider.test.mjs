@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {_internal as I} from '../index.mjs';
 
-const session={uid:'fixture-account',workToken:'synthetic-work-token',webToken:'synthetic-web-token'};
-const account={source:'kimi-work-desktop',uid:session.uid};
+const session={uid:'fixture-account',workToken:'synthetic-work-token',webToken:'synthetic-web-token',webRefresh:'synthetic-refresh-token'};
+const account={source:'kimi-work-desktop',uid:session.uid,access:session.webToken,refresh:session.webRefresh,expires:0};
 const json=x=>Response.json(x);
 const modelPayload={data:[{id:'k3-agent',display_name:'K3',context_length:1000000,supports_image_in:true,
   supports_reasoning:true,reasoningEffortOptions:[{effort:'REASONING_EFFORT_HIGH'}]}]};
@@ -24,12 +24,12 @@ test('desktop import reads only the Work credential origin and supports a redire
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('sign-in persists an account reference without either actual token',async()=>{
+test('sign-in imports web credentials without copying the Work API key',async()=>{
   const p=I.createPlugin({readSession:()=>session,fetchImpl:async()=>json(modelPayload)});
   const flow=await p.auth.methods[0].authorize(),auth=await flow.callback();
   expect(auth).toMatchObject({type:'success',source:'kimi-work-desktop',uid:session.uid});
   expect(JSON.stringify(auth)).not.toContain(session.workToken);
-  expect(JSON.stringify(auth)).not.toContain(session.webToken);
+  expect(auth).toMatchObject({access:session.webToken,refresh:session.webRefresh});
 });
 
 test('inference always uses the Work gateway and live Work credential, preserving stream, tools and cancellation',async()=>{
@@ -67,7 +67,7 @@ test('models come from Work; usage reports only the shared membership allowance'
   expect(models['k3-agent'].capabilities.input.image).toBe(true);
   const usage=await p.auth.usage(async()=>account);expect(usage.windows).toHaveLength(1);expect(usage.windows[0].used).toBe(42);
   expect(usage.windows[0]).not.toHaveProperty('resetsAt');
-  expect(usage.windows[0].name).toBe('会员共享额度');
+  expect(usage.windows[0].name).toBe('月度共享额度');
   expect(calls[1].init.headers.Authorization).toBe('Bearer '+session.webToken);
   expect(calls.every(x=>!x.url.includes('api.kimi.com'))).toBe(true);
 });
