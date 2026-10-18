@@ -138,8 +138,8 @@ test('another plugin instance reads the pair persisted by the host without deskt
   });
   expect(await next.auth.refresh(saved)).toBeUndefined();
   const usage=await next.auth.usage(async()=>saved);
-  expect(usage.windows).toEqual([{name:'月度共享额度',used:45.15},
-    {name:'其中 Kimi Code（月度总额占比）',used:24.22,aside:true}]);
+  expect(usage.plan).toBe('月度共享额度');
+  expect(usage.windows).toEqual([{name:'本月',used:45.15,display:'Code 已用 24.22%（占总额）'}]);
   expect(usage.windows.every(w=>!('resetsAt' in w))).toBe(true);
 });
 

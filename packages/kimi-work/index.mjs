@@ -204,10 +204,13 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
         // handled with a blind auth.set that could undo logout/reconnection.
         const j=await jsonRequest(MEMBER+'GetSubscriptionStats',auth.access,{});
         const b=j.subscriptionBalance,used=percent(b?.amountUsedRatio);
-        const windows=used===undefined?[]:[{name:'月度共享额度',used}];
+        const windows=used===undefined?[]:[{name:'本月',used}];
         const code=percent(b?.kimiCodeUsedRatio);
-        if(used!==undefined && code!==undefined)windows.push({name:'其中 Kimi Code（月度总额占比）',used:code,aside:true});
-        return {plan:'Kimi Work · 月度共享额度',windows};
+        // Magpie draws every window as an independent allowance, even aside
+        // ones. Code is part of this pool: keep it in the count/tooltip text,
+        // never turn its used share into another "remaining" quota ring.
+        if(windows.length && code!==undefined)windows[0].display='Code 已用 '+Number(code.toFixed(2))+'%（占总额）';
+        return {plan:'月度共享额度',windows};
       },
     },
     provider:{id:ID,models:async(provider,{auth}={})=>{

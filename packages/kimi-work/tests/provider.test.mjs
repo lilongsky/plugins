@@ -67,7 +67,7 @@ test('models come from Work; usage reports only the shared membership allowance'
   expect(models['k3-agent'].capabilities.input.image).toBe(true);
   const usage=await p.auth.usage(async()=>account);expect(usage.windows).toHaveLength(1);expect(usage.windows[0].used).toBe(42);
   expect(usage.windows[0]).not.toHaveProperty('resetsAt');
-  expect(usage.windows[0].name).toBe('月度共享额度');
+  expect(usage.windows[0].name).toBe('本月');
   expect(calls[1].init.headers.Authorization).toBe('Bearer '+session.webToken);
   expect(calls.every(x=>!x.url.includes('api.kimi.com'))).toBe(true);
 });

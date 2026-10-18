@@ -22,7 +22,7 @@ test('sign-in imports web renewal credentials and dynamic models/usage retain Wo
   const catalog = await p.provider.models({models: {}}, {auth});
   expect(catalog['k3-agent'].limit.context).toBe(262144);
   expect(Object.keys(catalog['k3-agent'].variants)).toEqual(['low', 'max']);
-  expect((await p.auth.usage(async () => auth)).windows).toEqual([{name: '月度共享额度', used: 42}]);
+  expect((await p.auth.usage(async () => auth)).windows).toEqual([{name: '本月', used: 42}]);
   expect(calls.at(-1).init.headers.Authorization).toBe('Bearer ' + session.webToken);
 });
 
