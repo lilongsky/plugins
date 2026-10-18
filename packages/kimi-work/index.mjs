@@ -13,9 +13,11 @@ const UA = 'Magpie Kimi Work provider/' + version;
 const expired = () => Object.assign(Error('请先在本机 Kimi 桌面版登录 Work，再重新连接 Kimi Work 供应商。'), {signIn:'expired',code:'kimi_work_login_expired'});
 const unavailable = error => Object.assign(Error('Kimi Work 连接失败：' + (error?.cause?.code || error?.message || '未知网络错误'), {cause:error}), {code:'kimi_work_connection_failed'});
 const percent = x => typeof x === 'number' && Number.isFinite(x) ? Math.max(0,Math.min(100,x*100)) : undefined;
-const storeFailed = () => Object.assign(Error('Kimi Work 无法保存登录凭证，请检查凭证存储后重试。'), {code:'kimi_work_auth_store_failed'});
 function tokenClaims(token) {
-  try {return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));} catch {return {};}
+  try {
+    const claims=JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    return claims && typeof claims==='object' ? claims : {};
+  } catch {return {};}
 }
 const expiry = token => Number(tokenClaims(token).exp) * 1000 || 0;
 
@@ -66,7 +68,7 @@ function modelRows(payload) {
   return out;
 }
 
-function createPlugin({client,readSession=readDesktop,fetchImpl=globalThis.fetch,now=Date.now}={}) {
+function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Date.now}={}) {
   const current=auth=>{
     const session=readSession();
     if(auth?.source!=='kimi-work-desktop'||auth.uid!==session.uid)throw expired();
@@ -84,80 +86,61 @@ function createPlugin({client,readSession=readDesktop,fetchImpl=globalThis.fetch
     if(Buffer.byteLength(text)>2*1024*1024)throw Error('Kimi Work 响应过大。');
     try{return JSON.parse(text);}catch{throw Error('Kimi Work 响应格式无效。');}
   }
-  // Share renewal between auth.refresh and usage, including the interval
-  // before the host saves auth.refresh's result. Keep a rotated pair in memory
-  // if saving fails so a retry never spends the previous refresh token again.
+  // Only auth.refresh rotates. Magpie commits its return value under the auth
+  // store lock, checking that the original access/refresh pair still stands.
+  // A plugin-side getAuth + auth.set cannot make that check atomic.
+  // Remember rotations after a failed host save, by exact input pair rather
+  // than uid: a reconnect can have the same uid and independent credentials.
   const renewing=new Map(), renewed=new Map();
   const valid=auth=>auth?.source==='kimi-work-desktop' && typeof auth.uid==='string' && !!auth.uid;
+  const hasPair=auth=>valid(auth) && typeof auth.access==='string' && !!auth.access
+    && typeof auth.refresh==='string' && !!auth.refresh;
+  const credentialKey=auth=>JSON.stringify([auth.uid,auth.access,auth.refresh]);
   const latest=auth=>{
-    const r=renewed.get(auth.uid);
-    return r && (auth.refresh===r.spent || auth.refresh===r.next.refresh) ? {...auth,...r.next} : auth;
+    const seen=new Set();let a=auth;
+    for(let key=credentialKey(a);renewed.has(key)&&!seen.has(key);key=credentialKey(a)) {
+      seen.add(key);a={...a,...renewed.get(key)};
+    }
+    return a;
+  };
+  const remember=(key,pair)=>{
+    // A server-expired replacement refresh token cannot recover that entry.
+    for(const [k,v] of renewed) {
+      const until=expiry(v.refresh);
+      if(until>0 && until<=now())renewed.delete(k);
+    }
+    renewed.set(key,pair);
   };
   const due=auth=>auth.expires>0 && auth.expires<=now()+REFRESH_LEAD;
-  async function save(getAuth, before, next) {
-    if(!client?.auth?.set)throw storeFailed();
-    const current=await getAuth();
-    // Do not restore a login removed or replaced while the request was away.
-    if(!valid(current) || current.uid!==before.uid ||
-      (current.refresh!==before.refresh && current.refresh!==next.refresh))throw expired();
-    try {
-      const result=await client.auth.set({path:{id:ID},body:{...current,type:'oauth',
-        access:next.access,refresh:next.refresh,expires:next.expires}});
-      if(result?.error)throw storeFailed();
-    } catch {throw storeFailed();}
-  }
-  async function webAuth(getAuth) {
-    let auth=await getAuth();
-    if(!valid(auth))throw expired();
-    if(!auth.access || !auth.refresh) {
-      const s=current(auth);
-      if(!s.webRefresh)throw expired();
-      const imported={...auth,access:s.webToken,refresh:s.webRefresh,expires:expiry(s.webToken)};
-      await save(getAuth,auth,imported);auth=imported;
-    }
-    const next=latest(auth);
-    if(next.access!==auth.access || next.refresh!==auth.refresh)await save(getAuth,auth,next);
-    return next;
-  }
-  async function renew(auth,force=false) {
-    if(!valid(auth) || !auth.access || !auth.refresh)throw expired();
-    const pending=renewing.get(auth.uid);
-    if(pending) {await pending;return renew(auth,force);}
+  async function renew(auth) {
     const a=latest(auth);
-    if(force ? a.access!==auth.access : !due(a))return a;
-    const run=(async()=>{
+    if(!due(a))return a;
+    // A reconnect is a new token lineage even when it has the same user id.
+    // It must not wait for (or inherit an error from) the previous login.
+    const key=credentialKey(a);
+    let run=renewing.get(key);
+    if(!run)run=(async()=>{
       let j;
       try {j=await jsonRequest(REFRESH,undefined,{refresh_token:a.refresh});}
       catch(error) {
         if(error?.signIn==='expired')throw error;
         throw Error('Kimi Work 登录续期暂不可用，请稍后重试。');
       }
-      const access=j.access_token??j.accessToken,refresh=j.refresh_token??j.refreshToken;
+      const access=j?.access_token??j?.accessToken,refresh=j?.refresh_token??j?.refreshToken;
       const expires=expiry(access),oldSub=tokenClaims(a.access).sub,newSub=tokenClaims(access).sub;
       if(typeof access!=='string'||!access||typeof refresh!=='string'||!refresh||expires<=now()||!Number.isFinite(expires)
         || (oldSub && newSub && oldSub!==newSub))throw Error('Kimi Work 续期响应格式无效。');
-      const pair={access,refresh,expires};
-      renewed.set(a.uid,{spent:a.refresh,next:pair});
-      return {...a,...pair};
+      return {access,refresh,expires};
     })();
-    renewing.set(a.uid,run);
-    try {return await run;} finally {renewing.delete(a.uid);}
-  }
-  async function membership(getAuth) {
-    const before=await webAuth(getAuth);
-    // Refuse to consume a refresh token when the host cannot save its result.
-    if(due(before) && !client?.auth?.set)throw storeFailed();
-    let auth=await renew(before);
-    const rotated=auth.access!==before.access || auth.refresh!==before.refresh;
-    if(rotated)await save(getAuth,before,auth);
-    try {return await jsonRequest(MEMBER+'GetSubscriptionStats',auth.access,{});}
-    catch(error) {
-      if(error?.signIn!=='expired' || rotated)throw error;
-      if(!client?.auth?.set)throw storeFailed();
-      const next=await renew(auth,true);
-      await save(getAuth,auth,next);
-      return jsonRequest(MEMBER+'GetSubscriptionStats',next.access,{});
-    }
+    renewing.set(key,run);
+    try {
+      const pair=await run;
+      // Also advance an older stored input when its cached access token has
+      // expired during a continuing save failure. Its refresh must stay live.
+      remember(key,pair);
+      renewed.set(credentialKey(auth),pair);
+      return {...auth,...pair};
+    } finally {if(renewing.get(key)===run)renewing.delete(key);}
   }
   return {
     config:async cfg=>{
@@ -182,7 +165,7 @@ function createPlugin({client,readSession=readDesktop,fetchImpl=globalThis.fetch
       })}],
       refreshLead:REFRESH_LEAD,
       async refresh(auth) {
-        if(!valid(auth) || !auth.access || !auth.refresh)return;
+        if(!hasPair(auth))return;
         const next=await renew(auth);
         if(next.access!==auth.access || next.refresh!==auth.refresh)
           return {access:next.access,refresh:next.refresh,expires:next.expires};
@@ -215,7 +198,11 @@ function createPlugin({client,readSession=readDesktop,fetchImpl=globalThis.fetch
         },
       }),
       usage:async getAuth=>{
-        const j=await membership(getAuth);
+        const auth=await getAuth();
+        if(!hasPair(auth))throw expired();
+        // The host refreshes before calling usage. A 401 is reported, never
+        // handled with a blind auth.set that could undo logout/reconnection.
+        const j=await jsonRequest(MEMBER+'GetSubscriptionStats',auth.access,{});
         const b=j.subscriptionBalance,used=percent(b?.amountUsedRatio);
         const windows=used===undefined?[]:[{name:'月度共享额度',used}];
         const code=percent(b?.kimiCodeUsedRatio);
@@ -230,5 +217,5 @@ function createPlugin({client,readSession=readDesktop,fetchImpl=globalThis.fetch
   };
 }
 
-export default async function KimiWorkProvider({client}={}){return createPlugin({client});}
+export default async function KimiWorkProvider(){return createPlugin();}
 export const _internal={createPlugin,readDesktop,desktopFile,modelRows,BASE,MEMBER,REFRESH,REFRESH_LEAD,UA,expiry};

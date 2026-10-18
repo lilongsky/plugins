@@ -3,200 +3,182 @@ import {_internal as I} from './index.mjs';
 
 const NOW=1900000000000;
 const jwt=(sub,exp,tag='fixture')=>'fixture.'+Buffer.from(JSON.stringify({sub,exp:exp/1000,tag})).toString('base64url')+'.fixture';
-const account=(uid='fixture-account')=>({type:'oauth',source:'kimi-work-desktop',uid,
-  access:jwt(uid,NOW-1000),refresh:'synthetic-refresh-'+uid,expires:NOW-1000});
-const rotated=(uid='fixture-account',tag='new')=>({access_token:jwt(uid,NOW+900000,tag),refresh_token:'synthetic-rotated-'+uid+'-'+tag});
+const account=(uid='fixture-account',tag='old')=>({type:'oauth',source:'kimi-work-desktop',uid,
+  access:jwt(uid,NOW-1000,tag),refresh:'synthetic-refresh-'+uid+'-'+tag,expires:NOW-1000});
+const rotated=(uid='fixture-account',tag='new',clock=NOW)=>({access_token:jwt(uid,clock+900000,tag),refresh_token:'synthetic-rotated-'+uid+'-'+tag});
+const fields=p=>({access:p.access_token,refresh:p.refresh_token,expires:I.expiry(p.access_token)});
 const stats={subscriptionBalance:{amountUsedRatio:0.4515,kimiCodeUsedRatio:0.2422,expireTime:'2035-01-01T00:00:00Z'},
   ratelimitCode5h:{ratio:1},ratelimitCode7d:{ratio:1}};
-function fixture({auth=account(),fetchImpl,readSession}={}) {
-  let saved=structuredClone(auth),saves=0,saveError=false;
-  const getAuth=async()=>structuredClone(saved);
-  const client={auth:{set:async({path,body})=>{
-    expect(path.id).toBe('kimi-work');
-    if(saveError)throw Error('synthetic credential must not appear in errors');
-    saved=structuredClone(body);saves++;return {data:true};
-  }}};
-  const p=I.createPlugin({client,readSession:readSession||(()=>{throw Error('No desktop or browser in this fixture');}),fetchImpl,now:()=>NOW});
-  return {p,getAuth,client,get saved(){return saved;},get saves(){return saves;},
-    set failSave(value){saveError=value;},replace:value=>{saved=value;}};
+function deferred() {
+  let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};
+}
+function plugin(fetchImpl,extra={}) {
+  return I.createPlugin({now:()=>NOW,readSession:()=>{throw Error('No desktop or browser in this fixture');},fetchImpl,...extra});
 }
 
-test('expired web credentials rotate and are persisted before membership is queried',async()=>{
-  const calls=[];let f;
-  f=fixture({fetchImpl:async(url,init)=>{
-    calls.push({url,init});
-    if(url===I.REFRESH) {
-      expect(init.method).toBe('POST');expect(init.redirect).toBe('error');
-      expect(init.headers.Authorization).toBeUndefined();expect(init.headers.Cookie).toBeUndefined();
-      expect(JSON.parse(init.body)).toEqual({refresh_token:account().refresh});
-      return Response.json(rotated());
-    }
-    expect(f.saves).toBe(1);expect(f.saved.refresh).toBe(rotated().refresh_token);
-    expect(init.headers.Authorization).toBe('Bearer '+rotated().access_token);
-    return Response.json(stats);
-  }});
-  const usage=await f.p.auth.usage(f.getAuth);
-  expect(calls.map(x=>x.url)).toEqual([I.REFRESH,I.MEMBER+'GetSubscriptionStats']);
-  expect(f.saved).toMatchObject({type:'oauth',uid:account().uid,expires:NOW+900000,refresh:rotated().refresh_token});
+test('host renewal returns only rotated fields and never calls the blind auth.set',async()=>{
+  const calls=[];let writes=0;
+  const p=plugin(async(url,init)=>{
+    calls.push(url);expect(url).toBe(I.REFRESH);
+    expect(init.method).toBe('POST');expect(init.redirect).toBe('error');
+    expect(init.headers.Authorization).toBeUndefined();expect(init.headers.Cookie).toBeUndefined();
+    expect(JSON.parse(init.body)).toEqual({refresh_token:account().refresh});
+    return Response.json(rotated());
+  },{client:{auth:{set:async()=>{writes++;throw Error('Blind writes are forbidden');}}}});
+  expect(await p.auth.refresh(account())).toEqual(fields(rotated()));
+  expect(calls).toEqual([I.REFRESH]);expect(writes).toBe(0);
+});
+
+test('host-save retries reuse the rotated pair without spending the saved old token again',async()=>{
+  let calls=0;
+  const p=plugin(async()=>{calls++;return Response.json(rotated());});
+  expect(await p.auth.refresh(account())).toEqual(fields(rotated()));
+  expect(await p.auth.refresh(account())).toEqual(fields(rotated()));
+  expect(calls).toBe(1);
+});
+
+test('continuing host-save failure advances from the cached refresh even after its access expires',async()=>{
+  let clock=NOW;const spent=[];
+  const p=plugin(async(url,init)=>{
+    spent.push(JSON.parse(init.body).refresh_token);
+    return Response.json(rotated('fixture-account','rotation-'+spent.length,clock));
+  },{now:()=>clock});
+  const first=await p.auth.refresh(account());
+  clock+=900000;
+  const second=await p.auth.refresh(account());
+  expect(spent).toEqual([account().refresh,first.refresh]);
+  expect(await p.auth.refresh(account())).toEqual(second);
+  expect(await p.auth.refresh({...account(),...first})).toEqual(second);
+  expect(spent).toHaveLength(2);
+});
+
+test('concurrent renewal of the exact input pair shares one exchange',async()=>{
+  const gate=deferred(),entered=deferred();let calls=0;
+  const p=plugin(async()=>{calls++;entered.resolve();await gate.promise;return Response.json(rotated());});
+  const one=p.auth.refresh(account());await entered.promise;
+  const two=p.auth.refresh(account());gate.resolve();
+  expect(await one).toEqual(fields(rotated()));expect(await two).toEqual(fields(rotated()));
+  expect(calls).toBe(1);
+});
+
+test('same-uid reconnects with independent due credentials have independent pending work and caches',async()=>{
+  const gate=deferred(),entered=deferred(),old=account(),reconnected=account('fixture-account','reconnected');
+  const spent=[];
+  const p=plugin(async(url,init)=>{
+    const token=JSON.parse(init.body).refresh_token;spent.push(token);
+    if(token===old.refresh){entered.resolve();await gate.promise;return Response.json(rotated('fixture-account','old-lineage'));}
+    return Response.json(rotated('fixture-account','new-lineage'));
+  });
+  const oldRun=p.auth.refresh(old);await entered.promise;
+  const fresh=await p.auth.refresh(reconnected);gate.resolve();const previous=await oldRun;
+  expect(fresh).toEqual(fields(rotated('fixture-account','new-lineage')));
+  expect(previous).toEqual(fields(rotated('fixture-account','old-lineage')));
+  expect(await p.auth.refresh(reconnected)).toEqual(fresh);
+  expect(await p.auth.refresh(old)).toEqual(previous);
+  expect(spent).toEqual([old.refresh,reconnected.refresh]);
+});
+
+test('old pending 401 does not block or expire a same-uid fresh reconnect',async()=>{
+  const gate=deferred(),entered=deferred(),old=account();
+  const fresh={...old,...fields(rotated('fixture-account','reconnected'))};
+  let reads=0;
+  const p=plugin(async url=>{
+    if(url!==I.REFRESH){reads++;return Response.json(stats);}
+    entered.resolve();await gate.promise;return new Response('{}',{status:401});
+  });
+  const oldRun=p.auth.refresh(old).catch(error=>error);await entered.promise;
+  const outcome=await Promise.race([
+    Promise.all([p.auth.refresh(fresh),p.auth.usage(async()=>fresh)]).then(value=>({value})),
+    new Promise(resolve=>setTimeout(()=>resolve({blocked:true}),50)),
+  ]);
+  gate.resolve();const oldError=await oldRun;
+  expect(outcome.blocked).toBeUndefined();expect(outcome.value[0]).toBeUndefined();
+  expect(outcome.value[1].windows[0].used).toBe(45.15);expect(reads).toBe(1);
+  expect(oldError).toMatchObject({signIn:'expired'});
+});
+
+test('usage is read-only and reports a 401 without a forced rotation or direct save',async()=>{
+  let writes=0;const calls=[];
+  const fresh={...account(),...fields(rotated())};
+  const p=plugin(async url=>{calls.push(url);return new Response('{}',{status:401});},
+    {client:{auth:{set:async()=>{writes++;}}}});
+  await expect(p.auth.usage(async()=>fresh)).rejects.toMatchObject({signIn:'expired'});
+  expect(calls).toEqual([I.MEMBER+'GetSubscriptionStats']);expect(writes).toBe(0);
+});
+
+test('completion after logout or replacement only returns fields for the host conditional commit',async()=>{
+  for(const replacement of [undefined,account('fixture-account','replacement')]) {
+    const gate=deferred(),entered=deferred();let saved=account(),writes=0;
+    const p=plugin(async()=>{entered.resolve();await gate.promise;return Response.json(rotated());},
+      {client:{auth:{set:async({body})=>{saved=body;writes++;}}}});
+    const pending=p.auth.refresh(saved);await entered.promise;saved=replacement;gate.resolve();
+    expect(await pending).toEqual(fields(rotated()));
+    expect(saved).toEqual(replacement);expect(writes).toBe(0);
+  }
+});
+
+test('reference-only legacy accounts require explicit reconnect without hidden desktop import or writes',async()=>{
+  let imports=0,calls=0,writes=0;
+  const legacy={source:'kimi-work-desktop',uid:account().uid,access:'',refresh:'',expires:0};
+  const p=plugin(async()=>{calls++;return Response.json(stats);},{
+    readSession:()=>{imports++;return {uid:legacy.uid,webToken:account().access,webRefresh:account().refresh};},
+    client:{auth:{set:async()=>{writes++;}}},
+  });
+  expect(await p.auth.refresh(legacy)).toBeUndefined();
+  await expect(p.auth.usage(async()=>legacy)).rejects.toMatchObject({signIn:'expired'});
+  expect(imports).toBe(0);expect(calls).toBe(0);expect(writes).toBe(0);
+});
+
+test('another plugin instance reads the pair persisted by the host without desktop or browser access',async()=>{
+  const p=plugin(async()=>Response.json(rotated()));
+  const saved={...account(),...await p.auth.refresh(account())};
+  const next=plugin(async(url,init)=>{
+    expect(url).toBe(I.MEMBER+'GetSubscriptionStats');
+    expect(init.headers.Authorization).toBe('Bearer '+saved.access);return Response.json(stats);
+  });
+  expect(await next.auth.refresh(saved)).toBeUndefined();
+  const usage=await next.auth.usage(async()=>saved);
   expect(usage.windows).toEqual([{name:'月度共享额度',used:45.15},
     {name:'其中 Kimi Code（月度总额占比）',used:24.22,aside:true}]);
-  expect(usage.windows.every(x=>!('resetsAt' in x))).toBe(true);
+  expect(usage.windows.every(w=>!('resetsAt' in w))).toBe(true);
 });
 
-test('a server-side 401 refreshes once and retries the same read with the new access token',async()=>{
-  const auth=account();auth.expires=NOW+900000;
-  const calls=[];
-  const f=fixture({auth,fetchImpl:async(url,init)=>{
-    calls.push(url);
-    if(url===I.REFRESH)return Response.json(rotated());
-    return init.headers.Authorization==='Bearer '+auth.access ? new Response('{}',{status:401}) : Response.json(stats);
-  }});
-  await f.p.auth.usage(f.getAuth);
-  expect(calls).toEqual([I.MEMBER+'GetSubscriptionStats',I.REFRESH,I.MEMBER+'GetSubscriptionStats']);
-  expect(f.saves).toBe(1);
-});
-
-test('a freshly issued access token rejected by membership is not refreshed in a loop',async()=>{
-  let refreshes=0;
-  const f=fixture({fetchImpl:async url=>url===I.REFRESH ? (refreshes++,Response.json(rotated())) : new Response('{}',{status:401})});
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toMatchObject({signIn:'expired'});
-  expect(refreshes).toBe(1);expect(f.saves).toBe(1);
-});
-
-test('concurrent usage and host renewal share one refresh token exchange',async()=>{
-  let refreshes=0,release;
-  const gate=new Promise(resolve=>{release=resolve;});
-  const f=fixture({fetchImpl:async url=>{
-    if(url!==I.REFRESH)return Response.json(stats);
-    refreshes++;await gate;return Response.json(rotated());
-  }});
-  const first=f.p.auth.refresh(await f.getAuth());
-  const usage=f.p.auth.usage(f.getAuth);
-  release();
-  const [next]=await Promise.all([first,usage]);
-  expect(refreshes).toBe(1);expect(next.refresh).toBe(rotated().refresh_token);
-  expect(f.saved.refresh).toBe(rotated().refresh_token);
-});
-
-test('failed persistence keeps the rotated pair for a save retry without spending the old token again',async()=>{
-  let refreshes=0,reads=0;
-  const f=fixture({fetchImpl:async url=>{
-    if(url===I.REFRESH){refreshes++;return Response.json(rotated());}
-    reads++;return Response.json(stats);
-  }});
-  f.failSave=true;
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toMatchObject({code:'kimi_work_auth_store_failed'});
-  expect(reads).toBe(0);expect(f.saved.refresh).toBe(account().refresh);
-  f.failSave=false;
-  await f.p.auth.usage(f.getAuth);
-  expect(refreshes).toBe(1);expect(reads).toBe(1);expect(f.saved.refresh).toBe(rotated().refresh_token);
-});
-
-test('a new plugin instance uses persisted credentials without a browser or desktop read',async()=>{
-  let refreshes=0;
-  const f=fixture({fetchImpl:async url=>url===I.REFRESH ? (refreshes++,Response.json(rotated())) : Response.json(stats)});
-  await f.p.auth.usage(f.getAuth);
-  const p=I.createPlugin({client:f.client,now:()=>NOW,readSession:()=>{throw Error('Desktop unavailable');},fetchImpl:async(url,init)=>{
-    expect(url).toBe(I.MEMBER+'GetSubscriptionStats');
-    expect(init.headers.Authorization).toBe('Bearer '+rotated().access_token);
-    return Response.json(stats);
-  }});
-  expect((await p.auth.usage(f.getAuth)).windows[0].used).toBe(45.15);
-  expect(refreshes).toBe(1);
-});
-
-test('legacy account references import the web pair once and retain account metadata',async()=>{
-  let imports=0;
-  const legacy={source:'kimi-work-desktop',uid:account().uid,accountId:'synthetic alias',access:'',refresh:'',expires:0};
-  const f=fixture({auth:legacy,readSession:()=>{imports++;return {uid:legacy.uid,workToken:'synthetic-work',webToken:account().access,webRefresh:account().refresh};},
-    fetchImpl:async url=>Response.json(url===I.REFRESH ? rotated() : stats)});
-  await f.p.auth.usage(f.getAuth);await f.p.auth.usage(f.getAuth);
-  expect(imports).toBe(1);expect(f.saved.accountId).toBe(legacy.accountId);
-  expect(JSON.stringify(f.saved)).not.toContain('synthetic-work');
-});
-
-test('legacy imports refuse a different desktop account',async()=>{
-  let calls=0;
-  const f=fixture({auth:{source:'kimi-work-desktop',uid:account().uid},
-    readSession:()=>({uid:'different-account',webToken:'synthetic',webRefresh:'synthetic'}),
-    fetchImpl:async()=>{calls++;return Response.json(stats);}});
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toMatchObject({signIn:'expired'});
-  expect(calls).toBe(0);expect(f.saves).toBe(0);
-});
-
-test('an account replaced while renewal is running is not overwritten',async()=>{
-  let release;
-  const gate=new Promise(resolve=>{release=resolve;});
-  const f=fixture({fetchImpl:async()=>{await gate;return Response.json(rotated());}});
-  const pending=f.p.auth.usage(f.getAuth);
-  // Let usage enter the exchange before replacing the login.
-  await new Promise(resolve=>setTimeout(resolve,0));
-  const replacement={...account(),refresh:'synthetic-new-login'};f.replace(replacement);release();
-  await expect(pending).rejects.toMatchObject({signIn:'expired'});
-  expect(f.saved).toEqual(replacement);expect(f.saves).toBe(0);
-});
-
-test('renewal preserves account metadata changed while the exchange is running',async()=>{
-  let release,entered;
-  const gate=new Promise(resolve=>{release=resolve;}),started=new Promise(resolve=>{entered=resolve;});
-  const f=fixture({fetchImpl:async url=>{
-    if(url!==I.REFRESH)return Response.json(stats);
-    entered();await gate;return Response.json(rotated());
-  }});
-  const pending=f.p.auth.usage(f.getAuth);await started;
-  f.replace({...f.saved,accountId:'updated synthetic alias'});release();await pending;
-  expect(f.saved.accountId).toBe('updated synthetic alias');
-  expect(f.saved.refresh).toBe(rotated().refresh_token);
-});
-
-for(const status of [429,503])test('transient refresh HTTP '+status+' preserves the saved login',async()=>{
-  const f=fixture({fetchImpl:async()=>new Response('synthetic secret response',{status})});
-  try {await f.p.auth.usage(f.getAuth);throw Error('expected failure');}
+for(const status of [429,503])test('transient refresh HTTP '+status+' does not declare the login expired',async()=>{
+  const p=plugin(async()=>new Response('synthetic secret response',{status}));
+  try {await p.auth.refresh(account());throw Error('expected failure');}
   catch(error) {expect(error.signIn).toBeUndefined();expect(error.message).not.toContain('synthetic secret');}
-  expect(f.saved).toEqual(account());expect(f.saves).toBe(0);
 });
 
-test('a refused refresh requires sign-in without revealing its response',async()=>{
-  const f=fixture({fetchImpl:async()=>new Response('synthetic secret response',{status:401})});
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toMatchObject({signIn:'expired',code:'kimi_work_login_expired'});
-  expect(f.saved).toEqual(account());expect(f.saves).toBe(0);
+test('a refused refresh requests sign-in without revealing its response',async()=>{
+  const p=plugin(async()=>new Response('synthetic secret response',{status:401}));
+  await expect(p.auth.refresh(account())).rejects.toMatchObject({signIn:'expired',code:'kimi_work_login_expired'});
 });
 
-test('network errors during refresh do not expose request credentials',async()=>{
-  const f=fixture({fetchImpl:async()=>{throw Error('synthetic secret request');}});
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toThrow('登录续期暂不可用');
-  expect(f.saved).toEqual(account());
+test('network errors during refresh do not reveal request credentials',async()=>{
+  const p=plugin(async()=>{throw Error('synthetic secret request');});
+  await expect(p.auth.refresh(account())).rejects.toThrow('登录续期暂不可用');
 });
 
-for(const payload of [{access_token:rotated().access_token},rotated('different-account'),
-  {access_token:jwt(account().uid,NOW-1),refresh_token:'synthetic expired'}])test('invalid rotated pairs never replace the saved login '+JSON.stringify(Object.keys(payload)),async()=>{
-  const f=fixture({fetchImpl:async()=>Response.json(payload)});
-  await expect(f.p.auth.usage(f.getAuth)).rejects.toThrow('续期响应格式无效');
-  expect(f.saved).toEqual(account());expect(f.saves).toBe(0);
+for(const [name,payload] of [['missing refresh',{access_token:rotated().access_token}],['other account',rotated('different-account')],
+  ['expired access',{access_token:jwt(account().uid,NOW-1),refresh_token:'synthetic expired'}],['null response',null],
+  ['null JWT claims',{access_token:'fixture.'+Buffer.from('null').toString('base64url')+'.fixture',refresh_token:'synthetic'}]])
+  test('invalid rotated pair is rejected: '+name,async()=>{
+    const p=plugin(async()=>Response.json(payload));
+    await expect(p.auth.refresh(account())).rejects.toThrow('续期响应格式无效');
+  });
+
+test('different accounts renew independently',async()=>{
+  const spent=[];
+  const p=plugin(async(url,init)=>{
+    const token=JSON.parse(init.body).refresh_token;spent.push(token);
+    return Response.json(rotated(token.includes('account-a')?'account-a':'account-b'));
+  });
+  const results=await Promise.all(['account-a','account-b'].map(uid=>p.auth.refresh(account(uid))));
+  expect(spent).toHaveLength(2);
+  expect(results.map(x=>x.refresh)).toEqual(['account-a','account-b'].map(uid=>rotated(uid).refresh_token));
 });
 
-test('without persistence support an expired pair is not consumed',async()=>{
-  let calls=0;
-  const p=I.createPlugin({now:()=>NOW,fetchImpl:async()=>{calls++;return Response.json(rotated());}});
-  await expect(p.auth.usage(async()=>account())).rejects.toMatchObject({code:'kimi_work_auth_store_failed'});
-  expect(calls).toBe(0);
-});
-
-test('two accounts renew independently and save to their own host account scopes',async()=>{
-  const saved=new Map(['account-a','account-b'].map(uid=>[uid,account(uid)]));
-  const calls=[];
-  const p=I.createPlugin({now:()=>NOW,client:{auth:{set:async({body})=>{saved.set(body.uid,body);}}},fetchImpl:async(url,init)=>{
-    if(url!==I.REFRESH)return Response.json(stats);
-    const refresh=JSON.parse(init.body).refresh_token;calls.push(refresh);
-    return Response.json(rotated(refresh.endsWith('account-a')?'account-a':'account-b'));
-  }});
-  await Promise.all([...saved.keys()].map(uid=>p.auth.usage(async()=>saved.get(uid))));
-  expect(calls).toHaveLength(2);
-  for(const uid of saved.keys())expect(saved.get(uid).refresh).toBe(rotated(uid).refresh_token);
-});
-
-test('missing monthly data stays unknown and Code short-window counters are not substituted',async()=>{
-  const auth={...account(),expires:NOW+900000};
-  const f=fixture({auth,fetchImpl:async()=>Response.json({ratelimitCode5h:{ratio:0.5},ratelimitCode7d:{ratio:0.8}})});
-  expect((await f.p.auth.usage(f.getAuth)).windows).toEqual([]);
+test('missing monthly data stays unknown instead of using Code short-window counters',async()=>{
+  const p=plugin(async()=>Response.json({ratelimitCode5h:{ratio:0.5},ratelimitCode7d:{ratio:0.8}}));
+  expect((await p.auth.usage(async()=>({...account(),...fields(rotated())}))).windows).toEqual([]);
 });

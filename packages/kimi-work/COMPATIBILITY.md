@@ -1,6 +1,16 @@
 # macOS compatibility record
 
-## Upgrade 0.1.5: membership renewal and monthly usage
+## PR #218 independent security review
+
+The initial 0.1.5 implementation at `91f52c7` had two reproducible races: usage could restore a signed-out account or overwrite a replacement login because `getAuth` followed by `client.auth.set` is not a conditional write; and a same-uid reconnect could inherit the previous login's pending refresh failure.
+
+The revision removes usage-side rotation, persistence and automatic legacy import. Only explicit sign-in imports credentials; only `auth.refresh` rotates them. Magpie's native renewal commits the returned fields while comparing the expected access/refresh pair under the same auth-store lock. Usage reads stored credentials without writing them. Pending work and cached rotations are keyed by the exact credential pair, preserving independent reconnects. Reference-only accounts need explicit reconnect, and usage no longer forces a refresh after an unexpected 401.
+
+The independent reviewer reproduced the original failures using synthetic credentials and the production host's auth-store/client functions in an isolated VM. The same production native renewal code preserved concurrent logout and replacement login. Current provider regressions include failed host-save retries through subsequent access-token expiry and separate same-uid credential lineages. This review makes no new request with real credentials and does not change the user's configuration. It does not establish long-term vendor refresh policy or solve independent native-host error-notification/cross-process coordination behavior.
+
+The independent second review cleared both findings with no remaining in-scope blocker. It separately passed **39 provider tests**, the focused hook check, and **9 deterministic production-host VM cases**: read-only usage during logout/replacement; native renewal during logout/replacement; fresh/due reconnects during an old 401; 16 concurrent native refresh calls sharing one exchange; actual rename/EIO save failures recovering across access expiry while retaining mode `0600` and account metadata; and recovery through four rotation generations without reusing spent tokens. A separate plugin instance read the persisted pair. The parent run passed **1804 full-repository tests**, **39 provider tests**, and all provider hook checks. These are synthetic host/provider checks, not a new live Kimi or OpenCode run.
+
+## Initial 0.1.5 live probe (before security review)
 
 Observed on Apple-silicon macOS at **2026-10-18 01:43 UTC**, using official Magpie **0.1.1279** and Bun **1.4.3**. This run used a disposable HOME and XDG profile. Only the local desktop Work/membership credential fields were copied into that private test home; the everyday Magpie profile and Kimi desktop files were not changed.
 
@@ -13,7 +23,7 @@ Observed on Apple-silicon macOS at **2026-10-18 01:43 UTC**, using official Magp
 
 The renewal RPC/rotation format was also checked against Kimi's current public [web token module](https://statics.moonshot.cn/kimi-web-seo/assets/token-Cpryl615.js). This is an undocumented service. One successful rotation and a separate-process fresh quota read do not establish months of session survival or the server's revocation policy. This upgrade did not send a new inference request; earlier live Work streaming evidence remains below.
 
-Local checks: **38 provider tests passed**, **1803 full-repository tests passed**, and `bun scripts/check.mjs` passed for every provider. Synthetic cases cover concurrent host/usage renewal, one retry after a 401, persistence failure and recovery, process restart, legacy import/account binding, rejected/transient renewal, account replacement and metadata changes during an exchange, and missing monthly data. Existing Work inference/stream/tool/header/error regression cases continue to pass.
+At that initial revision, **38 provider tests passed**, **1803 full-repository tests passed**, and `bun scripts/check.mjs` passed for every provider. Those tests did not cover the two real host interleavings above; they are historical evidence, not approval of the superseded usage-side persistence design.
 
 ## Upgrade 0.1.4
 
