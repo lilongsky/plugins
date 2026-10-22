@@ -163,6 +163,8 @@ test("desktop sign-in is read-only and never writes or refreshes auth.json", asy
     },
   })
 
+  // a seat with no token of its own, as one added before the seat's own
+  // token was saved: the app's stale account is read, never written
   const hooks = await RaccoonAuthPlugin({ client: {} })
   const res = await hooks.auth.usage(async () => ({ type: "oauth", source: "desktop" }))
   expect(refreshCalled).toBe(false)
@@ -231,6 +233,32 @@ test("usage reports Credits window when unexpired bills account for total grante
     runsOutAt: "2029-10-17T15:59:59.000Z",
     runsOut: 300,
   })
+})
+
+test("usage reads bills past the newest 200 rows, where the large grants are (plugins #223)", async () => {
+  const validTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
+  // newest first, as the endpoint answers: 1200 spends, then the grants
+  const items = []
+  for (let i = 0; i < 1200; i++) items.push({ bill_id: `s${i}`, biz_type: "consume", points: -1 })
+  items.push({ bill_id: "g1", biz_type: "daily_grant", points: 300, expire_at: "2029-10-24T23:59:59+08:00" })
+  items.push({ bill_id: "g2", biz_type: "reward_grant", points: 3000 })
+  items.push({ bill_id: "g3", biz_type: "reward_grant", points: 3000 })
+  const asked = []
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 5100 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": (req, u) => {
+      // offset is ignored and total is always 0, as plugins #223 found
+      const limit = Number(u.searchParams.get("paging.limit"))
+      asked.push(limit)
+      return Response.json({ code: 0, data: { items: items.slice(0, limit), paging: { offset: 0, limit, total: 0 } } })
+    },
+  })
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const u = await hooks.auth.usage(async () => ({ type: "oauth", access: validTok, refresh: "rt1", expires: Date.now() + 3600_000 }))
+  expect(u.balance).toBeUndefined()
+  expect(u.windows[0]).toMatchObject({ name: "Credits", amount: 1200, limit: 6300, display: "1200 / 6300" })
+  expect(asked).toEqual([1000, 5000])
 })
 
 test("checkin preserves renewed tokens, claims once, and returns done on second call", async () => {
@@ -431,6 +459,203 @@ test("desktop sign-in marks expired when desktop app switches to another account
   expect(u.error).toContain("切换为其他账号")
 })
 
+// The desktop app is signed in to one account at a time: a seat added for the
+// first account must keep its own token after the app switched to the second,
+// instead of being expired or answered with the second account's token
+// (plugins #166: the seat was billed to the wrong account, silently).
+test("a desktop seat keeps its own account after the app switches to another", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  const aTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const bTok = fakeJwt({ iss: "888888", name: "AccountB", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const seen = []
+  writeFileSync(authFile, JSON.stringify({ access_token: aTok, refresh_token: "D1" }))
+
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 300 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push(req.headers.get("authorization"))
+      return Response.json({ code: 0, data: {} })
+    },
+  })
+  const seatA = await (await hooks.auth.methods[1].authorize()).callback()
+  expect(seatA).toMatchObject({ type: "success", source: "desktop", uid: "7615755", accountId: "AccountA" })
+  expect(seatA.access).toBe(aTok) // the seat's own record, not "" as before
+
+  // the app signs in to the second account: auth.json is overwritten
+  writeFileSync(authFile, JSON.stringify({ access_token: bTok, refresh_token: "D2" }))
+  let stored = seatA
+  const client = { auth: { set: async ({ body }) => { stored = body } } }
+  const hooks2 = await RaccoonAuthPlugin({ client })
+  const u = await hooks2.auth.usage(async () => ({ ...stored, type: "oauth" }))
+  expect(u.signIn).toBe("kept")
+  expect(u.user).toBe("AccountA")
+  expect(u.balance).toBe("300 credits")
+
+  // and its own token is spent on requests, not the app's current one
+  const loaded = await hooks2.auth.loader(async () => ({ ...stored, type: "oauth" }))
+  await loaded.fetch(`${loaded.baseURL}/chat/completions`, { method: "POST", body: "{}" })
+  expect(seen).toEqual([`Bearer ${aTok}`])
+})
+
+// The desktop app signs in to one account at a time, and signing in to the
+// second revokes the first account's session on the vendor's side (#166,
+// measured on a real pair of accounts): the first seat's token is answered
+// 401 / 200003 by the credits and check-in endpoints, and 404 by refresh, its
+// exp notwithstanding. The seat must then ask to be signed in again, and must
+// never fall back to the account the app holds now.
+test("a desktop seat asks to sign in again once the vendor revokes its token", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  const aTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const bTok = fakeJwt({ iss: "888888", name: "AccountB", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(authFile, JSON.stringify({ access_token: aTok, refresh_token: "D1" }))
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const seatA = await (await hooks.auth.methods[1].authorize()).callback()
+
+  // the app signs in to the second account, and the vendor revokes the first
+  writeFileSync(authFile, JSON.stringify({ access_token: bTok, refresh_token: "D2" }))
+  const seen = []
+  startServer({
+    // what the vendor answers a revoked token with, on every endpoint
+    "GET /api/web/points/v1/balance": () =>
+      Response.json({ code: 200003, message: "authorization_verify_error" }, { status: 401 }),
+    "GET /api/web/auth/v1/entitlement_info": () =>
+      Response.json({ code: 200003, message: "authorization_verify_error" }, { status: 401 }),
+    "GET /api/web/points/v1/bills": () =>
+      Response.json({ code: 200003, message: "authorization_verify_error" }, { status: 401 }),
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push(req.headers.get("authorization"))
+      return Response.json({ code: 200003, message: "authorization_verify_error" }, { status: 401 })
+    },
+  })
+
+  const u = await hooks.auth.usage(async () => ({ ...seatA, type: "oauth" }))
+  expect(u.signIn).toBe("expired")
+  expect(u.error).toContain("authorization_verify_error")
+
+  const loaded = await hooks.auth.loader(async () => ({ ...seatA, type: "oauth" }))
+  const res = await loaded.fetch(`${loaded.baseURL}/chat/completions`, { method: "POST", body: "{}" })
+  expect(res.status).toBe(401)
+  expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
+  // the app's account is never spent for this seat
+  expect(seen).toEqual([`Bearer ${aTok}`])
+})
+
+test("a desktop seat asks to sign in again once its own token expires", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  const aTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const bTok = fakeJwt({ iss: "888888", name: "AccountB", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(authFile, JSON.stringify({ access_token: aTok, refresh_token: "D1" }))
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const seatA = await (await hooks.auth.methods[1].authorize()).callback()
+
+  // the app switched, and the seat's own token has since ended
+  writeFileSync(authFile, JSON.stringify({ access_token: bTok, refresh_token: "D2" }))
+  const u = await hooks.auth.usage(async () => ({ ...seatA, type: "oauth", access: aTok, expires: Date.now() - 60_000 }))
+  expect(u.signIn).toBe("expired")
+  expect(u.error).toContain("切换为其他账号")
+})
+
+test("a desktop seat never takes the app's account when its own uid is unknown", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  // a token whose uid cannot be read: the seat names no account it can prove
+  const noUid = fakeJwt({ name: "NoUid", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const otherTok = fakeJwt({ iss: "888888", name: "OtherUser", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(authFile, JSON.stringify({ access_token: noUid, refresh_token: "D1" }))
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const seat = await (await hooks.auth.methods[1].authorize()).callback()
+  expect(seat.uid).toBe("")
+
+  writeFileSync(authFile, JSON.stringify({ access_token: otherTok, refresh_token: "D2" }))
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 123 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+  })
+  const u = await hooks.auth.usage(async () => ({ ...seat, type: "oauth" }))
+  expect(u.signIn).toBe("kept")
+  expect(u.user).toBe("NoUid")
+  expect(u.balance).toBe("123 credits")
+})
+
+// The seat names an account (its uid), and the app now holds a token whose uid
+// cannot be read at all. That token is not the seat's account: the seat keeps
+// its own, rather than being answered with credentials it cannot be shown to
+// own (plugins #166, the "kept / user=B with B's Bearer" case).
+test("a desktop seat with a uid is not handed a uid-less app token", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  const aTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 3600 })
+  // the app signed in to an account whose token carries no readable uid
+  const noUidTok = fakeJwt({ name: "AccountB", exp: Math.floor(Date.now() / 1000) + 3600 })
+  writeFileSync(authFile, JSON.stringify({ access_token: aTok, refresh_token: "D1" }))
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const seat = await (await hooks.auth.methods[1].authorize()).callback()
+  expect(seat.uid).toBe("7615755")
+
+  writeFileSync(authFile, JSON.stringify({ access_token: noUidTok, refresh_token: "D2" }))
+  const seen = []
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 77 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push(req.headers.get("authorization"))
+      return Response.json({ code: 0, data: {} })
+    },
+  })
+  const u = await hooks.auth.usage(async () => ({ ...seat, type: "oauth" }))
+  expect(u.signIn).toBe("kept")
+  expect(u.user).toBe("AccountA")
+  expect(u.balance).toBe("77 credits")
+
+  const loaded = await hooks.auth.loader(async () => ({ ...seat, type: "oauth" }))
+  await loaded.fetch(`${loaded.baseURL}/chat/completions`, { method: "POST", body: "{}" })
+  expect(seen).toEqual([`Bearer ${aTok}`]) // the app's token is never spent
+})
+
+test("a desktop seat takes the app's newer token for its own account", async () => {
+  tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
+  process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
+  const authFile = join(tempDir, "auth.json")
+  const oldTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 3600 })
+  const newTok = fakeJwt({ iss: "74350b", name: "AccountA", exp: Math.floor(Date.now() / 1000) + 7200 })
+  writeFileSync(authFile, JSON.stringify({ access_token: oldTok, refresh_token: "D1" }))
+  const hooks = await RaccoonAuthPlugin({ client: {} })
+  const seat = await (await hooks.auth.methods[1].authorize()).callback()
+
+  // the app refreshed its own token while the seat was idle: same account,
+  // newer token, and the seat's record is updated to it
+  writeFileSync(authFile, JSON.stringify({ access_token: newTok, refresh_token: "D1" }))
+  const saves = []
+  const client = { auth: { set: async ({ body }) => { saves.push(body) } } }
+  const hooks2 = await RaccoonAuthPlugin({ client })
+  const seen = []
+  startServer({
+    "GET /api/web/points/v1/balance": () => Response.json({ code: 0, data: { available_points: 42 } }),
+    "GET /api/web/auth/v1/entitlement_info": () => Response.json({ code: 0, data: {} }),
+    "GET /api/web/points/v1/bills": () => Response.json({ code: 0, data: { items: [] } }),
+    "POST /api/web/llm/v2/chat/completions": (req) => {
+      seen.push(req.headers.get("authorization"))
+      return Response.json({ code: 0, data: {} })
+    },
+  })
+  const loaded = await hooks2.auth.loader(async () => ({ ...seat, type: "oauth" }))
+  await loaded.fetch(`${loaded.baseURL}/chat/completions`, { method: "POST", body: "{}" })
+  expect(seen).toEqual([`Bearer ${newTok}`])
+  expect(saves.at(-1)).toMatchObject({ access: newTok, source: "desktop" })
+})
 test("renewToken cache hit inside 60s invokes save with merged tokens", async () => {
   const staleTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) - 5 })
   const freshTok = fakeJwt({ iss: "74350b", name: "Mason", exp: Math.floor(Date.now() / 1000) + 3600 })
@@ -579,7 +804,7 @@ test("failed onboarding grant (500) is not marked settled and retries on next ch
   tempDir = mkdtempSync(join(tmpdir(), "raccoon-test-"))
   process.env.RACCOON_BOX_AGENT_CONFIG_DIR = tempDir
   writeFileSync(join(tempDir, "auth.json"), JSON.stringify({ access_token: validTok, refresh_token: "D1" }))
-  const deskAuth = { type: "oauth", source: "desktop", uid: "7615755" }
+  const deskAuth = { type: "oauth", source: "desktop", uid: "7615755", access: validTok, expires: Date.now() + 3600_000 }
 
   const r2 = await hooks.auth.checkin(async () => deskAuth)
   expect(r2.outcome).toBe("done")

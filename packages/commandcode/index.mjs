@@ -12,6 +12,13 @@
 // is only taken where the CLI itself asks, POST /alpha/generate, in the
 // CLI's own format (command-code 1.72.2), which the fetch here writes from
 // the chat completion OpenCode sends and turns back into one.
+//
+// Zero Data Retention (commandcode.ai/docs/resources/zdr) is asked for as
+// the CLI asks it: x-cmd-zdr: 1 on every request for a reply, the Provider
+// API's and /alpha/generate's alike (command-code's buildCommandAuthHeaders
+// on CMD_ZDR=1: 1.84.0's bundle, and 1.74.1 as captured). It is on when the user turns on the provider's "Zero Data
+// Retention" switch in magpie, or when CMD_ZDR is "1" in the environment,
+// as for the CLI.
 import { createServer, STATUS_CODES } from "node:http"
 import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
@@ -935,8 +942,25 @@ function generateBody(chat, place = {}) {
   }
 }
 
-// generateHeaders are the CLI's own (buildCommandAuthHeaders).
-const generateHeaders = (key) => ({
+// ZDR is the header that asks for Zero Data Retention, and ZDR_OPTION the
+// provider's switch for it in magpie (auth.options, read through
+// input.magpie.option).
+const ZDR = "x-cmd-zdr"
+const ZDR_OPTION = "zdr"
+
+// zdrOn says whether requests ask for Zero Data Retention: magpie's switch
+// for it, read at each request so a change needs no restart, or CMD_ZDR
+// as the CLI reads it ("1" alone; isCmdZdrEnabled).
+function zdrOn(magpie) {
+  try {
+    if (magpie?.option?.(ID, ZDR_OPTION) === true) return true
+  } catch {}
+  return process.env.CMD_ZDR === "1"
+}
+
+// generateHeaders are the CLI's own (buildCommandAuthHeaders), with its
+// x-cmd-zdr: 1 when ZDR is on.
+const generateHeaders = (key, zdr = false) => ({
   "Content-Type": "application/json",
   "User-Agent": "cli",
   "x-command-code-version": CLI_VERSION,
@@ -945,6 +969,7 @@ const generateHeaders = (key) => ({
   "x-taste-learning": "false",
   "x-session-id": session,
   Authorization: `Bearer ${key}`,
+  ...(zdr ? { [ZDR]: "1" } : {}),
 })
 
 // QUOTA_WORDS are magpie's quotaWords (internal/gateway/fallback.go): a
@@ -996,14 +1021,20 @@ function streamError(e) {
       if (j?.error?.message) msg = j.error.message
     } catch {}
   }
-  return failure(status || 500, msg)
+  const f = failure(status || 500, msg)
+  // a ZDR request for a model no upstream that keeps nothing serves: its
+  // type goes on with it, as the Provider API's 422 says it
+  // ({"type":"cmd_zdr_no_providers","code":"CMD_ZDR_NO_PROVIDERS",
+  // "statusCode":400} on /alpha/generate)
+  if (typeof e === "object" && (e?.type === "cmd_zdr_no_providers" || e?.code === "CMD_ZDR_NO_PROVIDERS")) f.type = "cmd_zdr_no_providers"
+  return f
 }
 
 // errorResponse is a failure as the built-in answered it, the account
 // kept: the built-in never marked a Command Code account lapsed, a 401 of
 // Command Code's among them.
-const errorResponse = ({ status, message }) =>
-  new Response(JSON.stringify({ error: { message, type: "commandcode_error", code: status } }), {
+const errorResponse = ({ status, message, type }) =>
+  new Response(JSON.stringify({ error: { message, type: type || "commandcode_error", code: status } }), {
     status,
     headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
@@ -1112,10 +1143,10 @@ async function* events(body) {
 }
 
 // generate answers a chat completion through /alpha/generate.
-async function generate(key, chat, signal, place) {
+async function generate(key, chat, signal, place, zdr = false) {
   const res = await fetch(API + "/alpha/generate", {
     method: "POST",
-    headers: generateHeaders(key),
+    headers: generateHeaders(key, zdr),
     body: JSON.stringify(generateBody(chat, place)),
     signal,
   })
@@ -1189,9 +1220,9 @@ async function generate(key, chat, signal, place) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED }
+export const _internal = { subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED, zdrOn }
 
-export async function CommandCodePlugin({ client } = {}) {
+export async function CommandCodePlugin({ client, magpie } = {}) {
   // isGo keeps a key as Go's, for its models and endpoint: in the
   // subscriptions seen, and saved with the key as usage saves the plan read
   async function isGo(key, auth) {
@@ -1224,6 +1255,11 @@ export async function CommandCodePlugin({ client } = {}) {
             headers.set("Authorization", `Bearer ${key}`)
             headers.set("x-api-key", key)
             const place = workPlace(headers)
+            // Zero Data Retention, as the CLI asks it; a 422
+            // cmd_zdr_no_providers (no upstream that keeps nothing serves
+            // the model) goes on to the agent as it came
+            const zdr = zdrOn(magpie)
+            if (zdr) headers.set(ZDR, "1")
             const chatting = /\/chat\/completions$/.test(new URL(url).pathname)
             let chat
             if (chatting) {
@@ -1233,7 +1269,7 @@ export async function CommandCodePlugin({ client } = {}) {
               } catch {
                 return errorResponse({ status: 400, message: "a request that isn't JSON" })
               }
-              if ((await planNow(key, saved)) === "Go") return kept(await generate(key, chat, init.signal, place))
+              if ((await planNow(key, saved)) === "Go") return kept(await generate(key, chat, init.signal, place, zdr))
             }
             // the Provider API's answer goes on as it came, the account
             // kept: the built-in neither marked one lapsed nor cleared it
@@ -1246,12 +1282,23 @@ export async function CommandCodePlugin({ client } = {}) {
             const text = await res.text()
             if (GO_NO_API.test(text)) {
               await isGo(key, (await getAuth()) ?? auth)
-              if (chatting) return kept(await generate(key, chat, init.signal, place))
+              if (chatting) return kept(await generate(key, chat, init.signal, place, zdr))
             }
             return kept(new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers }))
           },
         }
       },
+      // magpie's switches for the provider (#2038): shown in its editor,
+      // read with input.magpie.option at each request
+      options: [
+        {
+          key: ZDR_OPTION,
+          label: "Zero Data Retention",
+          description:
+            "Sends x-cmd-zdr: 1, as the CLI's CMD_ZDR=1 does: requests go only to upstreams that keep no prompts or replies. They usually cost more, and a model with no such upstream fails (422 cmd_zdr_no_providers).",
+          confirm: "ZDR requests usually cost more, and a model with no zero-data-retention upstream fails instead of falling back.",
+        },
+      ],
       methods: [
         { type: "oauth", label: "Command Code (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Command Code CLI's sign-in", authorize: cliSignIn },

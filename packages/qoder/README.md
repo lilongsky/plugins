@@ -22,6 +22,36 @@ hosts; [its section](#qoder-cn) says what differs.
 3. The device token is traded for a job token, and the account's email and
    name are read.
 
+The page is asked for no `redirect_uri`, as Qoder's CLI asks for none, so
+the sign-in ends in the browser tab even when Qoder.app is installed
+(before 0.2.25 it sent the desktop app's `qoder-app://`, which handed the
+page to Qoder.app).
+
+**Sign in with Qoder PAT** (and **Sign in with Qoder CN PAT**) skips the
+device flow: a Personal Access Token from `<site>/account/integrations` is
+posted to `/api/v1/jobToken/exchange` (`personal_token`), which answers a
+job token, its refresh token and its expiry. The PAT is kept on the
+credential, so a lapsed job refresh is exchanged again instead of asking
+for the sign-in; PATs last up to a year. The job token signs the model list
+and chat calls with the same COSY envelope either sign-in's does.
+
+On Qoder CN this is the plugin's own reading of the protocol rather than
+the CLI's path: qoder.cn's CLI signs requests with its device token and
+never asks for a job token. Verified against a live qoder.cn account — the
+exchange answers 200 with a `jt-` token, the signed model list answers 200
+with that account's own models, and a chat completion returns its text.
+
+A PAT account keeps the name its browser sign-in takes (`email || uid`): magpie
+replaces an account on a new sign-in when both the accountId and the uid
+match, so a renewed PAT sign-in names the same account rather than adding a
+row beside the lapsed one.
+
+A PAT account has no device token, so its usage read, campaigns pages and
+daily check-in go out on the job token instead. The check-in works on it: a
+live PAT account answered 200 to the campaigns list and `CLAIMED` to a claim,
+so it earns the daily credits the browser sign-in does. That path has no
+second token to rotate, so a refused call is the answer rather than a retry.
+
 What is kept: the job token, its refresh token and expiry, the uid, the
 device token and a machine id made for this sign-in. OpenCode keeps them in
 `auth.json`; magpie keeps them in `plugin-auth.json`.
@@ -56,7 +86,22 @@ itself.
   - Messages become text and image blocks.
   - Tool calls and results become OpenAI tool turns. Images a tool returned
     follow in a user turn.
+  - A result whose id the client lost answers its turn's call in order
+    (since 0.2.22, #277): Qoder refuses a whole request with a result that
+    answers no call before it. A result with no call left to answer goes
+    as text in the user's turn.
   - Your tools become Qoder's native function tools.
+  - A call the client sent without an id gets one made from its turn, its
+    place and its arguments, so it goes out the same on every request.
+- It marks the prompt for Qoder's cache as Qoder's own client does (since
+  0.2.26, #290): the last block of the last user turn carries
+  `cache_control: ephemeral` (nothing is marked when the last turn is a
+  tool's result), user turns carry their blocks as `contents` too, and each
+  request names its conversation in `session_id`. That id is a hash of
+  Codex's thread (`prompt_cache_key`) when magpie sends one, else of the
+  conversation's start, so every turn of one conversation names the same
+  session; the key itself never goes out. Each request has its own
+  `request_id`.
   - The model's own configuration from Qoder's list goes with it.
 - It picks the reasoning effort from the model's own levels:
   - The nearest level to the one asked, the higher one on a tie.
@@ -71,6 +116,9 @@ itself.
   - the account, AES-encrypted, with the key wrapped by Qoder's RSA key;
   - an MD5 signature;
   - the machine id and the client's headers.
+  - `Cosy-Version`: the worker runtime version that Qoder's desktop app
+    ships (1.1.69 in app 0.4.8, since 0.2.23, #281), because
+    `Cosy-ClientType` says the desktop app.
 
 **Reading the reply**
 
@@ -91,8 +139,9 @@ itself.
 |---|---|
 | A refused sign-in (no code, or code 105) | 401 |
 | A quota (codes 110, 112–119, 122) | 429 |
-| Busy or queued for the model (code 10605) | 503, with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none); the sign-in is untouched |
+| Busy or queued for the model (code 10605) | Since 0.2.28 the request waits in Qoder's queue as Qoder's client does (below), then is sent again; past the wait, 503 with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none). The sign-in is untouched |
 | A refusal of the request itself (codes 406, 416, 430, 80411, 80412, 100400–100403) | 400, with Qoder's words |
+| "Error in upstream response", the model's own vendor behind Qoder failing, which Qoder sends as a 400 (since 0.2.24) | 502, so magpie asks again or another account; the sign-in is untouched |
 | A failure before the answer starts | Qoder's status |
 | A failure after the answer has started | The stream ends with an error |
 
@@ -145,7 +194,7 @@ Qoder CN's own CLI builds in for its `cn` build (`@qodercn-ai/qoderclicn`
 | Accounts: poll, tokens, user info, usage | openapi.qoder.sh | openapi.qoder.com.cn |
 | Models and chat | api3.qoder.sh | gateway.qoder.com.cn |
 | Device-flow client id | Qoder's desktop client's | Qoder CN's CLI's (production) |
-| `redirect_uri` on the sign-in page | `qoder-app://` | none, as the CLI sends |
+| `redirect_uri` on the sign-in page | none, as Qoder's CLI sends (since 0.2.25) | none, as the CLI sends |
 
 Qoder CN's CLI chats with the device token itself and never makes a job
 token. The plugin asks qoder.cn for a job token first, as it does on
@@ -219,8 +268,8 @@ the account's credentials.
 
 - Install Qoder desktop, or sign in to Qoder CLI once, to make its native
   runtime available. The plugin finds the desktop's `resources/umid`
-  (`Qoder.app` on macOS, `%LOCALAPPDATA%\Programs\Qoder` on Windows,
-  `/opt/Qoder` on Linux) or the runtime the CLI caches in `~/.qoder/.bin`
+  (`Qoder.app` on macOS, `%LOCALAPPDATA%\Programs\Qoder` or, since
+  0.2.26, `%ProgramFiles%\Qoder` on Windows, `/opt/Qoder` on Linux) or the runtime the CLI caches in `~/.qoder/.bin`
   (`runtime-info-<platform>-<arch>-*` on macOS and Linux,
   `umid-win32-x64-*\runtime-info.exe` on Windows; `QODER_CONFIG_DIR`,
   `QODER_CLI_HOME` and `QODER_CONFIG_DIR_NAME` move it as they move the
@@ -228,9 +277,16 @@ the account's credentials.
 - For another installation location, set `QODER_RUNTIME_INFO` to the
   absolute path of Qoder's installed `runtime-info` executable
   (`runtime-info.exe` on Windows), with its accompanying SDK files.
-- A missing helper or invalid identity is an error, rather than a false
-  "no activity" result. Qoder CN keeps its existing requests and does
-  not need this local helper.
+- With no helper anywhere (a machine that never had Qoder desktop or
+  Qoder CLI), the check-in is `ineligible` for the day, with a message
+  saying to install one (or set `QODER_RUNTIME_INFO`); magpie asks again
+  the next day rather than every 30 minutes (#304). The identity comes
+  only from Qoder's own helper: the plugin never makes one up, so such an
+  international account gets no daily claim until Qoder is installed.
+- A helper that is there but can't be read, or gives an invalid identity,
+  is `failed` and asked again later, rather than a false "no activity"
+  result. Qoder CN keeps its existing requests and does not need this
+  local helper.
 
 - **List:** `GET <openapi>/sash/api/v1/me/campaigns`: `campaigns[]` with
   `campaignId`, `actionType`, `claimStatus` (`CLAIMABLE`, `CLAIMED`),
@@ -262,6 +318,20 @@ by a BOM or wrapped in an outer message is read as busy too; see
 That parser fix does not remove the provider's limit or prove that every
 live 401 had the same cause. A timeout likewise does not establish an
 empty wallet or an expired login.
+
+Since **0.2.28** a queued request waits its turn as Qoder's own client
+(Qoder.app 0.4.3's agent worker) waits it: it asks
+`/api/v2/service/ask/queue/status` with the request's `requestSetId`, the
+model and the plan's `queueType`, at once and then every
+`retryAfterSeconds` (held to 0.5–30s, 30s when unsaid), and once
+`isQueued` is false it waits that state's `retryAfterSeconds` and sends the
+same request again (up to 10 times). Qoder's client waits up to an hour;
+the plugin waits at most 4 minutes from the request's start, since nothing
+reaches the agent meanwhile (magpie keeps a stream alive with comments for
+5 minutes of silence). Three failed status asks in a row, a 404, or a
+cancelled request end the wait early. Qoder's client also reports the end
+of its turn to `/api/v2/service/ask/finish`; the plugin doesn't, and
+Qoder releases that lease on its own TTL. `queue.test.mjs` has the wait.
 
 For a bounded offline reproduction, run `packages/qoder/busy.test.mjs`
 from #185 in an isolated temporary HOME. It compares plain queue JSON,

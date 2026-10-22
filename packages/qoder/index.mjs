@@ -43,7 +43,14 @@ import { join, resolve } from "node:path"
 
 const CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 const MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
-const COSY_VERSION = "1.1.49"
+// The build the envelope claims. It has to be the one Qoder's desktop app
+// talks through — the worker runtime bundled in the app — because the
+// envelope also says Cosy-ClientType: 10 (desktop) and carries that app's
+// machine identity; the CLI's channel publishes a different, later number
+// that no desktop build runs. Taken from app 0.4.8 (build 79743374,
+// 2026-10-14), whose transport config names 1.1.69. Raise it when the app
+// moves, not when the CLI does.
+const COSY_VERSION = "1.1.69"
 const SIGN_IN_TIMEOUT = 15 * 60 * 1000
 const REFRESH_LEAD = 5 * 60 * 1000 // a chat token this close to its end is refreshed before a request
 const RENEW_LEAD = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
@@ -357,6 +364,10 @@ async function patSignIn(site, pat) {
   return {
     type: "success",
     ...chat,
+    // The same name its browser sign-in takes: magpie's plugin host replaces
+    // an account on a new sign-in when both the accountId and the uid match,
+    // so a renewed PAT sign-in must keep naming the same account. A suffix
+    // here would add a second row beside the lapsed one instead.
     accountId: email || uid,
     uid,
     email,
@@ -683,6 +694,27 @@ const textOf = (c) => (typeof c === "string" ? c : blocksOf(c).filter((b) => b.t
 // blocks, an assistant's tool calls as tool_calls, results as tool turns by
 // tool_call_id. A tool turn holds text only, so the images a tool returned
 // follow in a user turn — the start of the user's own when one comes next.
+//
+// Qoder turns the whole request away when a tool turn answers no call of the
+// turn before it ("Messages with role 'tool' must be a response to a
+// preceding message with 'tool_calls'"), where another API takes the same
+// conversation. A client's history reaches here with such a turn because it
+// dropped the id: either the call lost it, so the result names one no call
+// has, or the result kept none. Both are filled in rather than dropped — a
+// call without an id is given one, and the results after it take the ids it
+// went out with in order, which is the pairing a dropped id means. Only a
+// result with no call of its turn left to answer becomes text in the user's
+// own turn, so the words the tool returned stay with the conversation.
+// callID is the id a call the client sent without one goes out with: the
+// same on every turn of the conversation (#290), made from where the call
+// is and what it says, so the history Qoder sees doesn't change under a
+// prompt cache from one request to the next.
+function callID(at, k, c) {
+  const args = c.function?.arguments
+  const said = typeof args === "string" ? args : JSON.stringify(args ?? {})
+  return "call_" + createHash("sha256").update(`${at}\0${k}\0${c.function?.name ?? ""}\0${said}`).digest("hex").slice(0, 32)
+}
+
 function qoderMessages(msgs) {
   const out = []
   const names = {}
@@ -691,31 +723,64 @@ function qoderMessages(msgs) {
     if (seen.length) out.push({ role: "user", content: seen })
     seen = []
   }
-  for (const m of msgs) {
+  // turn is the assistant turn being answered: the calls no result has
+  // answered yet, in the order they were made, and the ones a result after
+  // it names (kept), which a result whose id was lost must not take.
+  let turn = null
+  const asText = (txt, ims) => {
+    const said = txt.trim()
+    if (!said && !ims.length) return
+    if (seen.length) seen.push({ type: "text", text: "\n\n" })
+    if (said) seen.push({ type: "text", text: said })
+    seen.push(...ims)
+  }
+  for (const [i, m] of msgs.entries()) {
     if (m.role === "system" || m.role === "developer") continue
+    if (m.role === "user") turn = null
     if (m.role !== "user" && m.role !== "tool") showSeen()
     if (m.role === "tool") {
       let txt = textOf(m.content)
       const ims = Array.isArray(m.content) ? m.content.filter((p) => p?.type === "image_url").map(imageBlock).filter(Boolean) : []
+      const named = String(m.tool_call_id ?? "").trim()
+      // A result naming a call of this turn answers it; one whose id the
+      // client lost — none, or one no call here has — answers the earliest
+      // call still open that no other result names, which is the order the
+      // calls were made in.
+      const at = named ? turn?.open.findIndex((id) => id === named) ?? -1 : -1
+      const pick = at >= 0 ? at : turn ? turn.open.findIndex((id) => !turn.kept.has(id)) : -1
+      if (pick < 0) {
+        asText(txt, ims)
+        continue
+      }
+      const answered = turn.open.splice(pick, 1)[0]
       if (ims.length) {
-        let of = "tool call " + m.tool_call_id
-        const name = names[m.tool_call_id] || m.name
+        let of = "tool call " + answered
+        const name = names[answered] || m.name
         if (name) of = `${name} (${of})`
         seen.push({ type: "text", text: `[From the result of ${of}:]` }, ...ims)
         const note = ims.length === 1 ? "[The tool returned an image; it follows in the next message.]" : `[The tool returned ${ims.length} images; they follow in the next message.]`
         txt = txt.trim() ? txt + "\n\n" + note : txt + note
       }
-      out.push({ role: "tool", tool_call_id: m.tool_call_id, content: txt })
+      out.push({ role: "tool", tool_call_id: answered, content: txt })
       continue
     }
     if (m.role === "assistant" && m.tool_calls?.length) {
-      const calls = m.tool_calls.map((c) => {
-        const id = c.id || "call_" + hexID()
+      // a call the client sent without an id gets one, so its result can
+      // answer it instead of being turned into text
+      const calls = m.tool_calls.map((c, k) => {
+        const id = String(c.id ?? "").trim() || callID(i, k, c)
         names[id] = c.function?.name
         const args = c.function?.arguments
         return { id, type: "function", function: { name: c.function?.name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) } }
       })
       out.push({ role: "assistant", content: textOf(m.content), tool_calls: calls })
+      const open = calls.map((c) => c.id)
+      const kept = new Set()
+      for (let j = i + 1; j < msgs.length && msgs[j].role === "tool"; j++) {
+        const id = String(msgs[j].tool_call_id ?? "").trim()
+        if (open.includes(id)) kept.add(id)
+      }
+      turn = { open, kept }
       continue
     }
     let blocks = blocksOf(m.content)
@@ -723,6 +788,8 @@ function qoderMessages(msgs) {
     if (!blocks.length) continue
     if (m.role === "user" && seen.length) [blocks, seen] = [[...seen, ...blocks], []]
     out.push({ role: m.role, content: blocks })
+    // a result after the assistant's own words answers no call before it
+    turn = null
   }
   showSeen()
   return out
@@ -747,6 +814,49 @@ function windowFor(chat, m, reply = 0) {
   return m.windows.find((w) => w >= need) ?? m.windows[m.windows.length - 1]
 }
 
+// UNCACHED are the blocks Qoder's client never marks for the prompt cache.
+const UNCACHED = new Set(["thinking", "redacted_thinking", "tool_use", "tool_result"])
+
+// cacheMarked is the turns as Qoder's own client sends them for the prompt
+// cache (#290): every user turn's blocks also as contents, and the last
+// block of the last turn that isn't thinking or a tool's marked
+// cache_control ephemeral. That is qoder-agent-sdk's (Qoder.app and
+// qodercli 1.1.75 alike): the last message's last such block, and nothing
+// when the last turn is a tool's. A model behind Qoder that caches only
+// what is marked (Anthropic's) read none of a conversation without it,
+// while one that caches on its own (Fast) did. The caller's turns are left
+// as they were.
+function cacheMarked(msgs) {
+  const out = msgs.map((m) => (m.role === "user" && Array.isArray(m.content) ? { ...m, contents: m.content } : m))
+  const last = out.at(-1)
+  if (last?.role !== "user" || !Array.isArray(last.content)) return out
+  const at = last.content.findLastIndex((b) => b?.type && !UNCACHED.has(b.type))
+  if (at < 0) return out
+  const blocks = last.content.slice()
+  blocks[at] = { ...blocks[at], cache_control: { type: "ephemeral" } }
+  out[out.length - 1] = { ...last, content: blocks, contents: blocks }
+  return out
+}
+
+// sessionOf is the session_id a request goes out under: one for every turn
+// of a conversation and another for each conversation, as Qoder's client
+// sends its own session's (#290). Qoder can keep a conversation where its
+// prompt is cached only when its turns say they are one. It is the
+// client's prompt_cache_key (Codex's thread), else its user, else the
+// conversation's opening (its system prompt and first user turn), hashed,
+// so no key of the client's goes to Qoder as it is.
+function sessionOf(chat) {
+  let seed = String(chat.prompt_cache_key ?? "").trim() ? "key\0" + chat.prompt_cache_key : String(chat.user ?? "").trim() ? "user\0" + chat.user : ""
+  if (!seed) {
+    const msgs = chat.messages ?? []
+    const sys = msgs.filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content))
+    const first = msgs.find((x) => x.role === "user")
+    seed = "chat\0" + JSON.stringify([sys, first?.content ?? ""])
+  }
+  const h = createHash("sha256").update(seed).digest("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
 // qoderBody is the plaintext agent_chat_generation takes for a chat
 // completion request, for model m.
 function qoderBody(chat, m) {
@@ -760,7 +870,12 @@ function qoderBody(chat, m) {
   if (effort) params.reasoning_effort = effort
   const window = windowFor(chat, m, params.max_tokens)
   if (window > 0) params.context_length = window
+  const request = randomUUID()
   const body = {
+    request_id: request,
+    request_set_id: request,
+    chat_record_id: request,
+    session_id: sessionOf(chat),
     parameters: params,
     business: { product: "app", version: COSY_VERSION, type: "agent", id: hexID(), name: "magpie session", begin_at: Date.now(), stage: "start" },
     agent_id: "agent_common",
@@ -768,7 +883,7 @@ function qoderBody(chat, m) {
     session_type: "app",
     model_config: m.config,
     system: [sys],
-    messages: [{ role: "system", content: [sys] }, ...qoderMessages(chat.messages ?? [])],
+    messages: [{ role: "system", content: [sys] }, ...cacheMarked(qoderMessages(chat.messages ?? []))],
   }
   if (tools.length)
     body.tools = tools.map((t) => ({
@@ -792,6 +907,14 @@ const QUOTA_CODES = new Set(["110", "112", "113", "114", "115", "116", "117", "1
 // supported, input too long, too many media, a custom model's service
 const REQUEST_CODES = new Set(["406", "416", "430", "80411", "80412", "100400", "100401", "100403"])
 const BUSY_WAIT = 30
+// UPSTREAM_FAILED is Qoder saying the model's own vendor behind it failed:
+// "Error in upstream response", which Qoder sends as a 400 (SlouchyQuill507
+// on Discord, qoder-cn). Nothing is wrong with the request or the account,
+// so it is a 502, which magpie asks again or of another account, not a
+// 400 that ends the turn as the client's fault. A request too long for the
+// model fails the same way, and magpie tells that one apart by its size
+// (tooLongUnsaid), at 502 as at 400.
+const UPSTREAM_FAILED = /\berror in upstream response\b/i
 
 function failure(status, text) {
   if (status < 400 || status > 599) status = 502
@@ -833,10 +956,11 @@ function failure(status, text) {
     const model = queue?.modelKey ? ` for ${queue.modelKey}` : ""
     const tier = queue?.queueType ? ` (this plan's queue: ${queue.queueType})` : ""
     const what = queue?.isQueued === true ? "queued the request" : "is busy"
-    return { status: 503, message: `Qoder ${what}${model}${tier}; try again in ${wait}s`, retryAfter: wait, signIn: "" }
+    return { status: 503, message: `Qoder ${what}${model}${tier}; try again in ${wait}s`, retryAfter: wait, signIn: "", queue: queue ?? {} }
   }
   if (QUOTA_CODES.has(code)) return { status: 429, message: "usage limit reached: " + msg, signIn: "" }
   if (REQUEST_CODES.has(code)) return { status: 400, message: `Qoder refused the request (${code}): ${msg}`, signIn: "" }
+  if (UPSTREAM_FAILED.test(msg)) return { status: 502, message: msg, signIn: "" }
   // a refused chat is the built-in's 401, which never marked the account
   // lapsed: only a refused refresh did (errorResponse says kept). Qoder's
   // own words go with it: a 401 right after signing in isn't a lapsed
@@ -862,6 +986,148 @@ const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : und
       ...(retryAfter > 0 ? { "Retry-After": String(retryAfter) } : {}),
     },
   })
+
+// ---- Qoder's queue -------------------------------------------------------------
+
+// A chat Qoder answers with its queue code (10605) is waited out as Qoder's
+// own client waits it (qoder-agent-sdk's worker in Qoder.app 0.4.3, its
+// "[ModelQueue]" path): it asks GET /api/v2/service/ask/queue/status with
+// the request's requestSetId, the model and the plan's queueType, at once
+// and then every retryAfterSeconds (held to 0.5s..30s, 30s when unsaid),
+// while the state says isQueued or serviceAvailable false. Once isQueued is
+// false it waits that state's retryAfterSeconds, if any, and sends the same
+// request again, request_set_id and all, up to 10 times. Three failed asks
+// in a row, a 404 (no queue there) or a state with neither field end the
+// wait. Qoder's client waits up to an hour; here the whole of it is held
+// under QUEUE.budget from the request's start, since nothing reaches the
+// agent meanwhile: magpie keeps a stream's agent alive with comments for 5
+// minutes of a vendor's silence, and then leaves it to the agent's own
+// timeout. Past the budget it is the 503 with Retry-After it was before, so
+// magpie may ask another account. Qoder's client also tells
+// /api/v2/service/ask/finish when its turn ends; that is left out, and its
+// own log says Qoder's TTL releases the lease when finish is not heard.
+const QUEUE_STATUS_PATH = "/algo/api/v2/service/ask/queue/status"
+const QUEUE = {
+  budget: 4 * 60 * 1000, // the longest a request is held, its first answer's wait included
+  shortest: 500,
+  longest: 30_000,
+  unsaid: 30_000, // a pause when the queue gives no retryAfterSeconds
+  recoveries: 10, // the queue waited out this many times, at most, for one request
+  failures: 3, // status asks failing in a row that end the wait
+  ask: 30_000, // the longest one status ask may take
+  now: () => Date.now(),
+  pause: (ms, signal) =>
+    new Promise((ok, no) => {
+      if (signal?.aborted) return no(signal.reason ?? new DOMException("aborted", "AbortError"))
+      const t = setTimeout(() => {
+        signal?.removeEventListener("abort", stop)
+        ok()
+      }, ms)
+      const stop = () => {
+        clearTimeout(t)
+        no(signal.reason ?? new DOMException("aborted", "AbortError"))
+      }
+      signal?.addEventListener("abort", stop, { once: true })
+    }),
+}
+
+// queuePause is how long to wait before asking the queue again: the
+// queue's retryAfterSeconds held to 0.5s..30s, or 30s when it said none.
+function queuePause(seconds) {
+  const n = Number(seconds)
+  const ms = Number.isFinite(n) ? n * 1000 : QUEUE.unsaid
+  return Math.min(QUEUE.longest, Math.max(QUEUE.shortest, ms))
+}
+
+class QueueEnd extends Error {}
+
+// queueState is the queue's state in a status reply, found as Qoder's
+// client finds it: the object, or one under data/result/message/body, as
+// an object or a JSON string, that says isQueued or serviceAvailable.
+function queueState(text) {
+  let root
+  try {
+    root = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  const todo = [root]
+  const seen = new Set()
+  while (todo.length) {
+    const o = todo.shift()
+    if (!o || typeof o !== "object" || Array.isArray(o) || seen.has(o)) continue
+    seen.add(o)
+    const flag = (v) => (typeof v === "boolean" ? v : v === "true" ? true : v === "false" ? false : undefined)
+    const isQueued = flag(o.isQueued)
+    const serviceAvailable = flag(o.serviceAvailable)
+    if (isQueued !== undefined || serviceAvailable !== undefined) {
+      const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? undefined : Number(v))
+      const str = (v) => (typeof v === "string" && v ? v : undefined)
+      return { isQueued, serviceAvailable, modelKey: str(o.modelKey), queueType: str(o.queueType), retryAfterSeconds: num(o.retryAfterSeconds) }
+    }
+    for (const k of ["data", "result", "message", "body"]) {
+      const v = o[k]
+      if (v && typeof v === "object") todo.push(v)
+      else if (typeof v === "string")
+        try {
+          todo.push(JSON.parse(v))
+        } catch {}
+    }
+  }
+  return undefined
+}
+
+// queueStatus asks Qoder's queue where the request stands.
+async function queueStatus(api, cred, { requestSetId, modelKey, queueType, requestId, sessionId }, signal, deadline) {
+  const q = new URLSearchParams({ requestSetId, modelKey })
+  if (queueType) q.set("queueType", queueType)
+  const url = `${api}${QUEUE_STATUS_PATH}?${q}`
+  const headers = { ...cosyHeaders(url, cred, ""), "X-Request-ID": requestId, "X-Session-ID": sessionId }
+  delete headers["Content-Type"]
+  const left = Math.min(QUEUE.ask, deadline - QUEUE.now())
+  if (left <= 0) throw new QueueEnd("the queue's wait ran out")
+  const res = await fetch(url, { headers, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(left)]) : AbortSignal.timeout(left) })
+  const text = await res.text()
+  if (res.status === 404) throw new QueueEnd("Qoder has no queue status here")
+  if (!res.ok) throw new Error(`queue status: HTTP ${res.status}`)
+  const st = queueState(text)
+  if (!st) throw new QueueEnd("the queue status said nothing of the queue")
+  return st
+}
+
+// queueWait waits in Qoder's queue for the request, from the state its
+// refusal gave, until the queue lets it through (true) or the wait ends
+// (false). A cancelled request throws.
+async function queueWait(api, cred, ask, first, signal, deadline) {
+  let q = first ?? {}
+  let asked = false
+  let failed = 0
+  for (;;) {
+    if (signal?.aborted) throw signal.reason ?? new DOMException("aborted", "AbortError")
+    if (QUEUE.now() >= deadline) return false
+    if (asked) await QUEUE.pause(Math.min(queuePause(q.retryAfterSeconds), Math.max(0, deadline - QUEUE.now())), signal)
+    asked = true
+    if (QUEUE.now() >= deadline) return false
+    let st
+    try {
+      st = await queueStatus(api, cred, { ...ask, modelKey: q.modelKey ?? ask.modelKey, queueType: q.queueType ?? ask.queueType }, signal, deadline)
+    } catch (e) {
+      if (signal?.aborted) throw signal.reason ?? e
+      if (e instanceof QueueEnd) return false
+      if (++failed >= QUEUE.failures) return false
+      q = { ...q, retryAfterSeconds: undefined }
+      continue
+    }
+    failed = 0
+    q = { ...st, modelKey: st.modelKey ?? q.modelKey, queueType: st.queueType ?? q.queueType }
+    if (st.isQueued === false) {
+      if (st.retryAfterSeconds > 0) await QUEUE.pause(Math.min(queuePause(st.retryAfterSeconds), Math.max(0, deadline - QUEUE.now())), signal)
+      return QUEUE.now() < deadline
+    }
+    if (st.serviceAvailable === false || st.isQueued === true) continue
+    return false
+  }
+}
 
 // ---- the reply ----------------------------------------------------------------
 
@@ -1015,7 +1281,7 @@ async function* sseLines(body) {
 async function* events(body) {
   const a = new Splitter()
   let index = -1 // the tool call being given
-  let native = -1 // the native tool call being assembled
+  const native = new Map() // upstream index -> call and its output index
   // one piece of the split text as an event: a call, text, or a call that
   // can't be read, which ends the turn as a 502
   const piece = (f) =>
@@ -1055,16 +1321,29 @@ async function* events(body) {
     // tool calls served the OpenAI way keep Qoder's id: a result answers it
     for (const tc of delta.tool_calls ?? []) {
       const i = Number(tc.index ?? 0)
-      if (i !== native) {
-        native = i
+      const name = typeof tc.function?.name === "string" ? tc.function.name.trim() : ""
+      const args = tc.function?.arguments ?? ""
+      if (!tc.id && !name && !args) continue
+      let call = native.get(i)
+      if (!call) {
+        call = { id: "", args: "" }
+        native.set(i, call)
+      }
+      if (tc.id) call.id = tc.id
+      if (call.index === undefined) {
+        // An id or arguments can arrive before the name. Never emit an
+        // unnamed tool: clients persist it and other providers reject it.
+        call.args += args
+        if (!name) continue
         for (const f of a.flush()) {
           const e = piece(f)
           yield e
           if (e.error) return
         }
         a.sawTool = true
-        yield { tool: { index: ++index, id: tc.id || "call_" + hexID(), name: tc.function?.name ?? "", args: tc.function?.arguments ?? "" } }
-      } else if (tc.function?.arguments) yield { args: { index, text: tc.function.arguments } }
+        call.index = ++index
+        yield { tool: { index: call.index, id: call.id || "call_" + hexID(), name, args: call.args } }
+      } else if (args) yield { args: { index: call.index, text: args } }
     }
     fr = chunk?.choices?.[0]?.finish_reason || fr
     // the usage comes in a chunk of its own after the finish, with no
@@ -1085,17 +1364,27 @@ async function* events(body) {
     yield e
     if (e.error) return
   }
+  if ([...native.values()].some((call) => call.index === undefined)) {
+    yield { error: { status: 502, message: "the model's native tool call has no name; it is not sent on as a tool" } }
+    return
+  }
   yield { stop: a.sawTool ? "tool_calls" : fr === "length" ? "length" : "stop", usage }
 }
 
 // answer turns Qoder's reply into the chat completion OpenAI's API gives.
 // A failure before the answer keeps its status; one after it ends the
 // stream with an error.
-async function answer(res, chat) {
+// opened is a chat reply's events and the first of them, read before
+// anything is answered: a refusal in the stream (Qoder's queue among them)
+// comes first.
+async function opened(res) {
+  const it = events(res.body)
+  return { it, first: await it.next() }
+}
+
+async function answer({ it, first }, chat) {
   const id = "chatcmpl-" + hexID()
   const created = Math.floor(Date.now() / 1000)
-  const it = events(res.body)
-  const first = await it.next()
   if (first.value?.error) return errorResponse(first.value.error)
   if (first.done) return errorResponse({ status: 502, message: "Qoder ended without an answer" })
 
@@ -1111,7 +1400,7 @@ async function answer(res, chat) {
       if (e.text) msg.content += e.text
       if (e.reasoning) reasoning += e.reasoning
       if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } })
-      if (e.args) calls[calls.length - 1].function.arguments += e.args.text
+      if (e.args) calls[e.args.index].function.arguments += e.args.text
       if (e.stop) [stop, usage] = [e.stop, e.usage]
     }
     if (reasoning) msg.reasoning_content = reasoning
@@ -1229,7 +1518,8 @@ const CAMPAIGN_MACHINE_TTL = 60 * 60 * 1000 // Qoder's desktop client renews its
 //
 // Where each one keeps it (Qoder desktop 0.4.3's packages, qodercli 1.1.66):
 //   - desktop: <install>/resources/umid/runtime-info(.exe): Qoder.app on
-//     macOS, %LOCALAPPDATA%\Programs\Qoder (the user installer) on Windows,
+//     macOS, %LOCALAPPDATA%\Programs\Qoder (the user installer) or
+//     %ProgramFiles%\Qoder (a machine-wide install) on Windows,
 //     /opt/Qoder (the .deb and the .rpm) on Linux;
 //   - CLI: <config>/.bin, where <config> is QODER_CONFIG_DIR, else
 //     QODER_CLI_HOME (or the home folder) joined with QODER_CONFIG_DIR_NAME
@@ -1244,6 +1534,8 @@ async function campaignRuntime({ home = homedir(), platform = process.platform, 
   if (platform === "win32") {
     const local = env.LOCALAPPDATA || join(home, "AppData", "Local")
     paths.push(join(local, "Programs", "Qoder", "resources", "umid", name))
+    // the machine-wide installer, as VS Code's system setup places it
+    for (const dir of [env.ProgramFiles || env.PROGRAMFILES, env.ProgramW6432]) if (dir) paths.push(join(dir, "Qoder", "resources", "umid", name))
   } else if (platform === "darwin") {
     for (const dir of ["/Applications", join(home, "Applications")]) paths.push(join(dir, "Qoder.app", "Contents", "Resources", "umid", name))
   } else if (platform === "linux") {
@@ -1264,7 +1556,21 @@ async function campaignRuntime({ home = homedir(), platform = process.platform, 
     if (path && (await isFile(path))) found.push({ path, time: (await stat(path)).mtimeMs })
   }
   if (found.length) return found.sort((a, b) => b.time - a.time)[0].path
-  throw new Error("Qoder check-in: device identity runtime not found; install Qoder desktop or sign in to Qoder CLI once, or set QODER_RUNTIME_INFO to its runtime-info executable")
+  throw new RuntimeMissing()
+}
+
+// RuntimeMissing: no Qoder desktop or CLI on this machine to read the
+// device identity from. Qoder offers the daily credits only on a request
+// carrying it (without it the list answers 200 with no CLAIM_BENEFIT), and
+// the identity is the output of Qoder's own signed helper, which the plugin
+// never makes up. Asking again won't change that until the user installs
+// Qoder, so the check-in says what to do once instead of "tries again later".
+class RuntimeMissing extends Error {
+  constructor() {
+    super(
+      "Qoder check-in: device identity runtime not found. Qoder gives the daily credits only to a device its own app identifies, and this machine has neither Qoder desktop nor Qoder CLI to read that identity from. Install Qoder desktop (or install Qoder CLI and sign in to it once), or set QODER_RUNTIME_INFO to its runtime-info executable; magpie checks in again the next day",
+    )
+  }
 }
 
 // Read the SDK identity as Qoder does: environment 3 is international; on
@@ -1421,7 +1727,10 @@ const SITES = {
     web: "https://qoder.com",
     openapi: "https://openapi.qoder.sh",
     api: "https://api3.qoder.sh",
-    redirect: "qoder-app://",
+    // none, as Qoder's CLI (@qoder-ai/qodercli 1.1.75) sends: the desktop
+    // app's qoder-app:// hands the finished page to Qoder.app, when it is
+    // installed, instead of leaving it in the tab while this polls (#276)
+    redirect: "",
     models: MODELS,
   },
   "qoder-cn": {
@@ -1619,8 +1928,14 @@ const makePlugin = (site) => async ({ client }) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase()
     try {
       const machine = site.id === "qoder" ? await machineForCampaign(cred.uid) : {}
-      let res = await campaignCall(url, method, body, cred.deviceToken, machine, init.signal)
-      if (res.status === 401 || res.status === 403) res = await campaignCall(url, method, body, await deviceToken(getAuth, cred.deviceToken), machine, init.signal)
+      // A PAT account has no device token: its job token signs the campaigns
+      // pages too, as it does the usage read. Nothing is rotated on that
+      // path — the refusal is the answer.
+      const patToken = cred.patAuth && !cred.deviceToken
+      const token = patToken ? cred.access : cred.deviceToken
+      let res = await campaignCall(url, method, body, token, machine, init.signal)
+      if (!patToken && (res.status === 401 || res.status === 403))
+        res = await campaignCall(url, method, body, await deviceToken(getAuth, cred.deviceToken), machine, init.signal)
       return signed(res, renewed(cred))
     } catch (e) {
       if (e?.expired) return signedInError(e)
@@ -1642,8 +1957,15 @@ const makePlugin = (site) => async ({ client }) => {
     if (!base) return { outcome: "inactive", message: "no campaigns page for this account" }
     try {
       const machine = site.id === "qoder" ? await machineForCampaign(cred.uid) : {}
+      // A PAT account has no device token: the campaigns pages take the job
+      // token the exchange gave, as the usage endpoint does. A live Qoder CN
+      // PAT account answered 200 to the list and CLAIMED to a claim, so the
+      // check-in works there as it does on a device-token account. That path
+      // has no second token to rotate, so a refusal is the answer.
+      const patToken = cred.patAuth && !cred.deviceToken ? cred.access : ""
       const call = async (url, method, body) => {
-        let res = await campaignCall(url, method, body, cred.deviceToken, machine)
+        let res = await campaignCall(url, method, body, patToken || cred.deviceToken, machine)
+        if (patToken) return res
         if (res.status === 401 || res.status === 403) {
           const token = await deviceToken(getAuth, cred.deviceToken)
           const current = latest(await getAuth())
@@ -1691,6 +2013,9 @@ const makePlugin = (site) => async ({ client }) => {
       }
       return { outcome: "failed", message: `claim: ${said || "unknown answer"}` }
     } catch (e) {
+      // no Qoder on this machine: an answer for the day, not a failure
+      // magpie would ask again every 30 minutes (plugins#304)
+      if (e instanceof RuntimeMissing) return { outcome: "ineligible", message: e.message }
       return { outcome: "failed", message: e?.message ?? String(e), ...(e?.expired ? { signIn: "expired" } : {}) }
     }
   }
@@ -1708,28 +2033,41 @@ const makePlugin = (site) => async ({ client }) => {
     try {
       m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
     } catch (e) {
-      // the built-in answered any failure to read the list 400
-      // (QoderModelOf), a refused one included, marking nothing
-      return errorResponse({ status: 400, message: e.message })
+      if (e instanceof SignInGone || e?.expired) return signedInError(e)
+      return errorResponse({ status: 502, message: e?.message ?? String(e) })
     }
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
-    const CHAT_URL = siteOf(site, cred).api + CHAT_PATH
-    const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))
-    const headers = {
-      ...cosyHeaders(CHAT_URL, cred, wire),
-      Accept: "text/event-stream",
-      "Cache-Control": "no-cache",
-      "X-Model-Key": m.key,
-      "X-Model-Source": m.source,
+    const api = siteOf(site, cred).api
+    const CHAT_URL = api + CHAT_PATH
+    const body = qoderBody(chat, m)
+    const wire = encodeBody(JSON.stringify(body))
+    // Qoder's queue is waited out (queueWait) and the same request, its
+    // request_set_id the one the queue knows, sent again
+    const deadline = QUEUE.now() + QUEUE.budget
+    const ask = { requestSetId: body.request_set_id, requestId: body.request_id, sessionId: body.session_id, modelKey: m.key }
+    for (let waited = 0; ; waited++) {
+      const headers = {
+        ...cosyHeaders(CHAT_URL, cred, wire),
+        Accept: "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Model-Key": m.key,
+        "X-Model-Source": m.source,
+      }
+      let res, open
+      try {
+        res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
+        if (res.ok) open = await opened(res)
+      } catch (e) {
+        return errorResponse({ status: 502, message: e.message })
+      }
+      const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
+      if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat)
+      try {
+        if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline))) return errorResponse(f)
+      } catch (e) {
+        return errorResponse({ status: 502, message: e?.message ?? String(e) })
+      }
     }
-    let res
-    try {
-      res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
-    } catch (e) {
-      return errorResponse({ status: 502, message: e.message })
-    }
-    if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
-    return answer(res, chat)
   }
 
   return {
@@ -1793,38 +2131,35 @@ const makePlugin = (site) => async ({ client }) => {
         { type: "oauth", label: `Sign in with ${site.name}`, authorize: () => deviceSignIn(site) },
         // PAT sign-in: exchange a Personal Access Token for a job token,
         // bypassing the OAuth device flow. PATs last up to 1 year.
-        // Not offered on Qoder CN: its CLI uses device chat directly and
-        // never makes a job token, so a PAT exchange may not produce one
-        // the chat endpoint accepts.
-        ...(site.id !== "qoder-cn"
-          ? [
-              {
-                type: "oauth",
-                label: `Sign in with ${site.name} PAT`,
-                prompts: [
-                  {
-                    type: "password",
-                    key: "pat",
-                    message: "Your Qoder Personal Access Token (from qoder.com/account/integrations)",
-                    placeholder: "pt-...",
-                    validate: (v) => (String(v ?? "").trim().startsWith("pt-") ? undefined : "PAT must start with pt-"),
-                  },
-                ],
-                authorize: (inputs) => {
-                  const pat = String(inputs?.pat ?? "").trim()
-                  if (!pat) throw new Error("enter your Personal Access Token")
-                  return {
-                    url: `${site.web}/account/integrations`,
-                    instructions: `Create a PAT at ${site.web}/account/integrations if you don't have one`,
-                    method: "auto",
-                    async callback() {
-                      return patSignIn(site, pat)
-                    },
-                  }
-                },
+        // Offered on both sites: Qoder CN's /api/v1/jobToken/exchange takes
+        // a PAT too (verified: HTTP 200 and a jt- token), and that job token
+        // signs the model list and chat calls with the COSY envelope as on
+        // qoder.com, so the exchange gives a token the chat endpoint accepts.
+        {
+          type: "oauth",
+          label: `Sign in with ${site.name} PAT`,
+          prompts: [
+            {
+              type: "password",
+              key: "pat",
+              message: `Your ${site.name} Personal Access Token (from ${site.web}/account/integrations)`,
+              placeholder: "pt-...",
+              validate: (v) => (String(v ?? "").trim().startsWith("pt-") ? undefined : "PAT must start with pt-"),
+            },
+          ],
+          authorize: (inputs) => {
+            const pat = String(inputs?.pat ?? "").trim()
+            if (!pat) throw new Error("enter your Personal Access Token")
+            return {
+              url: `${site.web}/account/integrations`,
+              instructions: `Create a PAT at ${site.web}/account/integrations if you don't have one`,
+              method: "auto",
+              async callback() {
+                return patSignIn(site, pat)
               },
-            ]
-          : []),
+            }
+          },
+        },
         // an enterprise VPC instance (Qoder CN), a method of its own so
         // that the sign-in above asks nothing new
         ...(site.vpcDomain
@@ -1898,4 +2233,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { campaignRuntime, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }
+export const _internal = { campaignRuntime, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, SITES, decodeBody, events, QUEUE, queueState }

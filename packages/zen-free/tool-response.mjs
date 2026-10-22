@@ -250,6 +250,8 @@ function appendFunction(target, fragment) {
   if (!object(fragment)) throw new GuardError("Invalid upstream function delta");
   for (const [key, value] of Object.entries(fragment)) {
     if (key === "name" || key === "arguments") {
+      // Nullable stream fields carry no new bytes; keep prior fragments intact.
+      if (value == null) continue;
       if (typeof value !== "string") throw new GuardError("Invalid upstream function delta");
       target[key] = (target[key] ?? "") + value;
     } else {
@@ -343,6 +345,14 @@ function chatBuffer(checkName) {
           const index = position(fragment.index);
           const previous = state.calls.get(index) ?? { index, function: {} };
           const value = { ...previous, ...fragment, index, function: previous.function };
+          // 空 ID 片段不应抹掉已缓存的有效 ID，同时允许首次 ID 后续到达。
+          if (
+            typeof previous.id === "string" &&
+            previous.id.length > 0 &&
+            (fragment.id == null || fragment.id === "")
+          ) {
+            value.id = previous.id;
+          }
           if (fragment.function != null) appendFunction(value.function, fragment.function);
           state.calls.set(index, value);
         }

@@ -6,7 +6,8 @@
 // ~/.box-agent/config/auth.json (read-only). Chats are OpenAI-compatible chat
 // completions at /api/web/llm/v2/chat/completions.
 
-import { randomUUID } from "node:crypto"
+import { randomUUID, randomBytes } from "node:crypto"
+import { createServer } from "node:http"
 import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -208,29 +209,52 @@ function isStale(a, marginMs = EARLY_MS) {
 }
 
 // Desktop sign-in is strictly read-only: never write ~/.box-agent/config/auth.json
-// and never spend the desktop app's refresh token.
+// and never spend the desktop app's refresh token. The app holds one account
+// at a time, so a seat keeps the token it was signed in with, saved on its own
+// record through the client (as kiro does), and reads the app only to take a
+// newer token for that same account. The app's current account never stands in
+// for a seat it does not name: a seat answered with another account's token
+// was billed to the wrong account and reported that account's credits, with
+// nothing anywhere saying so (plugins #166).
+//
+// sameAccount says whether a seat names the account the app holds now. A uid
+// the read token does not carry never agrees: the seat's own token is used, or
+// the seat asks to be signed in again, rather than being answered with
+// credentials it cannot be shown to own. A seat that names no account at all
+// has nothing to protect and means the app's own account.
+function sameAccount(seat, read) {
+  if (!read) return false
+  if (seat?.uid) return !!read.uid && String(seat.uid) === String(read.uid)
+  if (seat?.accountId) return !!read.name && String(seat.accountId) === String(read.name)
+  return true
+}
+
 async function currentAuth(client, auth, force = false) {
   if (auth?.source === "desktop") {
     const d = readDesktopAuth()
-    if (!d) {
-      const err = new Error("商汤小浣熊桌面端未登录，请打开商汤小浣熊客户端登录")
-      err.signIn = "expired"
-      throw err
+    // the app holds this seat's account: its token is the newest there is,
+    // and a seat asked again after a refusal takes it
+    if (sameAccount(auth, d) && !isStale(d, EARLY_MS)) {
+      if (d.access && d.access !== auth.access) {
+        try {
+          await client?.auth?.set?.({ path: { id: PROVIDER_ID }, body: { ...auth, ...d } })
+        } catch {}
+      }
+      return { a: { ...auth, ...d }, didRenew: false }
     }
-    if (
-      (auth.uid && d.uid && String(auth.uid) !== String(d.uid)) ||
-      (!auth.uid && auth.accountId && d.name && String(auth.accountId) !== String(d.name))
-    ) {
-      const err = new Error("商汤小浣熊桌面端已切换为其他账号，请重新登录")
-      err.signIn = "expired"
-      throw err
-    }
-    if (force || isStale(d, EARLY_MS)) {
+    // the app holds another account, or none: this seat goes on with the
+    // token it was signed in with until that token ends
+    if (!force && auth.access && !isStale(auth, EARLY_MS)) return { a: { ...auth }, didRenew: false }
+    if (sameAccount(auth, d)) {
       const err = new Error("商汤小浣熊桌面端登录态已过期，请打开商汤小浣熊客户端重新登录")
       err.signIn = "expired"
       throw err
     }
-    return { a: { ...auth, ...d }, didRenew: false }
+    const err = new Error(
+      d ? "商汤小浣熊桌面端已切换为其他账号，请重新登录" : "商汤小浣熊桌面端未登录，请打开商汤小浣熊客户端登录",
+    )
+    err.signIn = "expired"
+    throw err
   }
 
   let a = { ...auth }
@@ -493,11 +517,24 @@ async function claimDesktopOnboardingGrant(token) {
   return { points: 0, settled: false }
 }
 
+// allBills is the account's whole bill history, newest first. The bills
+// endpoint ignores paging.offset and always says total 0, so it can only be
+// asked for the newest N rows; 200 covered under a day of an active account
+// and left out the large grants a balance is made of (plugins #223).
+async function allBills(token) {
+  let bills = null
+  for (const limit of [1000, 5000]) {
+    bills = await apiGetJson(`/api/web/points/v1/bills?paging.limit=${limit}&paging.offset=0`, token)
+    if (!Array.isArray(bills?.items) || bills.items.length < limit) break
+  }
+  return bills
+}
+
 async function queryUsage(token) {
   const [points, entitlement, bills] = await Promise.all([
     apiGetJson("/api/web/points/v1/balance", token),
     apiGetJson("/api/web/auth/v1/entitlement_info", token).catch(() => null),
-    apiGetJson("/api/web/points/v1/bills?paging.limit=200&paging.offset=0", token).catch(() => null),
+    allBills(token).catch(() => null),
   ])
   const avail = Math.floor(Number(points?.available_points) || 0)
 
@@ -736,7 +773,73 @@ function toSuccessAuth(access, refresh, extra = {}) {
   }
 }
 
-function browserSignIn() {
+async function browserSignIn(timeoutMs = 10 * 60 * 1000) {
+  // The current authorize page accepts desktop loopback callbacks only with
+  // a 64-character hex state and a 127.0.0.1 /auth/callback URL.
+  const state = randomBytes(32).toString("hex")
+  const url = new URL(buildAuthorizeUrl(state))
+  url.searchParams.set("desktop_callback", "loopback")
+  let complete, timer, origin, received = false, settled = false
+  const done = new Promise((resolve) => { complete = resolve })
+  const finish = (result) => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    complete(result)
+    server.close()
+    server.closeIdleConnections?.()
+  }
+  const server = createServer(async (req, res) => {
+    const reply = (status, text) => {
+      res.writeHead(status, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'",
+      })
+      res.end(text)
+    }
+    const url = new URL(req.url || "/", "http://127.0.0.1")
+    if (req.headers.host !== origin || url.pathname !== "/auth/callback") return reply(404, "Not found")
+    if (req.method !== "GET") return reply(405, "Method not allowed")
+    const q = url.searchParams
+    if (q.getAll("state").length !== 1 || q.get("state") !== state) return reply(400, "回调不属于本次登录，请回到原授权页重试。")
+    if (settled || received) return reply(409, "本次回调已经处理，请回到 Magpie 查看结果。")
+    if (q.get("error")) {
+      reply(400, "登录未获授权，请回到 Magpie 重新登录。")
+      finish({ type: "failed", error: "商汤小浣熊授权被拒绝，请重新登录" })
+      return
+    }
+    const code = q.get("code") || ""
+    if (q.getAll("code").length !== 1 || !code || code.length > 4096) return reply(400, "回调缺少有效授权码，请回到原授权页重试。")
+    received = true
+    try {
+      const tokens = await exchangeAuthCode(code)
+      if (settled) return reply(408, "登录已超时，请回到 Magpie 重新登录。")
+      reply(200, "商汤小浣熊登录成功，可以关闭此页并返回 Magpie。")
+      finish(toSuccessAuth(tokens.access, tokens.refresh))
+    } catch (e) {
+      reply(502, "登录未完成，请返回 Magpie 查看错误并重新登录。")
+      finish({ type: "failed", error: e?.message ?? String(e) })
+    }
+  })
+  await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  origin = `127.0.0.1:${server.address().port}`
+  url.searchParams.set("redirect", `http://${origin}/auth/callback`)
+  timer = setTimeout(() => finish({ type: "failed", error: "商汤小浣熊登录超时，请重新登录" }), timeoutMs)
+  timer.unref?.()
+  return {
+    url: url.toString(),
+    instructions: "在浏览器完成商汤小浣熊登录并确认授权后，会自动返回此处；无需填写短信验证码或复制网页地址。",
+    method: "auto",
+    async callback() { return await done },
+  }
+}
+
+function manualSignIn() {
   const state = randomUUID()
   const url = buildAuthorizeUrl(state)
   return {
@@ -762,6 +865,11 @@ function desktopSignIn() {
     instructions: "直接复用本机商汤小浣熊客户端的实时登录态 (~/.box-agent/config/auth.json)。",
     method: "auto",
     async callback() {
+      // A new seat takes the account the app holds now, and its token, and
+      // keeps them on its own record: the app is signed in to one account at
+      // a time and drops the previous one's token as soon as it rotates off
+      // disk. Only the app's own account is offered here, so a seat is never
+      // quietly handed some other account's credentials.
       const d = readDesktopAuth()
       if (!d) return { type: "failed", error: "未检测到本机商汤小浣熊登录态 (~/.box-agent/config/auth.json)" }
       if (isStale(d, EARLY_MS)) {
@@ -769,9 +877,9 @@ function desktopSignIn() {
       }
       return {
         type: "success",
-        access: "",
+        access: d.access,
         refresh: "",
-        expires: 0,
+        expires: d.expires,
         source: "desktop",
         accountId: d.name || PROVIDER_NAME,
         uid: d.uid || "",
@@ -955,7 +1063,7 @@ export const RaccoonAuthPlugin = async ({ client }) => {
       methods: [
         {
           type: "oauth",
-          label: "商汤小浣熊账号 (浏览器登录 / 粘贴回调或 Token)",
+          label: "商汤小浣熊账号 (浏览器登录 / 自动返回)",
           authorize: async () => browserSignIn(),
         },
         {
@@ -963,12 +1071,19 @@ export const RaccoonAuthPlugin = async ({ client }) => {
           label: "商汤小浣熊桌面端登录态 (~/.box-agent/config/auth.json)",
           authorize: async () => desktopSignIn(),
         },
+        {
+          type: "oauth",
+          label: "手动粘贴回调链接或 Token（非短信验证码）",
+          authorize: async () => manualSignIn(),
+        },
       ],
     },
   }
 }
 
 export const _internal = {
+  browserSignIn,
+  sameAccount,
   stripBearer,
   decodeJwtClaims,
   jwtExpiryMs,

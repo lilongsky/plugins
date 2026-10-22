@@ -21,6 +21,190 @@ function tokenClaims(token) {
 }
 const expiry = token => Number(tokenClaims(token).exp) * 1000 || 0;
 
+// Kimi Work validates tools against Moonshot's "moonshot flavored json
+// schema" and refuses the whole request, 400 "tools.function.parameters is
+// not a valid moonshot flavored json schema", for shapes a JSON Schema
+// allows and agents send (#287). Codex's MCP and app tools are zod's
+// toJSONSchema with reused schemas as $defs (__schema0, __schema1 …), and
+// zod writes a schema derived from a reused one as a $ref beside what it
+// changed: z.number() reused, then .int(), is {"type":"integer","maximum":…,
+// "$ref":"#/$defs/__schema0"}, refused "when using $ref, type should be
+// defined in the referenced schema instead of the parent schema". The tools
+// are rewritten for the rules Kimi has been seen to hold:
+// - a $ref beside a type: the target, when it has no $ref of its own, is
+//   written in its place with the parent's keywords over it (what zod's
+//   derived schema means); otherwise the parent's type is left out;
+// - a type beside an anyOf ("type should be defined in anyOf items instead
+//   of the parent schema") is left out;
+// - an enum or const with no type gets the one its values have, or it and
+//   "null" ("type is not defined");
+// - a $ref's target with no type gets the one its keywords or branches say
+//   ("detected infinite recursion without termination condition").
+// A body Kimi takes as it is goes byte for byte; a rewrite is the same for
+// the same tools, so a cached prefix stays one.
+const isObj=x=>x!==null&&typeof x==='object'&&!Array.isArray(x);
+const MAP_KEYS=['properties','$defs','definitions','dependentSchemas','patternProperties'];
+const SUB_KEYS=['items','additionalProperties','contains','propertyNames','not','if','then','else','allOf','anyOf','oneOf','prefixItems','unevaluatedProperties','unevaluatedItems','contentSchema'];
+const NOTES=new Set(['$ref','description','title','default','examples','$comment','deprecated','readOnly','writeOnly']);
+const ALL_TYPES=['string','number','integer','boolean','object','array','null'];
+
+function eachSchema(node,f) {
+  if(Array.isArray(node)) {for(const v of node)eachSchema(v,f);return;}
+  if(!isObj(node))return;
+  f(node);
+  for(const k of MAP_KEYS) if(isObj(node[k])) for(const v of Object.values(node[k])) eachSchema(v,f);
+  for(const k of SUB_KEYS) if(k in node) eachSchema(node[k],f);
+}
+
+function refTarget(root,ref) {
+  if(typeof ref!=='string'||(ref!=='#'&&!ref.startsWith('#/')))return undefined;
+  let cur=root;
+  for(let tok of ref.split('/').slice(1)) {
+    tok=tok.replace(/~1/g,'/').replace(/~0/g,'~');
+    try{tok=decodeURIComponent(tok);}catch{}
+    if(!isObj(cur)&&!Array.isArray(cur))return undefined;
+    if(!Object.hasOwn(cur,tok))return undefined;
+    cur=cur[tok];
+  }
+  return cur;
+}
+
+const hasRefInside=s=>JSON.stringify(s).includes('"$ref"');
+
+function valueType(v) {
+  if(v===null)return 'null';
+  switch(typeof v){
+    case 'string':return 'string';
+    case 'boolean':return 'boolean';
+    case 'number':return Number.isInteger(v)?'integer':'number';
+  }
+  return Array.isArray(v)?'array':'object';
+}
+
+// the type an enum of vals is given: the one all non-null values have, with
+// "null" when a null is among them; undefined when there are none or they
+// are of more than one kind
+function enumType(vals) {
+  let t,nul=false;
+  for(const v of vals) {
+    const vt=valueType(v);
+    if(vt==='null'){nul=true;continue;}
+    if(vt==='array'||vt==='object')return undefined;
+    if(t===undefined||t===vt)t=vt;
+    else if((t==='integer'&&vt==='number')||(t==='number'&&vt==='integer'))t='number';
+    else return undefined;
+  }
+  if(t===undefined)return undefined;
+  return nul?[t,'null']:t;
+}
+
+// the types s can have, as its type, keywords, values or branches say;
+// undefined when they don't say
+function schemaTypes(root,s,depth=0) {
+  if(depth>16||!isObj(s))return undefined;
+  if('type' in s)return new Set([].concat(s.type).map(String));
+  if('$ref' in s){const t=refTarget(root,s.$ref);return t===undefined?undefined:schemaTypes(root,t,depth+1);}
+  if(Array.isArray(s.enum)||'const' in s)return new Set(('const' in s?[s.const]:s.enum).map(valueType));
+  for(const k of ['oneOf','anyOf','allOf']) {
+    if(!Array.isArray(s[k]))continue;
+    const ts=new Set();
+    for(const b of s[k]) {
+      const bt=schemaTypes(root,b,depth+1);
+      if(!bt){if(k!=='allOf')return undefined;continue;}
+      for(const t of bt)ts.add(t);
+    }
+    if(ts.size)return ts;
+  }
+  const has=(...ks)=>ks.some(k=>k in s);
+  if(has('properties','required','additionalProperties','patternProperties','minProperties','maxProperties','propertyNames','dependentRequired','dependentSchemas','unevaluatedProperties'))return new Set(['object']);
+  if(has('items','prefixItems','minItems','maxItems','uniqueItems','contains','unevaluatedItems'))return new Set(['array']);
+  if(has('minLength','maxLength','pattern','format','contentEncoding','contentMediaType'))return new Set(['string']);
+  if(has('minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf'))return new Set(['number']);
+  return undefined;
+}
+
+function typeFor(root,s) {
+  if(Array.isArray(s.enum))return enumType(s.enum);
+  if('const' in s)return enumType([s.const]);
+  const ts=schemaTypes(root,s);
+  if(!ts||!ts.size)return [...ALL_TYPES];
+  if(ts.has('integer')&&ts.has('number'))ts.delete('integer');
+  const names=ALL_TYPES.filter(t=>ts.has(t));
+  return names.length===1?names[0]:names;
+}
+
+// the same object with type written first, as an agent would have
+const withType=(s,type)=>{const rest={...s};delete rest.type;for(const k of Object.keys(s))delete s[k];Object.assign(s,{type},rest);};
+
+function moonshotSchema(root) {
+  let changed=false;
+  // a $ref beside a type, and a type beside an anyOf
+  eachSchema(root,s=>{
+    if('$ref' in s&&'type' in s) {
+      const t=refTarget(root,s.$ref);
+      if(isObj(t)&&!hasRefInside(t)) {
+        const own={...s};delete own.$ref;
+        for(const k of Object.keys(s))delete s[k];
+        Object.assign(s,structuredClone(t),own);
+      } else delete s.type;
+      changed=true;
+    }
+    if(Array.isArray(s.anyOf)&&'type' in s){delete s.type;changed=true;}
+  });
+  // an enum or const with no type
+  eachSchema(root,s=>{
+    if('type' in s||!(Array.isArray(s.enum)||'const' in s))return;
+    const t=enumType(Array.isArray(s.enum)?s.enum:[s.const]);
+    if(t!==undefined){withType(s,t);changed=true;}
+  });
+  // a $ref's target with no type
+  eachSchema(root,s=>{
+    if(typeof s.$ref!=='string')return;
+    const t=refTarget(root,s.$ref);
+    if(!isObj(t)||'type' in t||'anyOf' in t||'$ref' in t||!Object.keys(t).length)return;
+    const typ=typeFor(root,t);
+    if(typ!==undefined){withType(t,typ);changed=true;}
+  });
+  return changed;
+}
+
+// body with each tool's parameters as Kimi takes them; the same string when
+// nothing had to change or it isn't a chat body with tools
+function moonshotTools(body) {
+  if(typeof body!=='string'||!body.includes('"tools"'))return body;
+  let doc;
+  try{doc=JSON.parse(body);}catch{return body;}
+  if(!isObj(doc)||!Array.isArray(doc.tools))return body;
+  let changed=false;
+  for(const tool of doc.tools) {
+    const p=tool?.function?.parameters;
+    if(isObj(p)&&moonshotSchema(p))changed=true;
+  }
+  return changed?JSON.stringify(doc):body;
+}
+
+// Schema conversion reads the body before fetch; cancellation must cover that
+// read too, including a producer that never sends another chunk.
+async function bodyText(body,signal) {
+  const reader=new Response(body).body.getReader(),decoder=new TextDecoder();
+  const abort=()=>{void reader.cancel(signal.reason).catch(()=>{});};
+  signal?.addEventListener('abort',abort,{once:true});
+  try {
+    if(signal?.aborted)abort();
+    let text='';
+    for(;;) {
+      signal?.throwIfAborted();
+      const {done,value}=await reader.read();
+      signal?.throwIfAborted();
+      if(done)return text+decoder.decode();
+      text+=decoder.decode(value,{stream:true});
+    }
+  } finally {
+    signal?.removeEventListener('abort',abort);
+    reader.releaseLock();
+  }
+}
+
 function desktopFile({home=os.homedir(), platform=process.platform, appdata=process.env.APPDATA}={}) {
   const parent=platform==='win32' ? appdata || path.join(home,'AppData','Roaming')
     : platform==='darwin' ? path.join(home,'Library','Application Support') : path.join(home,'.config');
@@ -185,9 +369,17 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
           headers.set('Authorization','Bearer '+s.workToken);
           headers.set('User-Agent',UA);
           headers.set('Content-Type','application/json');
-          // Preserve messages, tools, stream and abort signal. There is no
+          // Preserve messages, stream and abort signal, and tools but for
+          // the schema shapes Kimi refuses (moonshotTools). There is no
           // fallback to api.kimi.com, a Code API key, or another provider.
-          const options=request?{...init,body:request.body,signal:request.signal,duplex:'half'}:init;
+          const signal=request?request.signal:init.signal;
+          const raw=request?request.body:init.body;
+          let body=raw;
+          if(raw!=null&&typeof raw!=='string')body=await bodyText(raw,signal);
+          signal?.throwIfAborted();
+          if(body!=null)body=moonshotTools(body);
+          const options={...init,body,signal};
+          if(body==null)delete options.body;
           let response;
           try { response=await fetchImpl(BASE+'/chat/completions',{...options,method:'POST',headers,redirect:'error'}); }
           catch(error) { if(options.signal?.aborted)throw error; throw unavailable(error); }
@@ -221,4 +413,4 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
 }
 
 export default async function KimiWorkProvider(){return createPlugin();}
-export const _internal={createPlugin,readDesktop,desktopFile,modelRows,BASE,MEMBER,REFRESH,REFRESH_LEAD,UA,expiry};
+export const _internal={createPlugin,moonshotTools,moonshotSchema,readDesktop,desktopFile,modelRows,BASE,MEMBER,REFRESH,REFRESH_LEAD,UA,expiry};

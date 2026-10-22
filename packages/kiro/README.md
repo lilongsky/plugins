@@ -17,8 +17,21 @@ Power) and makes its requests, in OpenCode and in magpie. Provider id:
   - Builder ID and Identity Center come back with an AWS sign-in URL and
     region. The plugin registers a client with AWS's OIDC service, sends
     the browser to AWS, and trades the code AWS returns.
-  - The account is named by the email Kiro has for it (`Get-Usage-Limits`),
-    and its plan is read from the same call.
+  - The account is named by the email Kiro has for it (`Get-Usage-Limits`)
+    and the way it was signed in to: `email (Google)`, `email (GitHub)`,
+    `email (Builder ID)`, `email (IAM Identity Center)`, `email
+    (Internal)`. Its plan is read from the same call, and its usage names
+    it the same way.
+  - Kiro keeps a Google, a GitHub, a Builder ID and an Identity Center
+    sign-in of one email as different accounts. The sign-in carries a `uid`
+    (`google`, `github`, `builderid`, `enterprise`), so magpie keeps each one
+    beside the others, and a sign-in again the same way replaces only its
+    own account. An account signed in before 0.1.13 is given its `uid`,
+    and one named by its bare email before 0.1.14 its name, on its first
+    request, model listing, usage read or renewal. Until then, a sign-in
+    again the same way goes beside it rather than replacing it: magpie
+    matches a sign-in by its name, and the plugin can't see the other
+    accounts to match it by `uid`.
   - A company's own identity provider (`external_idp`) is not supported
     here. Sign in with `kiro-cli login` and use the next method instead.
 - **Kiro CLI's or Kiro IDE's sign-in**: uses the account kiro-cli is signed
@@ -33,8 +46,12 @@ Power) and makes its requests, in OpenCode and in magpie. Provider id:
   kiro-cli refreshes its own token first (`kiro-cli debug refresh-auth-token`).
   A token the plugin refreshes itself is written back, so kiro-cli and the
   IDE go on with it.
-- **Kiro API key (`ksk_…`)**: sent with `tokentype: API_KEY`. Its profile is
-  found with `GetProfile`.
+- **Kiro API key (`ksk_…`)**: sent with `tokentype: API_KEY`, as kiro-cli
+  sends it. `GetProfile` is asked in us-east-1, then eu-central-1, for the
+  region the key's profile is in; a key it finds none for is used in
+  us-east-1, as kiro-cli uses it. Its models are listed with the control
+  plane's `ListAvailableModels` and its credits with `GetUsageLimits`, and
+  no profile is named in its calls, as kiro-cli names none.
 
 A browser sign-in is kept where OpenCode keeps sign-ins (`auth.json`; in
 magpie, `plugin-auth.json`) as an `oauth` entry. The entry holds the

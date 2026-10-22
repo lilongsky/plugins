@@ -1,5 +1,21 @@
 # macOS compatibility record
 
+## 0.1.6 upstream integration and cancellation regression
+
+Version 0.1.6 incorporates upstream `d324a96` (issue #287), retaining its tool-schema conversion and fixtures, alongside PR #218's membership renewal and single shared monthly meter. The merge conflict was only the `_internal` test-export list; both sets of exports are kept. The official upstream 0.1.5 and the earlier local PR 0.1.5 are different builds. A membership pair already imported by the local PR build stays usable without reconnecting; reference-only official sign-ins still need explicit reconnect.
+
+Independent review of the first merged candidate found a P2 inherited from the upstream body-buffering path: cancelling a partially produced Request/ReadableStream did not interrupt `Response.text()`, so a cancelled request could remain pending. The correction reads with a reader bound to the caller's abort signal, cancels it on abort, preserves the original cancellation reason, and removes the listener/releases the lock. It does not send the request after cancellation. The schema conversion itself is unchanged from upstream; the sign-in, renewal and monthly usage blocks are unchanged from the previously reviewed local build `36f575b`.
+
+Validation on Bun 1.4.3 uses disposable HOME/XDG directories, without real credentials:
+
+- **50 provider tests**, **189 assertions**, including the 7 upstream schema tests and 4 body/cancellation regressions.
+- **2158 full-repository tests**, 0 failures; **21 plugin hook checks** passed.
+- Slow Request and direct stream cancellation, an already-aborted body, and UTF-8 split across byte chunks are covered. Existing schema, streaming, credential-lineage and host-save-retry regressions remain green.
+
+The independent re-review cleared the cancellation finding. Separate Node and Bun 1.4.3 probes confirmed timely cancellation with no upstream request, original error/reason preservation, listener and reader-lock cleanup, and unchanged normal UTF-8/authentication/SSE behavior. The reviewer independently reran the 50 provider tests and focused hook check; it did not access real credentials or perform deployment.
+
+The first full-suite attempt used an isolated HOME under `/private/tmp`, which the repository's macOS temporary-directory guard rejected. Re-running with HOME inside the current `os.tmpdir()` passed; no other package was changed to bypass that guard. These are synthetic integration/regression results. They do not claim a new live Work inference request or a months-long renewal test. User-authorized local deployment and quota acceptance are recorded separately from these checks.
+
 ## PR #218 independent security review
 
 The initial 0.1.5 implementation at `91f52c7` had two reproducible races: usage could restore a signed-out account or overwrite a replacement login because `getAuth` followed by `client.auth.set` is not a conditional write; and a same-uid reconnect could inherit the previous login's pending refresh failure.

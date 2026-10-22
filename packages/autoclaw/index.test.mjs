@@ -163,6 +163,44 @@ test("every flagged line's replacement is one the gateway still takes", () => {
   expect(unflagged("Codex CLI is an open source project.")).not.toMatch(/Codex CLI/)
 })
 
+// ZCode (#245) and pi (#236) answered 406 on the CN managed gateway. The
+// fixtures are each reporter's identity line, byte for byte. #245's probes
+// found the gateway matching "You are ZCode" in any case, anywhere in the
+// text; pi's line wasn't probed, so its rewrite breaks "inside pi, a coding
+// agent harness" as a whole while keeping pi's name for the model.
+test("ZCode's and pi's identity lines are rewritten", () => {
+  const zcode = "You are ZCode, an interactive coding agent"
+  expect(unflagged(zcode)).toBe("You are the ZCode agent, an interactive coding agent")
+  expect(unflagged("Note: you are zcode here.")).toBe("Note: You are the ZCode agent here.")
+  for (const t of ["You are ZCode.", "you are zcode", `Intro.\n${zcode}.`]) {
+    expect(unflagged(t)).not.toMatch(/You are ZCode/i)
+  }
+
+  const pi = "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+  expect(unflagged(pi)).toBe("You are an expert coding assistant operating inside the pi coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.")
+  expect(unflagged(pi)).not.toMatch(/inside pi|pi, a coding agent harness/i)
+
+  // the same text in, the same text out: a cached prompt prefix stays put
+  expect(unflagged(unflagged(pi))).toBe(unflagged(pi))
+  expect(unflagged(unflagged(zcode))).toBe(unflagged(zcode))
+
+  // Claude Code's line is left to its own entry, exactly as before
+  expect(unflagged("You are Claude Code, Anthropic's official CLI for Claude.")).toBe("You are the Claude Code CLI, Anthropic's official CLI for Claude.")
+})
+
+// Claude Code 2.1.30x opens its system prompt with the SDK identity line,
+// not the CLI one. The CN gateway refuses "Claude Agent SDK" in any case,
+// wherever it sits; the bare phrase is matched so "running on" variants and
+// later mentions are covered too.
+test("Claude Agent SDK's identity line is rewritten", () => {
+  const sdk = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+  expect(unflagged(sdk)).toBe("You are a coding assistant.")
+  expect(unflagged("You are a Claude agent, running on Anthropic's Claude Agent SDK.")).toBe("You are a Claude agent, running on the agent framework.")
+  expect(unflagged("We build on the Claude Agent SDK; see docs.")).toBe("We build on the agent framework; see docs.")
+  // the same text in, the same text out: a cached prompt prefix stays put
+  expect(unflagged(unflagged(sdk))).toBe(unflagged(sdk))
+})
+
 // The gateway reads the system prompt, not the chat: the caller's own words
 // in a user or assistant message stay as they are.
 test("unflag rewrites system and developer messages only", () => {
@@ -171,12 +209,18 @@ test("unflag rewrites system and developer messages only", () => {
     { role: "developer", content: [{ type: "text", text: "You are Cursor" }] },
     { role: "user", content: "You are Codex" },
     { role: "assistant", content: [{ type: "text", text: "Codex CLI is what I use" }] },
+    { role: "system", content: [{ type: "text", text: "You are ZCode, an interactive coding agent" }] },
+    { role: "user", content: "You are ZCode, an interactive coding agent" },
+    { role: "tool", content: "operating inside pi, a coding agent harness" },
   ]
   expect(unflag(messages)).toBe(true)
   expect(messages[0].content).toBe("You are the Claude Code CLI, Anthropic's official CLI for Claude.")
   expect(messages[1].content[0].text).toBe("You are the Cursor agent")
   expect(messages[2].content).toBe("You are Codex")
   expect(messages[3].content[0].text).toBe("Codex CLI is what I use")
+  expect(messages[4].content[0].text).toBe("You are the ZCode agent, an interactive coding agent")
+  expect(messages[5].content).toBe("You are ZCode, an interactive coding agent")
+  expect(messages[6].content).toBe("operating inside pi, a coding agent harness")
   // nothing left to change the second time
   expect(unflag(messages)).toBe(false)
 })
@@ -235,6 +279,39 @@ test("overseas loader().fetch drops X-Harness-Type and explains 406", async () =
   }
 })
 
+
+test("CN loader rewrites the Claude Agent SDK identity and explains its 406", async () => {
+  const realFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body ?? "{}")) })
+    return new Response(JSON.stringify({ error: { code: null, message: "406 Not Acceptable", type: "api_error" } }), { status: 406 })
+  }
+  try {
+    const hooks = await AutoclawCnAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const body = JSON.stringify({
+      model: "zaicoding_glm-5.3",
+      messages: [
+        { role: "system", content: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+        { role: "user", content: "hi" },
+      ],
+    })
+
+    const refused = await loader.fetch("x", { method: "POST", body })
+    expect(refused.status).toBe(406)
+    expect(refused.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect((await refused.json()).error.message).toContain(REFUSED_HINT)
+
+    const sent = calls.at(-1)
+    expect(sent.url).toBe("https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw/chat/completions")
+    expect(sent.body.messages[0].content.startsWith(OFFICIAL_SYSTEM_PROMPT)).toBe(true)
+    expect(sent.body.messages[0].content).not.toMatch(/Claude Agent SDK/i)
+    expect(sent.headers.get("X-Authorization")).toBe("Bearer a1")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
 
 test("refreshTokens orders hosts by the token's source_id and falls back on 400002", async () => {
   const realFetch = globalThis.fetch
@@ -397,6 +474,32 @@ test("CN's managed gateway gets AutoClaw's official body and headers", async () 
   } finally { globalThis.fetch = realFetch }
 })
 
+// #245's surface: ZCode through autoclaw-cn's managed gateway. The system
+// text that leaves carries no "You are ZCode"; the user's own words do.
+test("CN's managed gateway gets ZCode's and pi's lines rewritten", async () => {
+  const realFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) })
+    return Response.json({ id: "x", object: "chat.completion", created: 1, model: "zaicoding_glm-5.3", choices: [{ index: 0, message: { role: "assistant", content: "OK" }, finish_reason: "stop" }] })
+  }
+  try {
+    const factory = await makePlugin("autoclaw-cn")
+    const hooks = await factory({ client: { auth: { set: async () => {} } } }, {})
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const zcode = "You are ZCode, an interactive coding agent"
+    const pi = "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+    for (const system of [zcode, pi]) {
+      await loader.fetch("x", { body: JSON.stringify({ model: "zaicoding_glm-5.3", stream: false, messages: [{ role: "system", content: system }, { role: "user", content: system }] }) })
+      const sent = calls.at(-1).body
+      expect(calls.at(-1).url).toBe("https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw/chat/completions")
+      expect(sent.messages[0].content).toBe(`${OFFICIAL_SYSTEM_PROMPT}\n\n${unflagged(system)}`)
+      expect(sent.messages[0].content).not.toMatch(/You are ZCode|inside pi, a coding agent harness/i)
+      expect(sent.messages[1].content).toBe(system)
+    }
+  } finally { globalThis.fetch = realFetch }
+})
+
 function makePlugin(id) {
   return _internal.makePluginForTest({
     providerId: id,
@@ -466,4 +569,106 @@ test("CN passes SSE through and marks 401 expired", async () => {
     expect(expired.status).toBe(401)
     expect(expired.headers.get("X-Magpie-Sign-In")).toBe("expired")
   } finally { globalThis.fetch = realFetch }
+})
+
+// #254: two sign-ins can share AutoClaw's default display name. The
+// usage-path signing (signinOnUsage) is remembered per sign-in, by uid or
+// by the refresh token when an old account has none, never per provider,
+// so the second account of a provider is still signed in that day.
+test("signinOnUsage signs every account, also two with the same name", async () => {
+  const realFetch = globalThis.fetch
+  const signed = []
+  const done = new Set()
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    const who = new Headers(init?.headers).get("Authorization")
+    if (url.includes("autoclaw-task-complete")) {
+      signed.push(who)
+      done.add(who)
+      return Response.json({ code: 0, data: { success: true, reward_points: 400 } })
+    }
+    if (url.includes("autoclaw-task-list")) {
+      return Response.json({ code: 0, data: [{ task_id: "daily_signin", status: done.has(who) ? "completed" : "pending", reward_points: 400 }] })
+    }
+    return Response.json({ code: 0, data: { total_balance: 1000, wallets: [] } })
+  }
+  try {
+    const hooks = await AutoclawAuthPlugin({ client: { auth: { set: async () => {} } } }, { signin: true, signinOnUsage: true })
+    const accounts = [
+      { type: "oauth", access: "a1", refresh: "r1", accountId: "AutoClaw用户", uid: "u1" },
+      { type: "oauth", access: "a2", refresh: "r2", accountId: "AutoClaw用户", uid: "u2" },
+      { type: "oauth", access: "a3", refresh: "r3", accountId: "AutoClaw用户" },
+      { type: "oauth", access: "a4", refresh: "r4", accountId: "AutoClaw用户" },
+    ]
+    for (const a of accounts) {
+      const u = await hooks.auth.usage(async () => a)
+      expect(u.windows.find((w) => w.name === "每日签到").display).toBe("今日已签 ✓ +400")
+    }
+    expect(signed).toEqual(["Bearer a1", "Bearer a2", "Bearer a3", "Bearer a4"])
+    expect(_internal.signinAccountKey("autoclaw", accounts[0])).toBe("autoclaw|uid:u1")
+    expect(_internal.signinAccountKey("autoclaw", accounts[2])).not.toBe(_internal.signinAccountKey("autoclaw", accounts[3]))
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+// plugins#274: the CN managed gateway answers a spent quota with a 403 whose
+// body says so (code 810000); the same token's next request gets as far as
+// the model check, so it is the quota, not the sign-in
+const SPENT = { code: 810000, message: "GLM-5.3 免费额度已用完,开通连续包月会员继续使用" }
+
+test("CN chat: a 403 for a spent quota is a 429 with the gateway's words, and the sign-in is kept", async () => {
+  const realFetch = globalThis.fetch
+  let answer = () => Response.json(SPENT, { status: 403 })
+  globalThis.fetch = async () => answer()
+  try {
+    const hooks = await AutoclawCnAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const body = JSON.stringify({ model: "zaicoding_glm-5.3", messages: [{ role: "user", content: "hi" }] })
+    const spent = await loader.fetch("x", { method: "POST", body })
+    expect(spent.status).toBe(429)
+    expect(spent.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    const e = (await spent.json()).error
+    expect(e.message).toBe("AutoClaw: GLM-5.3 免费额度已用完,开通连续包月会员继续使用")
+    expect(e.code).toBe(810000)
+
+    // any other 403, and a 401, is still the sign-in
+    for (const [status, raw] of [[403, ""], [403, '{"code":401,"message":"token invalid"}'], [401, JSON.stringify(SPENT)]]) {
+      answer = () => new Response(raw, { status })
+      const dead = await loader.fetch("x", { method: "POST", body })
+      expect(dead.status).toBe(401)
+      expect(dead.headers.get("X-Magpie-Sign-In")).toBe("expired")
+    }
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("overseas chat: a spent quota on the first host isn't asked of the second, and isn't the sign-in", async () => {
+  const realFetch = globalThis.fetch
+  const urls = []
+  let answer = () => Response.json(SPENT, { status: 403 })
+  globalThis.fetch = async (input) => {
+    urls.push(String(input))
+    return answer()
+  }
+  try {
+    const hooks = await AutoclawAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const body = JSON.stringify({ model: "zai_glm-5.3-flash", messages: [{ role: "user", content: "hi" }] })
+    const spent = await loader.fetch("x", { method: "POST", body })
+    expect(spent.status).toBe(429)
+    expect(spent.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect(urls.length).toBe(1)
+
+    // both hosts refusing the token is still the sign-in
+    urls.length = 0
+    answer = () => new Response("forbidden", { status: 403 })
+    const dead = await loader.fetch("x", { method: "POST", body })
+    expect(dead.status).toBe(401)
+    expect(dead.headers.get("X-Magpie-Sign-In")).toBe("expired")
+    expect(urls.length).toBe(2)
+  } finally {
+    globalThis.fetch = realFetch
+  }
 })

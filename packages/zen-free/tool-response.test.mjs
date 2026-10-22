@@ -994,6 +994,128 @@ test("chat: buffers names and arguments by choice/index, including arguments bef
   );
 });
 
+test("chat: later null or empty tool IDs do not replace buffered IDs", async () => {
+  const text = [
+    event(
+      chat(
+        {
+          tool_calls: [
+            { index: 0, id: "call_0", type: "function", function: { name: "read", arguments: "{}" } },
+            { index: 1, id: "call_1", type: "function", function: { name: "read", arguments: "{}" } },
+          ],
+        },
+        null,
+        0,
+      ),
+    ),
+    event(
+      chat(
+        { tool_calls: [{ index: 0, id: null }, { index: 1, id: "" }] },
+        null,
+        0,
+      ),
+    ),
+    event(chat({ tool_calls: [{ index: 2, function: { name: "read", arguments: "{}" } }] }, null, 0)),
+    event(chat({ tool_calls: [{ index: 2, id: "call_late" }] }, null, 0)),
+    event(
+      chat(
+        {
+          tool_calls: [
+            {
+              index: 0,
+              id: "choice_1_call",
+              type: "function",
+              function: { name: "read", arguments: "{}" },
+            },
+          ],
+        },
+        null,
+        1,
+      ),
+    ),
+    event(chat({ tool_calls: [{ index: 0, id: null }] }, null, 1)),
+    event(chat({}, "tool_calls", 0)),
+    event(chat({}, "tool_calls", 1)),
+    terminal("chat"),
+  ].join("");
+  const response = await guardToolResponse(sse(text, { chunkSize: 1 }), "chat", policy);
+  const values = frameData(await response.text());
+  assert.ok(!values.some((value) => value.error));
+
+  const choices = values.flatMap((value) => value.choices ?? []);
+  const callsFor = (index) =>
+    choices
+      .filter((choice) => choice.index === index)
+      .flatMap((choice) => choice.delta?.tool_calls ?? []);
+  assert.deepEqual(
+    callsFor(0).map((value) => value.id),
+    ["call_0", "call_1", "call_late"],
+  );
+  assert.deepEqual(callsFor(1).map((value) => value.id), ["choice_1_call"]);
+  assert.deepEqual(callsFor(0).map((value) => value.function.name), ["Read", "Read", "Read"]);
+});
+
+for (const legacy of [false, true]) {
+  const kind = legacy ? "function_call" : "tool_calls";
+  const delta = (fragment) => legacy
+    ? { function_call: fragment }
+    : { tool_calls: [{ index: 0, id: "call-0", type: "function", function: fragment }] };
+  const functions = (values) => values
+    .flatMap((value) => value.choices ?? [])
+    .flatMap((choice) => legacy
+      ? (choice.delta?.function_call ? [choice.delta.function_call] : [])
+      : (choice.delta?.tool_calls ?? []).map((value) => value.function));
+
+  test(`chat: ${kind} ignores null fields while preserving name and argument fragments`, async () => {
+    const fragments = [
+      { name: null, arguments: null },
+      { name: "Re", arguments: null },
+      { name: null, arguments: '{"path":' },
+      { name: "ad", arguments: null },
+      { name: null, arguments: '"example.txt"}' },
+      { name: null, arguments: null },
+    ];
+    const result = await guardToolResponse(
+      sse(fragments.map((fragment) => event(chat(delta(fragment)))).join("") +
+        event(chat({}, kind)) + terminal("chat"), { chunkSize: 1 }),
+      "chat",
+      policy,
+    );
+    const values = parse(await result.text()).map((frame) => frame.data);
+    assert.ok(!values.some((value) => value.error));
+    assert.deepEqual(functions(values), [{ name: "Read", arguments: '{"path":"example.txt"}' }]);
+  });
+
+  test(`chat: ${kind} still drops calls whose name remains null`, async () => {
+    const result = await guardToolResponse(
+      sse(event(chat(delta({ name: null, arguments: "{}" }), kind)) + terminal("chat")),
+      "chat",
+      policy,
+    );
+    const values = parse(await result.text()).map((frame) => frame.data);
+    assert.ok(!values.some((value) => value.error));
+    assert.deepEqual(functions(values), []);
+    assert.equal(textIn("chat", values), droppedNote(""));
+  });
+
+  for (const field of ["name", "arguments"]) {
+    for (const invalid of [42, false, [], {}]) {
+      test(`chat: ${kind} rejects ${field} delta ${JSON.stringify(invalid)}`, async () => {
+        const result = await guardToolResponse(
+          sse(event(chat(delta({ name: "Read", arguments: "" }))) +
+            event(chat(delta({ [field]: invalid }), kind)) + terminal("chat")),
+          "chat",
+          policy,
+        );
+        const values = parse(await result.text()).map((frame) => frame.data);
+        assert.deepEqual(functions(values), []);
+        assertError("chat", values[0]);
+        assert.equal(values[0].error.message, "Invalid upstream function delta");
+      });
+    }
+  }
+}
+
 test("chat: legacy fragments flush at DONE, but truncated pending calls never escape", async () => {
   const prefix =
     event(chat({ function_call: { arguments: "{}" } })) +

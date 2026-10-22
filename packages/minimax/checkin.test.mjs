@@ -3,7 +3,7 @@
 // minimax2api worked them out). Everything runs against the local fake.
 import "./nonet.mjs"
 import { afterEach, expect, test } from "bun:test"
-import { MiniMaxCodeAuthPlugin } from "./index.mjs"
+import { MiniMaxCodeAuthPlugin, MiniMaxCodeGlobalAuthPlugin } from "./index.mjs"
 import { _internal } from "./index.mjs"
 import { fakeMiniMax, json } from "./fake.mjs"
 
@@ -12,7 +12,7 @@ afterEach(() => f?.close())
 
 const STATUS = "/minimax-cloud/api/v1/signin/status"
 const CLAIM = "/minimax-cloud/api/v1/signin/claim"
-const auth = { type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 3600_000, accountId: "a@example.com" }
+const auth = { type: "oauth", access: "tok", refresh: "r", expires: Date.now() + 3600_000, accountId: "a@example.com", realUserID: "u-42" }
 
 const day = (over = {}) => ({ day_no: 1, points: 10, status: 2, is_today: true, ...over })
 
@@ -78,25 +78,136 @@ test("the check-in requests are signed like the account API", async () => {
     expect(r.headers.get("yy")).toBeTruthy()
     expect(r.headers.get("x-timestamp")).toBeTruthy()
     expect(r.headers.get("x-signature")).toBeTruthy()
-    expect(r.query.get("device_platform")).toBe("mcode")
+    expect(r.query.get("device_platform")).toBe("web")
+    expect(r.query.get("is_desktop")).toBe("1")
+    expect(r.query.get("desktop_version")).toBeTruthy()
+    expect(r.query.get("client")).toBe("mcode")
+    expect(r.query.get("user_id")).toBe("u-42")
     expect(r.query.get("timezone_offset")).toBe(String(new Date().getTimezoneOffset() * -60))
   }
   expect(claim?.text).toBe("{}")
 })
 
-test("the China panel is asked on the chat host, not the account host", async () => {
+// Magic_zero on Discord: the international site's check-in was refused
+// (HTTP 401) while the same account chatted. MiniMax Code asks it as the
+// account (user_id its realUserID); the fake turns away anyone else, as
+// a check-in asked as user 0 was.
+const asTheAccount = (r) => (r.query.get("user_id") === "u-42" ? null : new Response("", { status: 401 }))
+
+test("the international check-in is asked as the account, not as user 0", async () => {
+  f = fakeMiniMax()
+  f.route("GET " + STATUS, (r) => asTheAccount(r) ?? json({ base_resp: { status_code: 0 }, data: { days: week(2) } }))
+  f.route("POST " + CLAIM, (r) => asTheAccount(r) ?? json({ base_resp: { status_code: 0 }, data: { claim_result: 1, points: 20 } }))
+  const plugin = await MiniMaxCodeGlobalAuthPlugin({ client: { auth: { set: async () => {} } } })
+  expect(await plugin.auth.checkin(async () => auth)).toEqual({ outcome: "claimed", credit: 20, streak: 2 })
+  expect(f.seen.filter((r) => r.path === STATUS || r.path === CLAIM).map((r) => r.query.get("user_id"))).toEqual(["u-42", "u-42"])
+})
+
+test("an account saved without its user id has it looked up before the check-in", async () => {
+  f = fakeMiniMax()
+  f.route("GET /v1/api/user/info", () => json({ statusInfo: { code: 0 }, data: { userInfo: { realUserID: "u-42", userEmail: "a@example.com" } } }))
+  f.route("GET " + STATUS, (r) => asTheAccount(r) ?? json({ base_resp: { status_code: 0 }, data: { days: week(1, { status: 3 }) } }))
+  const plugin = await MiniMaxCodeGlobalAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const { realUserID, ...noID } = auth
+  expect(await plugin.auth.checkin(async () => noID)).toEqual({ outcome: "done", credit: 10, streak: 1 })
+  expect(f.seen.map((r) => r.path)).toEqual(["/v1/api/user/info", STATUS])
+})
+
+test("an account whose user id can't be read is failed without a check-in", async () => {
+  f = fakeMiniMax()
+  f.route("GET /v1/api/user/info", () => new Response("", { status: 401 }))
+  const plugin = await MiniMaxCodeGlobalAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const { realUserID, ...noID } = auth
+  const out = await plugin.auth.checkin(async () => noID)
+  expect(out.outcome).toBe("failed")
+  expect(f.seen.filter((r) => r.path === STATUS)).toHaveLength(0)
+})
+
+// MiniMax Code 0.6.12's minimax-cloud origins (chunk-5ADYFF2U, HA):
+// agent.minimaxi.com for cn, agent.minimax.io for en, the account API's
+// hosts. The China site's chat host (agent.minimax.cn) is not one of them.
+test("the China panel is asked on MiniMax Code's minimax-cloud host, not the chat host", async () => {
   f = fakeMiniMax()
   const was = { ..._internal.SITES["minimax-code"] }
   Object.assign(_internal.SITES["minimax-code"], {
-    agent: "https://account.example",
-    llm: f.origin,
+    agent: f.origin,
+    llm: "https://chat.example",
   })
-  f.route("GET " + STATUS, () => json({ base_resp: { status_code: 0 }, data: { days: week(1, { status: 3 }) } }))
-  const plugin = await MiniMaxCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+  try {
+    f.route("GET " + STATUS, () => json({ base_resp: { status_code: 0 }, data: { days: week(1, { status: 3 }) } }))
+    const plugin = await MiniMaxCodeAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const out = await plugin.auth.checkin(async () => auth)
+    expect(out).toEqual({ outcome: "done", credit: 10, streak: 1 })
+    expect(f.seen.filter((r) => r.path === STATUS)).toHaveLength(1)
+  } finally {
+    Object.assign(_internal.SITES["minimax-code"], was)
+  }
+})
+
+// Magic_zero on Discord, with 0.1.4: still "check-in: the sign-in was
+// refused (HTTP 401)" while chats went through. minimax-cloud answers a
+// token it doesn't take with 401 {"error":"invalid access token"} (asked
+// of agent.minimax.io). MiniMax Code's /checkin (T9.request) meets a 401
+// by renewing the sign-in (handleUnauthorized), reading the user id again
+// for the new token, and asking once more; the plugin's chat fetch also
+// renews on a 401, so only the check-in showed it.
+const refused = () => json({ error: "invalid access token" }, 401)
+const onlyNew = (r) => (r.headers.get("authorization") === "Bearer new" ? null : refused())
+
+for (const [name, Plugin] of [["international", MiniMaxCodeGlobalAuthPlugin], ["China", MiniMaxCodeAuthPlugin]]) {
+  test(`a ${name} check-in turned away with 401 is renewed and asked once more, as MiniMax Code does`, async () => {
+    f = fakeMiniMax()
+    const saved = []
+    f.route("POST /oauth2/token", () => json({ access_token: "new", refresh_token: "r2", token_type: "Bearer", expires_in: 3600 }))
+    f.route("GET /v1/api/user/info", (r) => onlyNew(r) ?? json({ statusInfo: { code: 0 }, data: { userInfo: { realUserID: "u-42" } } }))
+    f.route("GET " + STATUS, (r) => onlyNew(r) ?? asTheAccount(r) ?? json({ base_resp: { status_code: 0 }, data: { days: week(2) } }))
+    f.route("POST " + CLAIM, (r) => onlyNew(r) ?? asTheAccount(r) ?? json({ base_resp: { status_code: 0 }, data: { claim_result: 1, points: 20 } }))
+    const plugin = await Plugin({ client: { auth: { set: async (v) => (saved.push(v.body), true) } } })
+    expect(await plugin.auth.checkin(async () => auth)).toEqual({ outcome: "claimed", credit: 20, streak: 2 })
+    const asked = f.seen.map((r) => [r.path, r.headers.get("authorization")])
+    expect(asked).toEqual([
+      [STATUS, "Bearer tok"],
+      ["/oauth2/token", null],
+      ["/v1/api/user/info", "Bearer new"],
+      [STATUS, "Bearer new"],
+      [CLAIM, "Bearer new"],
+    ])
+    expect(f.seen.find((r) => r.path === "/oauth2/token").form).toMatchObject({ grant_type: "refresh_token", refresh_token: "r" })
+    expect(saved.map((a) => a.access)).toEqual(["new"])
+  })
+}
+
+test("a check-in still turned away after the renewal is failed, asked only twice", async () => {
+  f = fakeMiniMax()
+  f.route("POST /oauth2/token", () => json({ access_token: "new", refresh_token: "r2", token_type: "Bearer", expires_in: 3600 }))
+  f.route("GET /v1/api/user/info", () => json({ statusInfo: { code: 0 }, data: { userInfo: { realUserID: "u-42" } } }))
+  f.route("GET " + STATUS, refused)
+  const plugin = await MiniMaxCodeGlobalAuthPlugin({ client: { auth: { set: async () => true } } })
   const out = await plugin.auth.checkin(async () => auth)
-  expect(out).toEqual({ outcome: "done", credit: 10, streak: 1 })
+  expect(out.outcome).toBe("failed")
+  expect(out.message).toBe("check-in: the sign-in was refused (HTTP 401)")
+  expect(out.signIn).toBeUndefined()
+  expect(f.seen.filter((r) => r.path === STATUS)).toHaveLength(2)
+  expect(f.seen.filter((r) => r.path === "/oauth2/token")).toHaveLength(1)
+})
+
+test("a 401 whose renewal says the account is signed out says so", async () => {
+  f = fakeMiniMax()
+  f.route("POST /oauth2/token", () => json({ error: "invalid_grant" }, 400))
+  f.route("GET " + STATUS, refused)
+  const plugin = await MiniMaxCodeGlobalAuthPlugin({ client: { auth: { set: async () => true } } })
+  const out = await plugin.auth.checkin(async () => auth)
+  expect(out.outcome).toBe("failed")
+  expect(out.signIn).toBe("expired")
   expect(f.seen.filter((r) => r.path === STATUS)).toHaveLength(1)
-  Object.assign(_internal.SITES["minimax-code"], was)
+})
+
+test("a 403 is not renewed", async () => {
+  f = fakeMiniMax()
+  f.route("GET " + STATUS, () => new Response("no", { status: 403 }))
+  const out = await checkin()
+  expect(out.outcome).toBe("failed")
+  expect(f.seen.filter((r) => r.path === "/oauth2/token")).toHaveLength(0)
 })
 
 test("a day that hasn't started is inactive", async () => {

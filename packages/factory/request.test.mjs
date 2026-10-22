@@ -1662,3 +1662,40 @@ test("adapting a system prompt's configuration section is idempotent", async () 
   await l.fetch(url, { method: "POST", body: seen[0].body })
   expect(seen[1].body).toBe(seen[0].body)
 })
+
+// magpie-community/plugins#302, the reporter's offline repro: the billing
+// header joined with the instructions after it, in one block or a string
+// system, loses only its own line.
+test("a billing header joined with instructions loses only its own line (#302)", async () => {
+  const { l, seen } = await loaded()
+  const billing = "x-anthropic-billing-header: cc_version=2.1.300; cc_entrypoint=cli;"
+  const policy = "Preserve this task instruction. SYSTEM_POLICY_SENTINEL"
+  const cases = [
+    ["joined block", [{ type: "text", text: billing + "\n" + policy, cache_control: { type: "ephemeral" } }],
+      [{ type: "text", text: droid }, { type: "text", text: policy, cache_control: { type: "ephemeral" } }]],
+    ["joined string", billing + "\n" + policy, [{ type: "text", text: droid }, { type: "text", text: policy }]],
+    ["separate blocks", [{ type: "text", text: billing }, { type: "text", text: policy }], [{ type: "text", text: droid }, { type: "text", text: policy }]],
+    ["billing only", [{ type: "text", text: billing }], [{ type: "text", text: droid }]],
+    ["billing and a blank line", billing + "\n\n", [{ type: "text", text: droid }]],
+  ]
+  for (const [name, system, want] of cases) {
+    const messages = [{ role: "user", content: "Hello" }]
+    for (const endpoint of [url, url + "/count_tokens"]) {
+      await l.fetch(endpoint, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-5", system, messages, max_tokens: 64 }) })
+      const sent = JSON.parse(seen.at(-1).body)
+      expect([name, sent.system]).toEqual([name, want])
+      expect(sent.messages).toEqual(messages)
+      expect(sent.max_tokens).toBe(64)
+      // what was sent is what goes again unchanged
+      const once = seen.at(-1).body
+      await l.fetch(endpoint, { method: "POST", body: once })
+      expect(seen.at(-1).body).toBe(once)
+    }
+  }
+  // the identity after the header is still made Droid's
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-5", system: billing + "\nYou are Claude Code, Anthropic's official CLI for Claude.\n" + policy, messages: [{ role: "user", content: "Hello" }] }) })
+  const sent = JSON.parse(seen.at(-1).body).system
+  expect(JSON.stringify(sent)).not.toContain("x-anthropic-billing-header")
+  expect(sent[0].text).toStartWith(droid)
+  expect(JSON.stringify(sent)).toContain("SYSTEM_POLICY_SENTINEL")
+})

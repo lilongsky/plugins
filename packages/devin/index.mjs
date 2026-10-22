@@ -8,7 +8,7 @@
 import { Buffer } from "node:buffer"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, STATUS_CODES } from "node:http"
-import { gunzipSync } from "node:zlib"
+import { gunzipSync, gzipSync } from "node:zlib"
 import { spawn } from "node:child_process"
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
@@ -680,11 +680,12 @@ function statusField(out, key) {
 }
 
 // parseStatus reads `devin auth status`'s report: its User's Email (or
-// Name), its Account's Tier (or Plan).
+// Name), its Account's Tier (or Plan), and its Team ID when one is shown.
 function parseStatus(out) {
   if (!out.includes("Logged in")) return null
   const field = (key) => statusField(out, key)
-  return { user: field("Email") || field("Name"), plan: field("Tier") || field("Plan") }
+  const teamId = field("Team ID")
+  return { user: field("Email") || field("Name"), plan: field("Tier") || field("Plan"), ...(teamId ? { teamId } : {}) }
 }
 
 // inside says file is in dir, whichever way either is spelled.
@@ -736,9 +737,32 @@ const tierName = (t) =>
     .map((w) => w[0] + w.slice(1).toLowerCase())
     .join(" ")
 
+// whoOfStatus names the account GetUserStatus describes: its email (or
+// handle), and for a seat in an organization the organization's display
+// name too ("email · org"), so two organizations under one email are kept
+// apart as two accounts with their own quota pools.
+function whoOfStatus(u = {}) {
+  const base = String(u.email || u.name || "").trim()
+  if (!base) return undefined
+  const info = u.planStatus?.planInfo ?? {}
+  const devin = info.devinInfo ?? {}
+  const org = String(devin.accountDisplayName || info.teamName || u.teamName || "").trim()
+  const orgId = String(devin.orgId || u.teamId || "").trim()
+  const teamId = String(u.teamId || "").trim()
+  const named = org && org.toLowerCase() !== base.toLowerCase()
+  const user = named ? `${base} · ${org}` : base
+  return {
+    user,
+    ...(named ? { email: base } : {}),
+    plan: tierName(u.teamsTier || info.teamsTier) || info.planName || "",
+    ...(orgId ? { orgId } : {}),
+    ...(teamId ? { teamId } : {}),
+  }
+}
+
 // whoByKey is whose key it is, as GetUserStatus (usage's) says, asked with
-// the key itself: {user, plan}, null when Devin refuses the key, undefined
-// when it can't tell.
+// the key itself: {user, plan, orgId?, teamId?}, null when Devin refuses
+// the key, undefined when it can't tell.
 async function whoByKey(key, server) {
   let res, text
   try {
@@ -755,10 +779,7 @@ async function whoByKey(key, server) {
   } catch {
     return undefined
   }
-  const user = u.email || u.name
-  if (!user) return undefined
-  const info = u.planStatus?.planInfo ?? {}
-  return { user, plan: tierName(u.teamsTier || info.teamsTier) || info.planName || "" }
+  return whoOfStatus(u)
 }
 
 // cliAnswersFor says whether the CLI, run with home as its data folder,
@@ -775,11 +796,12 @@ async function cliAnswersFor(key, server, home) {
     return undefined
   }
   const own = readsHome(out, home)
-  const cli = parseStatus(out)?.user
-  if (!cli) return own
+  const st = parseStatus(out)
+  if (!st?.user) return own
   const who = await whoByKey(key, server)
   if (!who?.user) return own
-  return who.user.toLowerCase() === cli.toLowerCase()
+  if (who.teamId && st.teamId && who.teamId !== st.teamId) return false
+  return (who.email || who.user).toLowerCase() === st.user.toLowerCase()
 }
 
 // Each account's model list as the CLI last gave it, kept FRESH; one past
@@ -877,6 +899,9 @@ async function success(key, server) {
   if (who === null) throw new Error("Devin didn't take the sign-in: nobody is signed in with the token it gave")
   const metadata = { email: who?.user || "Devin" }
   if (who?.plan) metadata.plan = who.plan
+  const orgId = who?.orgId || who?.teamId
+  if (orgId) metadata.orgId = orgId
+  if (who?.teamId) metadata.teamId = who.teamId
   if (server && server !== SERVER) metadata.server = server
   return { type: "success", provider: ID, key, metadata }
 }
@@ -1065,11 +1090,20 @@ function fields(b) {
   return out
 }
 
-// frame wraps a message as the one frame of a Connect stream.
+// frame wraps a message as the one frame of a Connect stream. A message
+// past GZIP_AT goes gzipped (flag 1, with Connect-Content-Encoding: gzip),
+// as the devin CLI sends it: Devin's nginx turns away a body past 10 MiB on
+// the wire (413). The CLI (3000.11.92) gzips a GetChatMessage of 8,333
+// bytes and sends one of 8,083 as it is, and names the encoding only on a
+// gzipped request; it sends no Connect-Accept-Encoding.
+const GZIP_AT = 8 << 10
 function frame(msg) {
-  const out = new Uint8Array(5 + msg.length)
-  new DataView(out.buffer).setUint32(1, msg.length)
-  out.set(msg, 5)
+  const zip = msg.length > GZIP_AT
+  const body = zip ? gzipSync(msg) : msg
+  const out = new Uint8Array(5 + body.length)
+  out[0] = zip ? 1 : 0
+  new DataView(out.buffer).setUint32(1, body.length)
+  out.set(body, 5)
   return out
 }
 
@@ -1602,6 +1636,10 @@ async function* events(it) {
       }
     }
   }
+  if (!said && tools < 0) {
+    yield { error: { status: 502, message: "an empty reply (Devin returned no text, reasoning or tool call)" } }
+    return
+  }
   if (!usage.output) usage.output = Math.floor((said + 3) / 4)
   const prompt = usage.input + usage.cacheRead + usage.cacheWrite
   yield {
@@ -1625,15 +1663,21 @@ const errorResponse = ({ status, message }) =>
     headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
 
+async function* prepend(first, rest) {
+  yield first
+  yield* rest
+}
+
 // complete answers a chat completion through GetChatMessage.
 async function complete({ key, server, families }, chat, signal) {
   const uid = variantFor(families, chat.model, effortOf(chat.reasoning_effort))
+  const body = frame(build(chat, uid, key))
   let res
   try {
     res = await fetch(server + CHAT_RPC, {
       method: "POST",
-      headers: { "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1", Authorization: "Basic " + key },
-      body: frame(build(chat, uid, key)),
+      headers: { "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1", ...(body[0] & 1 ? { "Connect-Content-Encoding": "gzip" } : {}), Authorization: "Basic " + key },
+      body,
       signal,
     })
   } catch (e) {
@@ -1657,17 +1701,15 @@ async function complete({ key, server, families }, chat, signal) {
     const e = failure(200, dec.decode(first.value.data))
     return errorResponse(e.status < 300 ? { status: 502, message: "an empty reply" } : e)
   }
-  let replay = first
-  const it = events({
-    next: () => {
-      if (replay) {
-        const r = replay
-        replay = null
-        return Promise.resolve(r)
-      }
-      return fr.next()
-    },
-  })
+  // 先等到实际内容或错误，才能让网关在空回复时切换渠道。
+  const source = events(prepend(first.value, fr))
+  const head = await source.next()
+  if (head.done) return errorResponse({ status: 502, message: "an empty reply" })
+  if (head.value.error) {
+    await fr.return?.()
+    return errorResponse(head.value.error)
+  }
+  const it = prepend(head.value, source)
   const id = "chatcmpl-" + randomBytes(12).toString("hex")
   const created = Math.floor(Date.now() / 1000)
 
@@ -1748,13 +1790,15 @@ function userStatus(key, server) {
 // built-in Devin account showed none of this. The day and the week don't
 // count the models Devin says are free (notModels): with them used up,
 // SWE-2 still answers, and magpie sends it to the account.
-async function usage(key, server) {
+async function usage(key, server, onStatus) {
   const res = await userStatus(key, server)
   const text = await res.text()
   if (res.status === 401 || failure(res.status, text).status === 401)
     return { error: "Devin's sign-in has expired — sign in again", windows: [] }
   if (!res.ok) return { error: failure(res.status, text).message, windows: [] }
-  const st = JSON.parse(text || "{}")?.userStatus?.planStatus ?? {}
+  const u = JSON.parse(text || "{}")?.userStatus ?? {}
+  await onStatus?.(u)
+  const st = u.planStatus ?? {}
   const info = st.planInfo ?? {}
   const num = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() && !isNaN(Number(v)) ? Number(v) : 0)
   // no plan: the row keeps the one `devin auth status` gave the sign-in
@@ -1820,7 +1864,7 @@ async function live(auth) {
   return { key: auth?.key, server: serverOf(auth) }
 }
 
-export async function DevinAuthPlugin() {
+export async function DevinAuthPlugin({ client } = {}) {
   return {
     auth: {
       provider: ID,
@@ -1859,7 +1903,32 @@ export async function DevinAuthPlugin() {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return { error: "Devin isn't signed in", signIn: "kept" }
         const { key, server } = await live(auth)
-        return { ...(await usage(key, server)), signIn: "kept" }
+        const syncOrg = async (u) => {
+          if (!client?.auth?.set) return
+          const who = whoOfStatus(u)
+          if (!who) return
+          const md = { ...(auth.metadata ?? {}) }
+          let changed = key !== auth.key
+          if (who.user && md.email !== who.user) {
+            md.email = who.user
+            changed = true
+          }
+          const orgId = who.orgId || who.teamId
+          if (orgId && md.orgId !== orgId) {
+            md.orgId = orgId
+            changed = true
+          }
+          if (who.teamId && md.teamId !== who.teamId) {
+            md.teamId = who.teamId
+            changed = true
+          }
+          if (changed) {
+            try {
+              await client.auth.set({ path: { id: ID }, body: { ...auth, key, metadata: md } })
+            } catch {}
+          }
+        }
+        return { ...(await usage(key, server, syncOrg)), signIn: "kept" }
       },
     },
     async config(config) {
@@ -1892,4 +1961,4 @@ export async function DevinAuthPlugin() {
 }
 
 // for tests
-export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { parseFree, parsePrices, geminiSchema, freeIDs, outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, parseConfigFamilies, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoOfStatus, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }

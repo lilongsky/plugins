@@ -65,11 +65,37 @@ const num = (v) => {
 
 // ---- the models -------------------------------------------------------------
 
+// The limits the endpoint really allows, for the models whose advertised
+// ones are MiniMax Code's conservative declaration. Its model config says
+// 512K/128K for the M3 family, but the endpoint accepts 1,048,576 input
+// tokens and 524,288 output tokens for every one of them: a request of
+// 1,048,140 input tokens is answered, one of 1,048,700 is refused with
+// "context window exceeds limit (2013)", and max_tokens of 524,288 is
+// accepted where 600,000 is refused with "does not support max tokens >
+// 524288". The advertised numbers are the same for a signed-in account and
+// for nobody, so they are not a plan's limit, and an agent that believes
+// them compacts its history about half way too early.
+const VERIFIED_LIMITS = {
+  "MiniMax-M3.1-Flash": { context: 1048576, output: 524288 },
+  "MiniMax-M3.1-Flash-Preview": { context: 1048576, output: 524288 },
+  "MiniMax-M3": { context: 1048576, output: 524288 },
+}
+
+// limits is a model's context and output: the verified ones where they are
+// known, the advertised ones otherwise.
+function limits(id, context, output) {
+  const v = VERIFIED_LIMITS[id]
+  return {
+    context: v ? v.context : context ?? 0,
+    output: v ? v.output : output ?? 0,
+  }
+}
+
 // MiniMax Code's own list, for when the live one can't be had.
 // thinking: "switchable" (on or off), "forced_on" (always on, at an effort)
 const MODELS = [
-  { id: "MiniMax-M3.1-Flash-Preview", name: "M3.1-Flash-Preview", context: 512000, output: 128000, images: true, thinking: "forced_on", efforts: ["low", "medium", "high", "xhigh", "max"] },
-  { id: "MiniMax-M3", name: "MiniMax-M3", context: 512000, output: 128000, images: true, thinking: "switchable", efforts: [] },
+  { id: "MiniMax-M3.1-Flash-Preview", name: "M3.1-Flash-Preview", context: 1048576, output: 524288, images: true, thinking: "forced_on", efforts: ["low", "medium", "high", "xhigh", "max"] },
+  { id: "MiniMax-M3", name: "MiniMax-M3", context: 1048576, output: 524288, images: true, thinking: "switchable", efforts: [] },
   { id: "MiniMax-M2.7", name: "MiniMax-M2.7", context: 200000, output: 128000, images: false, thinking: "on", efforts: [] },
   { id: "MiniMax-M2.7-highspeed", name: "MiniMax-M2.7-highspeed", context: 200000, output: 128000, images: false, thinking: "on", efforts: [] },
 ]
@@ -94,7 +120,7 @@ function configModels() {
     tool_call: true,
     attachment: !!m.images,
     modalities: { input: m.images ? ["text", "image"] : ["text"], output: ["text"] },
-    limit: { context: m.context, output: m.output },
+    limit: limits(m.id, m.context, m.output),
     cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
     variants: variants(m),
   }]))
@@ -110,7 +136,7 @@ function modelOf(site, provider, m) {
     headers: {},
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    limit: limits(m.id, m.context, m.output),
     capabilities: {
       temperature: true,
       reasoning: reasons(m),
@@ -316,10 +342,11 @@ class SignInExpired extends Error {
 // signed is a request of MiniMax Code's account API, signed as mcode signs
 // one: yy over the path and query, the body ("{}" for a GET) and the time;
 // x-signature over the time (and the body of a POST).
-function signed(site, path, { access, userID, body, origin = site.agent, now = Date.now(), tz = new Date().getTimezoneOffset() * -60, platform = process.platform } = {}) {
+function signed(site, path, { access, userID, body, origin = site.agent, query, now = Date.now(), tz = new Date().getTimezoneOffset() * -60, platform = process.platform } = {}) {
   const url = new URL(path, origin)
   url.search = new URLSearchParams({
     device_platform: "mcode", biz_id: "3", app_id: "3001", version_code: "22201",
+    ...query,
     unix: String(now), timezone_offset: String(tz), sys_language: site.lang, lang: site.lang,
     device_id: "0", os_name: platform, browser_name: "mcode", user_id: String(userID ?? "").trim() || "0", client: "mcode",
   }).toString()
@@ -338,7 +365,12 @@ function signed(site, path, { access, userID, body, origin = site.agent, now = D
   return { url: url.toString(), init: { method: json === undefined ? "GET" : "POST", headers, ...(json === undefined ? {} : { body: json }) } }
 }
 
-class AccountRefused extends Error {}
+class AccountRefused extends Error {
+  constructor(message, status) {
+    super(message)
+    this.status = status
+  }
+}
 
 // checked throws on an answer MiniMax's account API says failed in its body.
 function checked(env, what) {
@@ -355,7 +387,7 @@ function checked(env, what) {
 async function accountCall(site, path, opts, what) {
   const { url, init } = signed(site, path, opts)
   const res = await fetch(url, { ...init, signal: AbortSignal.timeout(15000) })
-  if (res.status === 401 || res.status === 403) throw new AccountRefused(`${what}: the sign-in was refused (HTTP ${res.status})`)
+  if (res.status === 401 || res.status === 403) throw new AccountRefused(`${what}: the sign-in was refused (HTTP ${res.status})`, res.status)
   if (!res.ok) throw new Error(`${what}: HTTP ${res.status}`)
   let env
   try {
@@ -503,8 +535,24 @@ function usageOf(m, windows = []) {
 // already today. Both calls use the same signed account client as the rest
 // of the account API: the gateway checks the signature, and a Bearer-only
 // Bun fetch is not what MiniMax Code sends.
-async function checkinCall(site, access, method, path, body) {
-  const opts = { access, origin: site.llm }
+//
+// They go as MiniMax Code's own /checkin sends them (its daily-check-in
+// gateway, 0.6.12): as the account, user_id its realUserID — MiniMax Code
+// won't ask without one, and every minimax-cloud call it makes names the
+// user — and the desktop's device_platform web, is_desktop 1 and its
+// version. Its host is the account API's (agent.minimaxi.com on the China
+// site, agent.minimax.io on the international one), not the chat host:
+// MiniMax Code's minimax-cloud origin table has these.
+//
+// A 401 there ({"error":"invalid access token"}) is answered as MiniMax
+// Code answers it: the sign-in renewed (a newer token if one is had, else
+// refreshed), the user id read again for that token, and the check-in
+// asked once more. The chat path does the same on its 401, which is why a
+// token minimax-cloud turned away still chatted (Magic_zero on Discord).
+const CHECKIN_QUERY = { device_platform: "web", is_desktop: "1", desktop_version: "0.6.12" }
+
+async function checkinCall(site, access, userID, path, body) {
+  const opts = { access, userID, origin: site.agent, query: CHECKIN_QUERY }
   if (body !== undefined) opts.body = body
   return accountCall(site, path, opts, "check-in")
 }
@@ -514,8 +562,9 @@ async function checkinCall(site, access, method, path, body) {
 // hasn't started, or the panel has none), ineligible (the day isn't
 // available); a throw is failed. streak counts the claimed days up to and
 // including today.
-async function checkinOf(site, access) {
-  const panel = await checkinCall(site, access, "GET", "/minimax-cloud/api/v1/signin/status")
+async function checkinOf(site, access, userID) {
+  if (!String(userID ?? "").trim()) userID = (await identity(site, access)).realUserID
+  const panel = await checkinCall(site, access, userID, "/minimax-cloud/api/v1/signin/status")
   const days = Array.isArray(panel?.data?.days) ? panel.data.days : null
   if (!days?.length) throw new Error("check-in: no panel in the reply")
   const sorted = [...days].sort((a, b) => (a?.day_no ?? 0) - (b?.day_no ?? 0))
@@ -535,7 +584,7 @@ async function checkinOf(site, access) {
     return { outcome: "done", ...(points ? { credit: points } : {}), streak: streakFrom(sorted.indexOf(today)) }
   }
   if (today.status === 2) {
-    const claim = await checkinCall(site, access, "POST", "/minimax-cloud/api/v1/signin/claim", {})
+    const claim = await checkinCall(site, access, userID, "/minimax-cloud/api/v1/signin/claim", {})
     const r = pos(claim?.data, "claim_result")
     const credit = pos(claim?.data, "points")
     const got = { ...(credit ? { credit } : {}), streak: streakFrom(sorted.indexOf(today) - 1) + 1 }
@@ -795,10 +844,22 @@ function makePlugin(site) {
           } catch (e) {
             return { outcome: "failed", message: e?.message ?? String(e), ...(e?.signIn ? { signIn: e.signIn } : {}) }
           }
+          const failed = (e) => ({ outcome: "failed", message: e?.message ?? String(e), ...(e?.signIn ? { signIn: e.signIn } : {}) })
           try {
-            return await checkinOf(site, a.access)
+            return await checkinOf(site, a.access, a.realUserID)
           } catch (e) {
-            return { outcome: "failed", message: e?.message ?? String(e), ...(e?.signIn ? { signIn: e.signIn } : {}) }
+            if (!(e instanceof AccountRefused && e.status === 401)) return failed(e)
+            // MiniMax Code's /checkin on a 401: renewed, and asked once more
+            try {
+              ;({ a } = await fresh(getAuth, a.access))
+            } catch (e2) {
+              return e2 instanceof SignInExpired ? failed(e2) : failed(e)
+            }
+            try {
+              return await checkinOf(site, a.access, undefined)
+            } catch (e2) {
+              return failed(e2)
+            }
           }
         },
         methods: [

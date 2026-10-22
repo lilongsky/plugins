@@ -83,6 +83,21 @@ Each chat carries WorkBuddy's headers:
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
+WorkBuddy refuses some agents' identity lines as an "unapproved channel"
+(11128), so those lines are reworded before a chat goes out. Since 0.1.27
+(#279) that includes DeepSeek Harness's opening line. A refusal of words
+not reworded yet is sent once more, since 0.1.29, with the system prompt
+moved into the first user message (inside `<instructions>` tags) and
+WorkBuddy's default system prompt in its place: WorkBuddy checks only the
+system and assistant messages, and the line it matched is then in neither.
+A system message later in the chat becomes a user message where it stands.
+The plugin remembers each refused system prompt while it is loaded, so that
+agent's next chats go moved at once. A refusal that stands after the move
+(words in an assistant message) ends in a hint that names no one client
+(since 0.1.28): WorkBuddy refused words in this client's prompt; use it from
+Hermes, OpenCode or Pi, or add another provider to the group. Neither
+refusal rests the account.
+
 The loader also translates OpenAI-compatible request spellings WorkBuddy
 doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
 messages become `system`, and an object `tool_choice` becomes WorkBuddy's
@@ -205,3 +220,5 @@ magpie's built-in WorkBuddy does more than this package:
 - several accounts under one provider.
 
 OpenCode's plugin API has no place for these.
+
+Credit multipliers accept the international catalog's `x0.34 credits` text as well as `x0.34`. An empty credits value (for example Auto) stays unknown, never free.

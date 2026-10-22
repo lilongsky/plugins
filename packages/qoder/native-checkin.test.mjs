@@ -96,6 +96,32 @@ test("CN claims without the native runtime", async () => {
   expect(reads).toHaveLength(0)
 })
 
+// plugins#304: on a machine that never had Qoder there is no helper to read
+// the identity from, and without it Qoder hides the daily credits. That is
+// an answer for the day with what to do once, not "tries again later".
+test("no Qoder on this machine is ineligible, saying how to get its identity, and asks nothing", async () => {
+  delete process.env.QODER_RUNTIME_INFO
+  const nowhere = spyOn(fsPromises, "stat").mockImplementation(() => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })))
+  try {
+    const p = await checkin(QoderAuthPlugin, () => json(LIST))
+    expect(p.out.outcome).toBe("ineligible")
+    expect(p.out.message).toContain("Install Qoder desktop")
+    expect(p.out.message).toContain("QODER_RUNTIME_INFO")
+    expect(p.seen).toHaveLength(0)
+    expect(reads).toHaveLength(0)
+  } finally {
+    nowhere.mockRestore()
+  }
+})
+
+test("a helper that is there but can't be read is failed, to be asked again", async () => {
+  nativeError = new Error("fixture helper unavailable")
+  const p = await checkin(QoderAuthPlugin, () => json(LIST))
+  expect(p.out.outcome).toBe("failed")
+  expect(p.out.message).toContain("could not read device identity")
+  expect(p.seen).toHaveLength(0)
+})
+
 test("an unreadable list reply is failed", async () => {
   const p = await checkin(QoderAuthPlugin, () => new Response("<html>"))
   expect(p.out).toMatchObject({ outcome: "failed" })
@@ -127,4 +153,32 @@ test("a refused device token is rotated and the claim asked again", async () => 
   })
   expect(p.out).toEqual({ outcome: "claimed", credit: 100 })
   expect(p.auth().deviceToken).toBe("dt-new")
+})
+
+test("a PAT account's daily check-in claims on its job token, with no device token to rotate", async () => {
+  for (const [make, origin] of [[QoderAuthPlugin, "https://openapi.qoder.sh"], [QoderCNAuthPlugin, "https://openapi.qoder.com.cn"]]) {
+    let auth = { ...account(), patAuth: true, pat: "pt-x", deviceToken: "", deviceRefresh: "" }
+    const seen = []
+    globalThis.fetch = async (url, init = {}) => {
+      const u = new URL(String(url))
+      seen.push({ origin: u.origin, path: u.pathname, auth: init.headers.Authorization })
+      if (init.headers.Authorization !== "Bearer jt") return new Response("", { status: 401 })
+      return u.pathname.endsWith("/claim") ? json({ status: "CLAIMED" }) : json(LIST)
+    }
+    const hooks = await make({ client: { auth: { set: async ({ body }) => (auth = body) } } })
+    const out = await hooks.auth.checkin(async () => auth)
+    expect(out).toEqual({ outcome: "claimed", credit: 100 })
+    expect(seen.map((s) => s.origin + s.path)).toEqual([origin + "/sash/api/v1/me/campaigns", origin + "/sash/api/v1/me/campaigns/c1/claim"])
+    expect(auth.deviceToken).toBe("")
+  }
+})
+
+test("a PAT account's refused check-in is failed, not rotated", async () => {
+  let auth = { ...account(), patAuth: true, pat: "pt-x", deviceToken: "", deviceRefresh: "" }
+  const seen = []
+  globalThis.fetch = async (url) => (seen.push(new URL(String(url)).pathname), json({}, 403))
+  const hooks = await QoderCNAuthPlugin({ client: { auth: { set: async ({ body }) => (auth = body) } } })
+  const out = await hooks.auth.checkin(async () => auth)
+  expect(out).toEqual({ outcome: "failed", message: "campaigns: HTTP 403" })
+  expect(seen).toEqual(["/sash/api/v1/me/campaigns"])
 })

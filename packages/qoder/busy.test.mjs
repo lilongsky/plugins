@@ -3,14 +3,21 @@
 // trial account on 2026-10-12, byte for byte (testdata/queued-10605.json).
 // The other codes are read as Qoder's own client reads them (QoderErrorCode
 // in Qoder.app's qoder-agent-sdk worker): only 105 is loginExpired there.
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { QoderAuthPlugin, _internal } from "./index.mjs"
 
 const QUEUED = readFileSync(new URL("./testdata/queued-10605.json", import.meta.url), "utf8").trim()
 
 const real = globalThis.fetch
-afterEach(() => (globalThis.fetch = real))
+// these are Qoder still queued once the wait is over: queue.test.mjs has
+// the wait itself
+const budget = _internal.QUEUE.budget
+beforeEach(() => (_internal.QUEUE.budget = 0))
+afterEach(() => {
+  globalThis.fetch = real
+  _internal.QUEUE.budget = budget
+})
 
 const API_CHAT = "https://api3.qoder.sh/v1/chat/completions"
 const ASK = { method: "POST", body: JSON.stringify({ model: "efficient", messages: [{ role: "user", content: "hi" }] }) }

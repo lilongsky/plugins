@@ -19,7 +19,7 @@ two ways to get one:
   read, never changed.
 
 The plugin names the account as Devin does when asked with the token
-(`GetUserStatus`: its email and tier). When Devin can't tell, and the CLI
+(`GetUserStatus`: its email, organization when named, and tier). When Devin can't tell, and the CLI
 is installed, it asks `devin auth status`, run with a data folder of the
 plugin's own, `~/.cache/opencode-devin-auth/<hash of the token>/`, so the
 CLI's own sign-in is never touched. A CLI that reads another
@@ -28,7 +28,7 @@ CLI's own sign-in is never touched. A CLI that reads another
 its own account. Otherwise the account is named "Devin".
 
 The token is kept where OpenCode keeps sign-ins (`auth.json`; in magpie,
-`plugin-auth.json`) as `{ "type": "api", "key", "metadata": { "email", "plan" } }`.
+`plugin-auth.json`) as `{ "type": "api", "key", "metadata": { "email", "plan", "orgId", "teamId" } }`.
 Devin doesn't expire it on a schedule, so there is nothing to refresh;
 when it is refused, requests fail with a 401 saying to sign in again.
 
@@ -54,10 +54,15 @@ The plugin's `fetch` handles this:
     with its result, as magpie's built-in sends them: a tool message's own
     `image_url` parts, and the ones magpie's gateway puts in the user
     message after the results ("[From the result of …]").
+- A request past 8 KiB goes gzipped, as the CLI sends it (since 0.1.21,
+  #275): Devin turns a body past 10 MiB away with 413.
 - It turns the streamed reply back into a chat completion, streamed or
   not: text, reasoning, tool calls and usage.
 - Failures keep their statuses: a refused token is a 401, a usage limit a
   429, a prompt too long for the model a 400.
+- A reply with only metadata and usage is a 502, even when output tokens
+  were counted. The plugin waits for actual content before opening a
+  successful stream, so the gateway can try another channel.
 
 ## Models
 

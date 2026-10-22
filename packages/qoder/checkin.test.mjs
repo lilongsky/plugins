@@ -58,8 +58,8 @@ const account = () => ({
 
 const json = (v, status = 200) => new Response(JSON.stringify(v), { status })
 
-async function loader(make, serve) {
-  let auth = account()
+async function loader(make, serve, over = {}) {
+  let auth = { ...account(), ...over }
   const seen = []
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url))
@@ -127,6 +127,17 @@ test("Windows finds the Qoder desktop's installed runtime", async () => {
   mkdirSync(dirname(file), { recursive: true })
   writeFileSync(file, "fixture")
   expect(await _internal.campaignRuntime({ home: sandbox, platform: "win32", arch: "x64", env: { LOCALAPPDATA: sandbox } })).toBe(file)
+})
+
+// accomplish (Discord, 10-21): international check-in failed while CN's
+// needs no device identity at all. A machine-wide Qoder install on Windows
+// keeps the runtime under Program Files, which wasn't searched.
+test("Windows finds a machine-wide Qoder install's runtime", async () => {
+  const file = join(sandbox, "Program Files", "Qoder", "resources", "umid", "runtime-info.exe")
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, "fixture")
+  const env = { LOCALAPPDATA: join(sandbox, "Local"), ProgramFiles: join(sandbox, "Program Files") }
+  expect(await inSandbox(() => _internal.campaignRuntime({ home: join(sandbox, "nobody"), platform: "win32", arch: "x64", env }))).toBe(file)
 })
 
 // Keep desktop discovery inside the fixture, even on a Mac with Qoder installed.
@@ -231,6 +242,47 @@ test("CN still queries and claims without a native identity runtime", async () =
   expect(await (await p.fetch(url)).json()).toEqual(LIST)
   expect((await (await p.fetch(url + "/c1/claim", { method: "POST", body: "{}" })).json()).status).toBe("CLAIMED")
   expect(reads).toHaveLength(0)
+})
+
+test("a PAT account checks in on its job token, having no device token", async () => {
+  // a PAT sign-in keeps no device token; the campaigns pages take the job
+  // token the exchange gave, as the usage endpoint does. A live Qoder CN PAT
+  // account answered 200 to the list and CLAIMED to a claim.
+  const p = await loader(
+    QoderCNAuthPlugin,
+    (u, init) => {
+      if (u.pathname === "/sash/api/v1/me/campaigns") return json(LIST)
+      if (u.pathname === "/sash/api/v1/me/campaigns/c1/claim") return json({ status: "CLAIMED" })
+      return new Response("", { status: 404 })
+    },
+    { patAuth: true, pat: "pt-cn", deviceToken: "", deviceRefresh: "" },
+  )
+  const origin = "https://openapi.qoder.com.cn"
+  const list = await p.fetch(origin + "/sash/api/v1/me/campaigns", { method: "GET" })
+  expect(list.status).toBe(200)
+  expect(await list.json()).toEqual(LIST)
+  const claim = await p.fetch(origin + "/sash/api/v1/me/campaigns/c1/claim", { method: "POST", body: "{}" })
+  expect(claim.status).toBe(200)
+  expect((await claim.json()).status).toBe("CLAIMED")
+  // the job token signs both calls, and no device-token refresh is asked for
+  expect(p.seen).toEqual([
+    { origin, path: "/sash/api/v1/me/campaigns", method: "GET", auth: "Bearer jt-one", body: undefined },
+    { origin, path: "/sash/api/v1/me/campaigns/c1/claim", method: "POST", auth: "Bearer jt-one", body: "{}" },
+  ])
+  expect(p.seen.some((s) => s.path.includes("deviceToken"))).toBe(false)
+})
+
+test("a PAT account's refused check-in is the answer, with no second token to rotate", async () => {
+  const p = await loader(
+    QoderCNAuthPlugin,
+    () => new Response("", { status: 401 }),
+    { patAuth: true, pat: "pt-cn", deviceToken: "", deviceRefresh: "" },
+  )
+  const res = await p.fetch("https://openapi.qoder.com.cn/sash/api/v1/me/campaigns", { method: "GET" })
+  expect(res.status).toBe(401)
+  // nothing is rotated: the refresh call would fail with no device refresh
+  expect(p.seen.map((s) => s.path)).toEqual(["/sash/api/v1/me/campaigns"])
+  expect(p.auth().deviceToken).toBe("")
 })
 
 for (const [make, origin] of [
