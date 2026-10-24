@@ -25,12 +25,14 @@ over Anthropic's Messages API. Provider id: `zcode`.
     agent's system prompt at the end of the third (a fourth block is
     refused, #343), the day in a `<system-reminder>` turn before the agent's
     turns, and the sign-in's device id in `metadata.user_id`. GLM Coding
-    Plan and team requests go as the agent sent them. One it still turns
-    away (a 405, the block page or code 3012) comes back with what to do
-    about it, as magpie's built-in said: "ZCode's Start Plan still turned
-    this request away, though magpie sends it as the ZCode app does; …
-    Use an account with a GLM Coding Plan, or add another provider to this
-    group".
+    Plan and team requests go as the agent sent them. zcode.z.ai also
+    answers 405 code 3012 to every request of an account its risk control
+    blocked, ZCode's own app's included (plugins#348). That answer comes
+    back as ZCode's words, then "ZCode's risk control blocked this account
+    for unusual activity (code 3012); …", which magpie reads as the account
+    restricted: it rests, and the group's other providers are used. Only
+    ZCode support lifts such a block. A block page from ZCode's edge
+    firewall says this network's address was blocked instead.
   - The Start Plan's token can't be refreshed. When it runs out, sign in
     again.
 - **ZCode: a team's GLM Coding Plan**
