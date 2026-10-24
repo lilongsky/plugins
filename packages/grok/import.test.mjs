@@ -1,11 +1,14 @@
 // A CPA xAI account file is translated into the sign-in Grok Build keeps in
 // a home of the plugin's own. The file is only read: a CPA refresh token
 // rotates, so the account is migrated, not shared.
+import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, expect, test } from "bun:test"
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname, join } from "node:path"
 import { GrokAuthPlugin } from "./index.mjs"
+
+noRealGrok()
 
 const CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const SCOPE = `https://auth.x.ai::${CLIENT_ID}`

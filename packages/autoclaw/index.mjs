@@ -119,6 +119,15 @@ async function explained(res) {
 const QUOTA_CODES = new Set(["810000"]);
 const QUOTA_WORDS = /额度|余额不足|用完|用尽|quota|insufficient[_ ]?(balance|credit)|exhausted/i;
 
+/** said is the code and message of a parsed refusal body, read from its code/message fields only. */
+function said(d) {
+  if (!d || typeof d !== "object") return { code: null, message: "" };
+  return {
+    code: d.code ?? d.error?.code ?? null,
+    message: String(d.message ?? d.msg ?? d.error?.message ?? "").trim(),
+  };
+}
+
 /** quotaRefusal is a 403 chat answer read as a spent quota, or null when it isn't one (a 401 or any other 403 is still the sign-in). */
 async function quotaRefusal(res) {
   if (res.status !== 403) return null;
@@ -126,14 +135,57 @@ async function quotaRefusal(res) {
   let d;
   try { d = JSON.parse(text); } catch { return null; }
   if (!d || typeof d !== "object") return null;
-  const code = d.code ?? d.error?.code ?? null;
-  const message = String(d.message ?? d.msg ?? d.error?.message ?? "").trim();
+  const { code, message } = said(d);
   if (!QUOTA_CODES.has(String(code)) && !(message && QUOTA_WORDS.test(message))) return null;
   try { res.body?.cancel?.(); } catch {}
   return new Response(JSON.stringify({ error: { message: `AutoClaw: ${message || "quota exhausted"}`, type: "rate_limit_error", code } }), {
     status: 429,
     headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   });
+}
+
+// A 403 can be the account itself: a banned AutoClaw account answers
+// HTTP 403 {"code":410004,"message":"The account has been banned"} on every
+// route (小八, Discord 2026-10-23). That is no expired sign-in: signing in
+// again gets the same account and the same refusal, and reading it as
+// expired made magpie drop the token while the user never saw why. It goes
+// on as a 403 with the vendor's words, and the sign-in is kept. Only the
+// body's code or message field is read, never the whole body.
+const BANNED_CODES = new Set(["410004"]);
+const BANNED_WORDS = /\bbanned\b|封禁|封号|账号异常|账户异常|account (has been |is |was )?(suspended|frozen|disabled|blocked|restricted)|账[号户](已|已被|被)?(冻结|停用|禁用)/i;
+
+/** bannedSaid is the vendor's words when a parsed body is an account-level refusal (a ban), or "" when it isn't one. */
+function bannedSaid(d) {
+  const { code, message } = said(d);
+  if (BANNED_CODES.has(String(code))) return message || `account refused (code ${code})`;
+  return message && BANNED_WORDS.test(message) ? message : "";
+}
+
+/** bannedText is bannedSaid over a raw body text. */
+function bannedText(text) {
+  let d;
+  try { d = JSON.parse(text); } catch { return ""; }
+  return bannedSaid(d);
+}
+
+/** accountRefusal is a 401/403 chat answer read as the account refused (banned), or null when it isn't one. */
+async function accountRefusal(res) {
+  if (res.status !== 401 && res.status !== 403) return null;
+  const text = await res.clone().text().catch(() => "");
+  const message = bannedText(text);
+  if (!message) return null;
+  let code = null;
+  try { code = said(JSON.parse(text)).code; } catch {}
+  try { res.body?.cancel?.(); } catch {}
+  return new Response(JSON.stringify({ error: { message: `AutoClaw: ${message}`, type: "permission_error", code } }), {
+    status: 403,
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
+  });
+}
+
+/** refusedNotSignIn is a 401/403 that is the account's (quota or ban), not its sign-in, or null. */
+async function refusedNotSignIn(res) {
+  return (await quotaRefusal(res)) ?? (await accountRefusal(res));
 }
 
 function autoclawRewriteBody(rawBody) {
@@ -293,12 +345,15 @@ async function callEnvelope(path, { method = "GET", body, base }) {
   let parsed;
   try { parsed = text ? JSON.parse(text) : undefined; } catch { parsed = undefined; }
   if (!parsed || (parsed.code === undefined && response.status >= 400)) {
-    const err = new Error(`AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
-    // 401/403 不论响应体形态都是登录失效：挂上标记，宿主才会提示重新登录
-    if (response.status === 401 || response.status === 403) err.signIn = "expired";
+    const banned = bannedSaid(parsed);
+    const err = new Error(banned
+      ? `AutoClaw: ${banned}`
+      : `AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    // 401/403 不论响应体形态都是登录失效（账号被封除外：那是账号，不是登录）
+    if (response.status === 401 || response.status === 403) err.signIn = banned ? "kept" : "expired";
     throw err;
   }
-  return { status: response.status, code: parsed.code, msg: parsed.msg, data: parsed.data };
+  return { status: response.status, code: parsed.code, msg: parsed.msg ?? parsed.message, data: parsed.data, banned: bannedSaid(parsed) };
 }
 
 /** 验证码必须按数字发送（服务端按类型校验，字符串 → 400001）。 */
@@ -336,9 +391,17 @@ async function fetchWallets(accessToken, hosts) {
         redirect: "error",
         signal: AbortSignal.timeout(20_000),
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        // a banned account is so on every host: say it instead of "no data"
+        const banned = (res.status === 401 || res.status === 403) ? bannedText(await res.text().catch(() => "")) : "";
+        if (banned) throw Object.assign(new Error(`AutoClaw: ${banned}`), { banned: true });
+        continue;
+      }
       payload = await res.json();
-    } catch { continue; }
+    } catch (e) {
+      if (e?.banned) throw e;
+      continue;
+    }
     if (!payload || payload.code !== 0 || !payload.data) continue;
     return payload.data;
   }
@@ -369,6 +432,8 @@ async function taskList(accessToken, host) {
     signal: AbortSignal.timeout(15_000),
   });
   if (res.status === 401 || res.status === 403) {
+    const banned = bannedText(await res.text().catch(() => ""));
+    if (banned) throw Object.assign(new Error(`AutoClaw: ${banned}`), { banned: true, signIn: "kept" });
     throw new Error(`登录已失效（HTTP ${res.status}）`);
   }
   if (!res.ok) return null;
@@ -468,13 +533,28 @@ async function maybeSignin(accessToken, host, options, reason, accountKey) {
 // 用户资料（GUI 账户命名：昵称/手机号，替代无意义的 uid 哈希 → 「已登录」）
 // ---------------------------------------------------------------------------
 
+/**
+ * 账号自己的 device_id：登录时生成并随登录请求发出的那个，服务端写进了 token 的 device_id claim。
+ * 官方 AutoClaw（1.18.5 getUserInfoWithAccessToken → withWebInfo）在 user-profile 里发的就是
+ * 登录用的设备 id（getAuthState().deviceId），不是固定串。
+ */
+function accountDeviceId(deviceId, ...tokens) {
+  const given = nonEmptyString(deviceId);
+  if (given) return given;
+  for (const t of tokens) {
+    const claim = nonEmptyString(jwtClaim(t, "device_id"));
+    if (claim) return claim;
+  }
+  return "";
+}
+
 /** POST /userapi/v1/user-profile → { user_name, user_phone, user_id, … }；失败返回 null。 */
-async function fetchUserProfile(accessToken, base) {
+async function fetchUserProfile(accessToken, base, deviceId, refreshToken) {
   try {
     const res = await fetch(`${base}/userapi/v1/user-profile`, {
       method: "POST",
       headers: bizHeaders(accessToken),
-      body: JSON.stringify({ source_id: PRODUCT, device_id: "magpie-plugin" }),
+      body: JSON.stringify({ source_id: PRODUCT, device_id: accountDeviceId(deviceId, accessToken, refreshToken) }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) return null;
@@ -519,6 +599,8 @@ async function refreshTokens(refreshToken, preferredHosts) {
   }
   if (!result) throw new Error("AutoClaw refresh: no host attempted");
   if (result.code !== 0 || !result.data) {
+    // a banned account is refused, not signed out: the sign-in is kept
+    if (result.banned) throw Object.assign(new Error(`AutoClaw: ${result.banned}`), { signIn: "kept" });
     const dead = result.status === 401 || result.status === 403
       || /invalid[_ ]?grant|revoked|expired|登录已失效|token 失效/i.test(String(result.msg ?? ""));
     const err = new Error(`AutoClaw token refresh failed (HTTP ${result.status}): ${result.msg ?? `code ${result.code}`}`);
@@ -597,7 +679,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
         // 刷新时补拉 user-profile。magpie 的 refresh 返回字段会合并进账号。
         const old = String(auth.accountId ?? auth.email ?? "");
         if (!old || /^(已登录|[0-9a-f]{24,})$/.test(old)) {
-          const profile = await fetchUserProfile(t.access, homeHost);
+          const profile = await fetchUserProfile(t.access, homeHost, jwtClaim(bareToken(auth.refresh), "device_id"), t.refresh);
           const name = accountDisplayName(profile, "");
           if (name) {
             t.accountId = name;
@@ -618,6 +700,8 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
           async fetch(input, init) {
             if (providerId !== "autoclaw-cn") {
               const headers = new Headers(init?.headers);
+              // magpie's own hint headers (x-magpie-*) are for the plugin, never the vendor
+              for (const k of [...headers.keys()]) if (k.toLowerCase().startsWith("x-magpie-")) headers.delete(k);
               headers.set("User-Agent", USER_AGENT);
               headers.set("X-Authorization", `Bearer ${accessToken}`);
               headers.set("X-Client-Type", "pc");
@@ -650,12 +734,12 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
 
               const res1 = await tryFetch(hosts[0]);
               if (res1.status !== 401 && res1.status !== 403) return explained(res1);
-              // a spent quota is the account's on every host: not asked again
-              const spent1 = await quotaRefusal(res1);
+              // a spent quota or a ban is the account's on every host: not asked again
+              const spent1 = await refusedNotSignIn(res1);
               if (spent1) return spent1;
               try { res1.body?.cancel?.(); } catch {}
               const res2 = await tryFetch(hosts[1]);
-              const spent2 = await quotaRefusal(res2);
+              const spent2 = await refusedNotSignIn(res2);
               if (spent2) return spent2;
               if (res2.status === 401 || res2.status === 403) {
                 try { res2.body?.cancel?.(); } catch {}
@@ -678,7 +762,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
               body: JSON.stringify(payload),
             });
             if (res.status !== 401 && res.status !== 403) return explained(res);
-            const spent = await quotaRefusal(res);
+            const spent = await refusedNotSignIn(res);
             if (spent) return spent;
             try { res.body?.cancel?.(); } catch {}
             return new Response(JSON.stringify({ error: { message: "AutoClaw 登录已失效", type: "invalid_request_error" } }), {
@@ -741,6 +825,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
             ],
           };
         } catch (e) {
+          if (e?.banned) return { error: e.message, signIn: "kept", windows: [] };
           return { error: `积分查询失败: ${e?.message ?? e}`, windows: [] };
         }
       },
@@ -766,7 +851,10 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
               task = tasks.find((x) => x?.task_id === "daily_signin") ?? null;
               break;
             }
-          } catch (e) { lastErr = e; }
+          } catch (e) {
+            lastErr = e;
+            if (e?.banned) break;
+          }
         }
         if (!task && lastErr) throw lastErr;
         if (!task) return { outcome: "inactive", message: "当前没有签到活动" };
@@ -827,7 +915,7 @@ const phoneSmsMethod = {
         }
         const t = tokenFields(res.data);
         // GUI 显示名：拉 user-profile 取昵称/手机号（登录响应的 user_name 常为空 → 显示「已登录」）
-        const profile = await fetchUserProfile(t.access, CN_HOST);
+        const profile = await fetchUserProfile(t.access, CN_HOST, deviceId);
         const displayName = accountDisplayName(profile, phone);
         return {
           type: "success",
@@ -1084,7 +1172,7 @@ async function startLocalOAuth(vendor, openFn) {
         }
         const t = tokenFields(res.data);
         // GUI 显示名：拉 user-profile 取昵称（Google/z.ai 账号通常有昵称或邮箱）
-        const profile = await fetchUserProfile(t.access, GLOBAL_HOST);
+        const profile = await fetchUserProfile(t.access, GLOBAL_HOST, deviceId);
         const displayName = accountDisplayName(profile, `${vendor} 账号`);
         return {
           type: "success",
@@ -1252,11 +1340,11 @@ export const AutoclawCnAuthPlugin = makeAutoclawPlugin({
 
 /** 测试辅助（magpie/OpenCode 不会把它当插件调用）。 */
 export const _internal = {
-  quotaRefusal,
+  quotaRefusal, accountRefusal, bannedSaid,
   makePluginForTest: makeAutoclawPlugin,
   md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
   dailySignin, signinStatus, maybeSignin, signinAccountKey, signinConfig, checkinOutcome, refreshTokens,
-  fetchUserProfile, accountDisplayName, startLocalOAuth,
+  fetchUserProfile, accountDeviceId, accountDisplayName, startLocalOAuth,
   FLAGGED, unflagged, unflag, autoclawRewriteBody, explained, OFFICIAL_SYSTEM_PROMPT, REFUSED_HINT,
   guidePageHtml, callbackPageHtml,
 };

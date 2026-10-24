@@ -12,11 +12,19 @@ export function normalizeModels(payload, {allowEmpty=false}={}) {
     const id = clean(row.id);
     if (!id || !id.includes('/')) continue;
     const alias = 'magpie-local-' + crypto.createHash('sha256').update(id).digest('hex').slice(0, 24);
-    const efforts = [...new Set((row.supported_reasoning_levels || []).map(x => clean(x.effort)).filter(x => x in effortNames))];
+    const advertised = [...new Set((row.supported_reasoning_levels || []).map(x => clean(x.effort)))];
+    const efforts = advertised.filter(x => Object.hasOwn(effortNames, x));
     const thinking = efforts.includes('high') ? 'high' : efforts.includes('medium') ? 'medium' : efforts[0] || '';
     const capabilities = ['dynamically_loaded_tools'];
     if (row.modalities?.input?.includes('image')) capabilities.push('image_in');
-    if (row.reasoning) capabilities.push('thinking');
+    if (row.reasoning) {
+      capabilities.push('thinking');
+      // A complete, known list without none cannot turn thinking off. An
+      // absent/unknown list says nothing about this; keep its prior behavior.
+      if (advertised.length && advertised.every(x => Object.hasOwn(effortNames, x) && x !== 'none')) {
+        capabilities.push('always_thinking');
+      }
+    }
     const runtime = { model: alias, maxContextSize: positive(row.context_window || row.context_length, 131072),
       capabilities, ...(row.max_output_tokens ? {maxOutputSize: positive(row.max_output_tokens, 8192)} : {}),
       ...(efforts.length ? {supportEfforts: efforts, defaultEffort: thinking} : {}) };

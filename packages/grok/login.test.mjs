@@ -8,11 +8,14 @@
 // (#65). `grok login --device-auth` is then `sh login --device-auth`, and
 // sh reads the script `login` in the folder the plugin runs it in, the
 // home folder: a plain file, read and never scanned.
+import { noRealGrok } from "./nocli.mjs"
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { GrokAuthPlugin } from "./index.mjs"
+
+noRealGrok()
 
 const dir = mkdtempSync(join(tmpdir(), "grok-login-"))
 const script = join(homedir(), "login")

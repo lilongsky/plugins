@@ -147,6 +147,43 @@ test('Work inference uses selected model and gateway auth; SSE tools survive; of
   } finally { await f.cleanup(); }
 });
 
+test('thinking controls and complete tool histories survive the desktop bridge with and without Library instructions', async () => {
+  const f = await fixture();
+  try {
+    await f.controller.tick();
+    for (const shared of [false, true]) for (const controls of [
+      {}, {thinking: {type: 'disabled'}, reasoning_effort: 'none'},
+      {thinking: {type: 'enabled', effort: 'max', keep: 'all'}, reasoning_effort: 'max'},
+      {thinking: {type: 'adaptive', budget_tokens: 16384}, reasoning: {effort: 'high', summary: 'auto'}},
+      {thinking: null, reasoning_effort: null, reasoning: null},
+    ]) {
+      fs.writeFileSync(f.controller.instructionsFile, shared ? 'synthetic shared instruction' : '');
+      const original = {model: 'k2d8-preview', stream: true, tools: [
+        {type: 'function', function: {name: 'Read', description: 'synthetic', parameters: {
+          type: 'object', properties: {path: {type: 'string'}}, required: ['path']}}},
+      ], messages: [
+        {role: 'system', content: 'synthetic native instruction'},
+        {role: 'developer', content: 'synthetic developer instruction'},
+        {role: 'user', content: [{type: 'text', text: 'synthetic 中文'},
+          {type: 'image_url', image_url: {url: 'data:image/png;base64,AAAA'}}]},
+        {role: 'assistant', content: 'synthetic progress', reasoning_content: 'synthetic reasoning',
+          tool_calls: [{id: 'call_read', type: 'function', function: {name: 'Read', arguments: '{}'}}]},
+        {role: 'tool', tool_call_id: 'call_read', content: 'synthetic tool result'},
+        {role: 'user', content: 'synthetic continuation'},
+      ], ...controls};
+      const expected = structuredClone(original);
+      expected.model = 'original-provider/test-model';
+      if (shared) expected.messages.splice(2, 0, {role: 'system',
+        content: '<shared-instructions>\nsynthetic shared instruction\n</shared-instructions>'});
+      const response = await fetch(f.controller.bridgeURL + '/chat/completions', {method: 'POST',
+        headers: {Authorization: 'Bearer synthetic-kimi-key'}, body: JSON.stringify(original)});
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('"name":"Read"');
+      expect(f.requests.at(-1).body).toEqual(expected);
+    }
+  } finally {await f.cleanup();}
+});
+
 test('Kimi menu aliases route independently and removed models fail closed', async () => {
   const f = await fixture();
   try {

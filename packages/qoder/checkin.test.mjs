@@ -11,6 +11,7 @@ import { QoderAuthPlugin, QoderCNAuthPlugin, _internal } from "./index.mjs"
 
 const real = globalThis.fetch
 const originalRuntime = process.env.QODER_RUNTIME_INFO
+const originalCNRuntime = process.env.QODERCN_RUNTIME_INFO
 const realStat = fsPromises.stat
 let sandbox, native, reads, nativeError, nativeOutput
 const MACHINE_TYPE = "cfe111111111111111"
@@ -19,6 +20,7 @@ beforeEach(() => {
   const file = join(sandbox, process.platform === "win32" ? "runtime-info.exe" : "runtime-info")
   writeFileSync(file, "fixture")
   process.env.QODER_RUNTIME_INFO = file
+  process.env.QODERCN_RUNTIME_INFO = file
   reads = []
   nativeError = null
   nativeOutput = (uid) => JSON.stringify({ machineToken: "sdk-token-" + uid, machineType: MACHINE_TYPE, machineCode: "fixture-code" })
@@ -39,6 +41,8 @@ afterEach(() => {
   setSystemTime()
   if (originalRuntime === undefined) delete process.env.QODER_RUNTIME_INFO
   else process.env.QODER_RUNTIME_INFO = originalRuntime
+  if (originalCNRuntime === undefined) delete process.env.QODERCN_RUNTIME_INFO
+  else process.env.QODERCN_RUNTIME_INFO = originalCNRuntime
   // Only remove the directory this test made under the system's temp root.
   const target = realpathSync(sandbox)
   if (!target.startsWith(realpathSync(tmpdir()) + sep)) throw new Error("test directory escaped temp root")
@@ -204,6 +208,55 @@ test("Linux finds the Qoder desktop's /opt/Qoder runtime", async () => {
   expect(await inSandbox(() => _internal.campaignRuntime({ home: sandbox, platform: "linux", arch: "x64", env: {}, opt: join(sandbox, "opt") }))).toBe(file)
 })
 
+// Qoder CN keeps its runtime under its own names (Qoder CN desktop 0.4.9's
+// .deb, macOS installer and Windows user installer; qoderclicn 1.1.77), and
+// never reads the international Qoder's.
+const CN = _internal.RUNTIMES?.["qoder-cn"]
+const cnRuntime = (opts) => inSandbox(() => _internal.campaignRuntime({ arch: "x64", env: {}, opt: join(sandbox, "opt"), runtime: CN, ...opts }))
+const fixture = (...parts) => {
+  const file = join(sandbox, ...parts)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, "fixture")
+  return file
+}
+
+test("Qoder CN: Linux finds /opt/Qoder-CN, never /opt/Qoder", async () => {
+  fixture("opt", "Qoder", "resources", "umid", "runtime-info")
+  await expect(cnRuntime({ home: sandbox, platform: "linux" })).rejects.toThrow("Qoder CN check-in: device identity runtime not found")
+  const file = fixture("opt", "Qoder-CN", "resources", "umid", "runtime-info")
+  expect(await cnRuntime({ home: sandbox, platform: "linux" })).toBe(file)
+})
+
+test("Qoder CN: macOS finds Qoder CN.app", async () => {
+  fixture("Applications", "Qoder.app", "Contents", "Resources", "umid", "runtime-info")
+  const file = fixture("Applications", "Qoder CN.app", "Contents", "Resources", "umid", "runtime-info")
+  expect(await cnRuntime({ home: sandbox, platform: "darwin", arch: "arm64" })).toBe(file)
+})
+
+test("Qoder CN: Windows finds the Qoder CN desktop's runtime", async () => {
+  fixture("Local", "Programs", "Qoder", "resources", "umid", "runtime-info.exe")
+  const file = fixture("Local", "Programs", "Qoder CN", "resources", "umid", "runtime-info.exe")
+  expect(await cnRuntime({ home: join(sandbox, "nobody"), platform: "win32", env: { LOCALAPPDATA: join(sandbox, "Local") } })).toBe(file)
+})
+
+test("Qoder CN: finds its CLI's cache in .qoder-cn and its QODERCN_ folders, never .qoder", async () => {
+  cliCache(join(sandbox, ".qoder"), "linux", "x64")
+  await expect(cnRuntime({ home: sandbox, platform: "linux" })).rejects.toThrow("QODERCN_RUNTIME_INFO")
+  await expect(cnRuntime({ home: sandbox, platform: "linux", env: { QODER_CONFIG_DIR: join(sandbox, ".qoder") } })).rejects.toThrow("not found")
+  const own = cliCache(join(sandbox, ".qoder-cn"), "linux", "x64")
+  expect(await cnRuntime({ home: sandbox, platform: "linux" })).toBe(own)
+  const dir = cliCache(join(sandbox, "custom"), "linux", "x64")
+  expect(await cnRuntime({ home: join(sandbox, "nobody"), platform: "linux", env: { QODERCN_CONFIG_DIR: join(sandbox, "custom") } })).toBe(dir)
+  const named = cliCache(join(sandbox, "clihome", ".qcn"), "linux", "x64")
+  expect(await cnRuntime({ home: join(sandbox, "nobody"), platform: "linux", env: { QODERCN_CLI_HOME: join(sandbox, "clihome"), QODERCN_CONFIG_DIR_NAME: ".qcn" } })).toBe(named)
+})
+
+test("Qoder CN: QODERCN_RUNTIME_INFO names its runtime; QODER_RUNTIME_INFO is the international one's", async () => {
+  const intl = fixture("intl", "runtime-info")
+  await expect(cnRuntime({ home: sandbox, platform: "linux", env: { QODER_RUNTIME_INFO: intl } })).rejects.toThrow("not found")
+  expect(await cnRuntime({ home: sandbox, platform: "linux", env: { QODERCN_RUNTIME_INFO: intl } })).toBe(intl)
+})
+
 test("no runtime anywhere says how to get one", async () => {
   await expect(inSandbox(() => _internal.campaignRuntime({ home: sandbox, platform: "linux", arch: "x64", env: {}, opt: join(sandbox, "opt") }))).rejects.toThrow("device identity runtime not found")
 })
@@ -232,16 +285,36 @@ for (const identity of [{}, { machineToken: "", machineType: MACHINE_TYPE }, { m
 }
 
 test("CN still queries and claims without a native identity runtime", async () => {
-  process.env.QODER_RUNTIME_INFO = join(sandbox, "not-installed")
+  delete process.env.QODERCN_RUNTIME_INFO
+  const nowhere = spyOn(fsPromises, "stat").mockImplementation(() => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })))
+  try {
+    const p = await loader(QoderCNAuthPlugin, (u, init) => {
+      expect(init.headers["Cosy-MachineToken"]).toBeUndefined()
+      expect(init.headers["Cosy-MachineType"]).toBeUndefined()
+      return json(u.pathname.endsWith("/claim") ? { status: "CLAIMED" } : LIST)
+    })
+    const url = "https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"
+    expect(await (await p.fetch(url)).json()).toEqual(LIST)
+    expect((await (await p.fetch(url + "/c1/claim", { method: "POST", body: "{}" })).json()).status).toBe("CLAIMED")
+    expect(reads).toHaveLength(0)
+  } finally {
+    nowhere.mockRestore()
+  }
+})
+
+// #2911, plugins#304: Qoder CN's desktop (0.4.9) and CLI send Qoder CN's
+// own runtime-info identity, environment 0, on its campaigns pages.
+test("CN campaigns carry Qoder CN's own device identity, environment 0", async () => {
   const p = await loader(QoderCNAuthPlugin, (u, init) => {
-    expect(init.headers["Cosy-MachineToken"]).toBeUndefined()
-    expect(init.headers["Cosy-MachineType"]).toBeUndefined()
+    expect(init.headers["Cosy-MachineToken"]).toBe("sdk-token-u1")
+    expect(init.headers["Cosy-MachineType"]).toBe(MACHINE_TYPE)
     return json(u.pathname.endsWith("/claim") ? { status: "CLAIMED" } : LIST)
   })
   const url = "https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"
   expect(await (await p.fetch(url)).json()).toEqual(LIST)
   expect((await (await p.fetch(url + "/c1/claim", { method: "POST", body: "{}" })).json()).status).toBe("CLAIMED")
-  expect(reads).toHaveLength(0)
+  expect(reads).toHaveLength(1)
+  expect(reads[0].args).toEqual(process.platform === "linux" ? ["0"] : ["0", "--account-stdin"])
 })
 
 test("a PAT account checks in on its job token, having no device token", async () => {

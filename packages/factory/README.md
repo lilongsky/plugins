@@ -115,6 +115,30 @@ magpie plugin add @magpie-community/opencode-factory-auth
 magpie plugin login factory
 ```
 
+## Standard usage only (optional)
+
+In magpie, open the Factory provider, turn on **Standard usage only** under
+**Plugin options**, and save (or set `"pluginOptions": {"factory":
+{"standard_only": true}}` in magpie's settings.json). It is off by default,
+applies to every Factory account, and takes effect at each account's next
+usage reading.
+
+When on, the plugin reports the Standard 5 hours, 7 days and 30 days
+windows as counting every model, Droid Core's open models too, whether or
+not the account has Extra usage. Droid Core's windows and Extra usage are
+still shown but never keep an account in routing.
+
+magpie leaves an account out before sending only when it is held at a
+usage cap, so pair the option with a cap on each account, for example
+`magpie provider account-cap factory <account> 99`. An account is then
+skipped once any Standard window reaches the cap, the request goes to the
+next account with the same model, and when every account is held magpie
+answers 429 without sending. Without a cap, an account whose Standard
+usage is gone is still tried, and Factory may serve a Droid Core model
+from Core or Extra usage. Readings lag, so the last requests before a
+window fills still go out; to never spend Extra usage, turn it off in
+Factory.
+
 ## Claude Code through magpie
 
 Factory's Anthropic route requires Droid's fixed client preamble and

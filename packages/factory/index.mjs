@@ -983,11 +983,19 @@ function dollars(cents) {
   return "$" + ((lo % 2 === 0 ? lo : lo + 1) / 100).toFixed(2)
 }
 
+// STANDARD_ONLY is the switch (magpie's plugin options, off by default)
+// that keeps an account in routing only while its Standard usage lasts
+// (magpie-community/plugins#349)
+const STANDARD_ONLY = "standard_only"
+
 // limitWindows turns the limits into windows: standard's by their span,
 // then Droid Core's, then the extra usage left. For routing, standard counts
 // the vendors' models and Core the open ones Factory hosts; with extra usage
-// to spend, a window used up stops neither.
-function limitWindows(l) {
+// to spend, a window used up stops neither. standardOnly (STANDARD_ONLY on)
+// makes standard's windows count every model, Core's too, extra usage or
+// not, and leaves Droid Core's and the extra usage to be shown only: an
+// account stops when any of standard's windows is used up.
+function limitWindows(l, standardOnly = false) {
   const out = []
   const cents = typeof l.extraUsageBalanceCents === "number" ? l.extraUsageBalanceCents : null
   const extra = l.extraUsageAllowed === true && cents !== null && cents > 0
@@ -1003,9 +1011,16 @@ function limitWindows(l) {
       const win = { name: prefix + name, used: Math.min(Math.max(used, 0), 100), span }
       const end = windowEnd(w.windowEnd)
       if (end) win.resetsAt = end
-      if (extra) win.aside = true
-      if (core) win.models = CORE
-      else win.notModels = CORE
+      if (standardOnly) {
+        if (core) {
+          win.aside = true
+          win.models = CORE
+        }
+      } else {
+        if (extra) win.aside = true
+        if (core) win.models = CORE
+        else win.notModels = CORE
+      }
       out.push(win)
     }
   }
@@ -1676,7 +1691,16 @@ function anthropicBody(body) {
   return changed ? JSON.stringify(request) : body
 }
 
-export const FactoryAuthPlugin = async ({ client }) => {
+export const FactoryAuthPlugin = async ({ client, magpie }) => {
+  // standardOnly is the user's STANDARD_ONLY as magpie has it now, read at
+  // each usage reading so a change needs no restart; false outside magpie
+  const standardOnly = () => {
+    try {
+      return magpie?.option?.(PROVIDER, STANDARD_ONLY) === true
+    } catch {
+      return false
+    }
+  }
   // the session id this process's requests carry
   const session = crypto.randomUUID()
   // serializes checking, rotating and saving tokens: WorkOS rotates the
@@ -1870,7 +1894,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
           l = await limits()
         }
         if (!l?.limits?.standard) return { error: "Factory: the account reported no limits", signIn }
-        return { windows: limitWindows(l), signIn }
+        return { windows: limitWindows(l, standardOnly()), signIn }
       } catch (e) {
         if (e?.lapsed) signIn = "expired"
         return { error: e?.message ?? String(e), signIn }
@@ -1923,6 +1947,16 @@ export const FactoryAuthPlugin = async ({ client }) => {
         },
         // droid's FACTORY_API_KEY: the key is the bearer, never renewed
         { type: "api", label: "Factory API key (fk-…)", placeholder: "fk-…" },
+      ],
+      // magpie's own switches (input.magpie.option), read at each usage
+      // reading
+      options: [
+        {
+          key: STANDARD_ONLY,
+          label: "Standard usage only",
+          description:
+            "Keeps an account in routing only while its Standard usage lasts: once any Standard window (5 hours, 7 days, 30 days) is used up, magpie moves every model, Droid Core's too, to the next account until the window resets. Droid Core and Extra usage are shown but never keep an account in routing.",
+        },
       ],
       // magpie renews the sign-in MAGPIE_LEAD before its end, before its
       // requests and usage ask for it, and saves what this gives. Under
@@ -2068,4 +2102,4 @@ export const FactoryAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { contentRefused, explain, fastBody, FAST_BETA, limitWindows, windowEnd, dollars, vendorError, CORE, droidBody, DROID_LINE, geminiBody, leaveOutAttachments, LEFT_OUT, TOO_LARGE_HINT, MODELS, PROMOTIONS, rateOf, configModels, providerModel, providerModels }
+export const _internal = { STANDARD_ONLY, contentRefused, explain, fastBody, FAST_BETA, limitWindows, windowEnd, dollars, vendorError, CORE, droidBody, DROID_LINE, geminiBody, leaveOutAttachments, LEFT_OUT, TOO_LARGE_HINT, MODELS, PROMOTIONS, rateOf, configModels, providerModel, providerModels }

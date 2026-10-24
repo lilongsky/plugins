@@ -1,8 +1,11 @@
 // grok-4.7 offers the built-in's reasoning levels before Grok lists any:
 // magpie keeps the configured model when the models hook fails, and a
 // model with no variants lost the levels the built-in had (low…xhigh).
+import { noRealGrok } from "./nocli.mjs"
 import { expect, test } from "bun:test"
 import { GrokAuthPlugin, _internal } from "./index.mjs"
+
+noRealGrok()
 
 test("the configured grok-4.7 carries the built-in's levels", async () => {
   const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
@@ -63,7 +66,9 @@ test("a window offered without a k asks Grok for that model and that many tokens
 // A token Grok refuses before its time says the sign-in is gone, as one
 // past its time does, so magpie's move takes the account along untried;
 // "Grok models: 401 …" stopped every Grok account's move.
-test("a refused token says the sign-in has expired", async () => {
+// with no Grok Build to renew it, a refused token says so, not that the
+// sign-in has expired (renew.test.mjs has the CLI renewing it)
+test("a refused token with no Grok Build to renew it says so", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs")
   const { tmpdir } = await import("node:os")
   const { join } = await import("node:path")
@@ -76,7 +81,8 @@ test("a refused token says the sign-in has expired", async () => {
   try {
     const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
     const err = await hooks.provider.models({ id: "grok", models: {} }, { auth: { type: "oauth", refresh: home } }).catch((e) => e)
-    expect(err?.message).toMatch(/sign-in has expired/)
+    expect(err?.message).toContain("there is no Grok Build here to renew it")
+    expect(err?.message).not.toMatch(/sign-in has expired/)
   } finally {
     ;[process.env.PATH, process.env.HOME, globalThis.fetch] = [path, h, fetch0]
   }

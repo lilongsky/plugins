@@ -1,8 +1,11 @@
+import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { GrokAuthPlugin, _internal } from "./index.mjs"
+
+noRealGrok()
 
 const realFetch = globalThis.fetch
 afterEach(() => { globalThis.fetch = realFetch })

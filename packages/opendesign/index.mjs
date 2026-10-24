@@ -121,10 +121,16 @@ async function api(base, path, { key, body, method = "GET", signal } = {}) {
 
 // startDevice opens a device authorization: a code, the page that approves
 // it, and the secret the approval is polled with.
-async function startDevice({ signal } = {}) {
+// host is this computer's name, as `vela login` sends it (os.Hostname());
+// when it can't be read the CLI stops with "resolve hostname", and so does
+// this, rather than send a name of its own.
+async function startDevice({ signal, host = hostname } = {}) {
+  let name = ""
+  try { name = String(host() ?? "").trim() } catch {}
+  if (!name) throw new Error("Open Design sign-in: this computer's name couldn't be read, and the sign-in sends it")
   const r = await api(CONTROL, "/api/v1/cli/device-authorizations", {
     method: "POST",
-    body: { cliVersion: CLI_VERSION, host: hostname() || "magpie", profile: "prod" },
+    body: { cliVersion: CLI_VERSION, host: name, profile: "prod" },
     signal,
   })
   const d = r.body
@@ -499,4 +505,4 @@ export const OpenDesignAuthPlugin = async () => {
 
 // _internal is what the tests read through; magpie calls every exported
 // function as a plugin, so only the plugin itself is exported bare.
-export const _internal = { authOf, allowances, controlKeyOf, credits, modelsOf, money, runtimeKeyOf, said, thePlan, usedPercent, waitForDevice, windowName, when, workspaceOf }
+export const _internal = { authOf, allowances, controlKeyOf, credits, modelsOf, money, runtimeKeyOf, said, startDevice, thePlan, usedPercent, waitForDevice, windowName, when, workspaceOf }

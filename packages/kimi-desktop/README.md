@@ -50,6 +50,10 @@ bun test packages/kimi-desktop/kimi-desktop.test.mjs
 
 The model catalog is fetched from Magpie's `/v1/models` with this agent's credential and registered User-Agent. Magpie owns its visibility, picked/hidden models, disables and ordering. The adapter never opens Magpie's `providers.json` or `settings.json`. It rechecks the gateway catalog before every inference; removed selections are refused even during a running turn, and an unavailable catalog returns a fixed error instead of falling back to an unrestricted list. This package includes no Electron injection hook or model-menu patch. The icon is Kimi's desktop application icon.
 
+Thinking models with a complete, recognized effort list that omits `none` also declare `always_thinking` in both the runtime and menu model configurations. Kimi can then resolve an old Off selection using that model's thinking defaults. A list containing `none` remains switchable; missing or unrecognized effort metadata does not imply mandatory thinking. The adapter does not rewrite the inference request's thinking fields. See the [3.2.18 compatibility check](COMPATIBILITY.md#kimi-3218-isolated-compatibility-check).
+
+The 3.2.18 check includes real model requests, four background-control turns, and three signed-in UI submissions in a separate official desktop profile. Both real models completed native read-tool loops, and the final UI turn recalled the earlier history without a tool call. The signed-in UI retained native model labels; this does not verify custom Magpie aliases in the online menu. The full record distinguishes these checks from the synthetic core tests.
+
 ## Shutdown and manual recovery
 
 The shared plugin host owns process shutdown. This plugin installs no SIGTERM/SIGINT handler and never calls `process.exit`. On the host's normal exit event it synchronously restores the original address if the current address is still its own; restart Kimi to reload its runtime. An explicit disconnect while both apps are running additionally restores model selection/list through the control API.

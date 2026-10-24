@@ -62,9 +62,9 @@ export function envelope(body, flags = 0) {
 }
 export const update = (n, body) => envelope(bin(1, bin(n, body)))
 export const end = () => envelope(Buffer.from("{}"), 2)
-export function tool(id, rawID, value = "seed", { name = "audit_echo", provider = "magpie", server = "magpie", approval = false, omitID = false, argumentValue, omitArguments = false } = {}) {
+export function tool(id, rawID, value = "seed", { name = "audit_echo", provider = "tools", server = "tools", approval = false, omitID = false, argumentValue, omitArguments = false } = {}) {
   const args = omitArguments ? Buffer.alloc(0) : bin(2, message(text(1, "value"), bin(2, argumentValue ?? text(3, value))))
-  const a = message(text(1, "magpie-" + name), args, text(3, rawID), text(4, provider), text(5, name), text(9, server), ...(approval ? [uint(7, 1)] : []))
+  const a = message(text(1, "tools-" + name), args, text(3, rawID), text(4, provider), text(5, name), text(9, server), ...(approval ? [uint(7, 1)] : []))
   return envelope(bin(2, message(...(omitID ? [] : [uint(1, id)]), text(15, "exec-" + id), bin(11, a))))
 }
 export const setBlob = (request, id, data) => envelope(bin(4, message(uint(1, request), bin(3, message(bin(1, id), bin(2, data))))))

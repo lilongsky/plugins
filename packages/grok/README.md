@@ -59,9 +59,22 @@ it, then reads it again:
 - The CLI runs once for a home at a time: a request or renewal that
   comes while it runs waits for it and reads what it gave. A token the
   CLI already renewed is taken as it is.
+- Grok can turn a token away before its `expires_at`. A request, model
+  list or usage read that gets 401 has the CLI renew the token and asks
+  once more with the new one.
+- When the CLI's run leaves the token as it was, the 401 or error says
+  Grok Build couldn't renew the sign-in, with what the CLI said. For Grok
+  Build's own home ("Use Grok Build's current sign-in") opening Grok Build
+  and sending it a message renews it. For a home of the plugin's (a second
+  account, an imported one), opening Grok Build doesn't touch it: add the
+  account in magpie again.
 - When the CLI no longer holds a sign-in in that home (`grok logout`),
   the account has to be signed in again. When it couldn't renew a token
   that has ended, magpie tries again later.
+- An `auth.json` that is empty or not JSON is most likely one the CLI is
+  writing: it is read again for about half a second, then the last sign-in
+  read whole there stands, as the CLI itself keeps its previous one. It is
+  never taken as signed out. The plugin takes no `auth.json.lock`.
 
 ## Requests
 

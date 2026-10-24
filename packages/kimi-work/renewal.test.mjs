@@ -21,10 +21,21 @@ test('host renewal returns only rotated fields and never calls the blind auth.se
   const p=plugin(async(url,init)=>{
     calls.push(url);expect(url).toBe(I.REFRESH);
     expect(init.method).toBe('POST');expect(init.redirect).toBe('error');
-    expect(init.headers.Authorization).toBeUndefined();expect(init.headers.Cookie).toBeUndefined();
+    expect(new Headers(init.headers).has('authorization')).toBe(false);
+    expect(new Headers(init.headers).has('cookie')).toBe(false);
+    const headers=new Headers(init.headers);
+    expect(headers.get('content-type')).toBe('application/json');
+    expect(headers.get('connect-protocol-version')).toBe('1');
+    expect(headers.get('user-agent')).toContain('kimi-desktop/3.2.17');
+    expect(headers.get('user-agent')).not.toContain('kimi-code-cli');
+    expect(headers.get('x-msh-platform')).toBe('mac');
+    expect(headers.get('x-msh-version')).toBe('3.2.17');
+    expect(headers.get('r-timezone')).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(headers.get('x-language')).toBeTruthy();
+    for(const key of ['x-msh-device-id','x-msh-session-id','x-msh-shield-data'])expect(headers.has(key)).toBe(false);
     expect(JSON.parse(init.body)).toEqual({refresh_token:account().refresh});
     return Response.json(rotated());
-  },{client:{auth:{set:async()=>{writes++;throw Error('Blind writes are forbidden');}}}});
+  },{platform:'darwin',client:{auth:{set:async()=>{writes++;throw Error('Blind writes are forbidden');}}}});
   expect(await p.auth.refresh(account())).toEqual(fields(rotated()));
   expect(calls).toEqual([I.REFRESH]);expect(writes).toBe(0);
 });
@@ -125,7 +136,9 @@ test('reference-only legacy accounts require explicit reconnect without hidden d
     client:{auth:{set:async()=>{writes++;}}},
   });
   expect(await p.auth.refresh(legacy)).toBeUndefined();
-  await expect(p.auth.usage(async()=>legacy)).rejects.toMatchObject({signIn:'expired'});
+  await expect(p.auth.usage(async()=>legacy)).rejects.toMatchObject({signIn:'expired',code:'kimi_work_login_expired',
+    message:expect.stringContaining('sign-in has expired')});
+  await expect(p.auth.usage(async()=>legacy)).rejects.toThrow('magpie plugin login kimi-work');
   expect(imports).toBe(0);expect(calls).toBe(0);expect(writes).toBe(0);
 });
 
@@ -151,7 +164,12 @@ for(const status of [429,503])test('transient refresh HTTP '+status+' does not d
 
 test('a refused refresh requests sign-in without revealing its response',async()=>{
   const p=plugin(async()=>new Response('synthetic secret response',{status:401}));
-  await expect(p.auth.refresh(account())).rejects.toMatchObject({signIn:'expired',code:'kimi_work_login_expired'});
+  const error=await p.auth.refresh(account()).catch(error=>error);
+  expect(error).toMatchObject({signIn:'expired',code:'kimi_work_login_expired'});
+  expect(error.message).toContain('sign-in has expired');
+  expect(error.message).toContain('reconnect Kimi Work');
+  expect(error.message).toContain('magpie plugin login kimi-work');
+  expect(error.message).not.toContain('synthetic secret response');
 });
 
 test('network errors during refresh do not reveal request credentials',async()=>{

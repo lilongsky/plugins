@@ -3,11 +3,14 @@
 // CLI there twice at once. The CLI here is a fake in GROK_BIN_DIR: on
 // `grok models` it counts the run and, by FAKE_GROK, writes a new token
 // (renew), drops the sign-in (logout) or fails (anything else).
+import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { GrokAuthPlugin } from "./index.mjs"
+
+noRealGrok()
 
 const real = globalThis.fetch
 const env = { ...process.env }

@@ -128,11 +128,15 @@ function look(home) {
   } catch (e) {
     return { c: null, why: e?.code === "ENOENT" ? `there is no ${file}` : `${file} can't be read (${e?.code ?? e?.message})` }
   }
+  // an empty file, or one that isn't JSON, is most likely one the CLI is
+  // writing as it is read (it rewrites auth.json when it renews): torn
+  // says the read tells nothing, which read() tries again
+  if (!text.trim()) return { c: null, why: `${file} is empty`, torn: true }
   let all
   try {
     all = JSON.parse(text)
   } catch {
-    return { c: null, why: `${file} isn't JSON` }
+    return { c: null, why: `${file} isn't JSON`, torn: true }
   }
   if (!all || typeof all !== "object" || Array.isArray(all)) return { c: null, why: `${file} holds no sign-in` }
   const keys = Object.keys(all).sort()
@@ -143,19 +147,91 @@ function look(home) {
       const email = typeof c.email === "string" ? c.email : ""
       const sub = cpaClaims(c.key)?.sub
       const user = (typeof c.user_id === "string" && c.user_id) || (typeof sub === "string" ? sub : "")
-      return { c: { key: c.key, email, user, who: email || user, expires: Number.isFinite(t) ? t : 0, issuer: c.oidc_issuer ?? "" }, why: "" }
+      const got = { key: c.key, email, user, who: email || user, expires: Number.isFinite(t) ? t : 0, issuer: c.oidc_issuer ?? "" }
+      lastGood.set(home, got)
+      return { c: got, why: "" }
     }
   }
   return { c: null, why: keys.length ? `${file} has ${keys.join(", ")}, none with a token` : `${file} holds no sign-in` }
 }
 
-function credential(home) {
-  return look(home).c
+// lastGood is each home's last sign-in read whole.
+const lastGood = new Map()
+const TORN_TRIES = 6
+const TORN_WAIT = 100
+
+// read is look, a torn read (auth.json caught mid-write) tried again for
+// about half a second; still torn, it is the last sign-in read whole there,
+// as the CLI itself keeps its previous credentials when auth.json won't
+// read ("auth reload: auth.json unreadable, keeping previous credentials").
+// No lock is taken: the CLI's auth.json.lock is a flock it holds while it
+// renews, which Node can't take, and a reader holding it could only hold a
+// renewal back.
+async function read(home) {
+  let r = look(home)
+  for (let i = 1; r.torn && i < TORN_TRIES; i++) {
+    await new Promise((ok) => setTimeout(ok, TORN_WAIT))
+    r = look(home)
+  }
+  if (r.torn && lastGood.has(home)) return { c: lastGood.get(home), why: "" }
+  return r
+}
+
+// credential is the sign-in in home, null when there is none. A file that
+// stays torn, with nothing read there before, is unknown, not "not signed
+// in": that is an error saying so.
+async function credential(home) {
+  const r = await read(home)
+  if (r.torn) throw new Error(`Grok Build's sign-in couldn't be read (${r.why}); it may be mid-write, try again in a moment`)
+  return r.c
+}
+
+// shared is whether home is Grok Build's own, which opening Grok Build
+// renews; a home of this plugin's (a second account, an imported one) only
+// this plugin's runs of the CLI ever touch.
+function shared(home) {
+  return resolve(home) === resolve(cliHome())
+}
+
+// notSignedIn says a home holds no sign-in, and what makes one.
+function notSignedIn(home) {
+  return shared(home)
+    ? "Grok is not signed in; run `grok login`"
+    : "Grok is not signed in for this account any more; add the account in magpie again"
+}
+
+// cliSaid is what a `grok models` that renewed nothing said: how it ended
+// and its last line.
+function cliSaid(r) {
+  if (!r) return ""
+  const last = (r.stderr || r.stdout || "").replace(ANSI, "").split("\n").map((l) => l.trim()).filter(Boolean).at(-1)?.slice(0, 200)
+  const how = !r.err ? "ran and left the same token" : r.err.killed ? "timed out" : `exited ${r.err.code ?? "with an error"}`
+  return ` (grok models ${how}${last ? `: ${last}` : ""})`
+}
+
+// unrenewed is a token Grok turned away, or one past its end, that Grok
+// Build, run in its home, didn't replace: the CLI couldn't renew it (xAI's renewal failing, or
+// a refresh token used up elsewhere), which signing in with `grok login`
+// in ~/.grok doesn't help where the account's home is the plugin's own.
+function unrenewed(home, r) {
+  const how = shared(home)
+    ? "open Grok Build and send it a message, which renews the sign-in magpie reads"
+    : "this account's sign-in is kept apart from Grok Build's own, so opening Grok Build doesn't renew it: add the account in magpie again"
+  return Object.assign(new Error(`Grok Build couldn't renew the sign-in${cliSaid(r)}; ${how}`), { unrenewed: true })
+}
+
+// dead is a token Grok turned away even as Grok Build had just renewed it.
+function dead(home) {
+  return shared(home)
+    ? "Grok turned away Grok Build's sign-in even after renewing it; run `grok login` to sign Grok Build in afresh"
+    : "Grok turned away this account's sign-in even after renewing it; add the account in magpie again"
 }
 
 function run(file, args, opts) {
   return new Promise((resolve) => {
-    execFile(file, args, { timeout: 30000, ...opts }, (err, stdout) => resolve({ err, stdout: String(stdout ?? "") }))
+    execFile(file, args, { timeout: 30000, ...opts }, (err, stdout, stderr) =>
+      resolve({ err, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") }),
+    )
   })
 }
 
@@ -178,17 +254,25 @@ function renew(exe, home) {
 }
 
 // token is the CLI's sign-in in home with a token still good. One about to
-// expire (or that a request found expired) is first renewed by the CLI in
-// its own home.
-async function token(home, expired) {
-  let c = credential(home)
+// expire is first renewed by the CLI in its own home, and so is one Grok
+// turned away: rejected is that token (or true for whatever home holds).
+// A token on disk other than the one turned away was renewed already and
+// is taken as it is; one the CLI's run leaves as it was is unrenewed,
+// never "not signed in" nor "expired".
+async function token(home, rejected = false) {
+  let c = await credential(home)
   const exe = executable()
-  if (c && exe && (expired || c.expires - Date.now() < REFRESH_MARGIN)) {
-    await renew(exe, home)
-    c = credential(home)
+  const refused = !!c && (rejected === true || (typeof rejected === "string" && c.key === rejected))
+  let r
+  if (c && exe && (refused || c.expires - Date.now() < REFRESH_MARGIN)) {
+    const was = c.key
+    r = await renew(exe, home)
+    c = await credential(home)
+    if (c && refused && c.key === was) throw unrenewed(home, r)
   }
-  if (!c) throw new Error("Grok is not signed in; run `grok login`")
-  if (c.expires && c.expires <= Date.now()) throw new Error("Grok's sign-in has expired; run `grok login`")
+  if (!c) throw new Error(notSignedIn(home))
+  if (!exe && (refused || (c.expires && c.expires <= Date.now()))) throw new Error(`Grok turned the sign-in away and there is no Grok Build here to renew it; ${NO_CLI}`)
+  if (c.expires && c.expires <= Date.now()) throw unrenewed(home, r)
   return c
 }
 
@@ -425,10 +509,9 @@ async function listModels(key) {
   await sign(headers, key)
   const res = await fetch(`${BASE}/models`, { headers })
   const text = await res.text()
-  // a token Grok turned away before its time (signed out elsewhere) is a
-  // sign-in gone, said as one past its time is: a move takes it along
-  // untried rather than stopping on it
-  if (res.status === 401) throw new Error("Grok's sign-in has expired; run `grok login`")
+  // a token Grok turned away before its time: the caller has Grok Build
+  // renew it and asks once more (models below)
+  if (res.status === 401) throw Object.assign(new Error("Grok turned the sign-in away"), { status: 401 })
   if (!res.ok) throw new Error(`Grok models: ${res.status} ${text.slice(0, 200)}`)
   const out = []
   for (const d of JSON.parse(text)?.data ?? []) {
@@ -548,7 +631,8 @@ function newHome() {
 async function signIn() {
   const exe = executable()
   if (!exe) throw new Error(NO_CLI)
-  const own = !!credential(cliHome())
+  // a sign-in mid-write is one: the CLI's own home is left be
+  const own = await credential(cliHome()).then((c) => !!c, () => true)
   const home = own ? newHome() : cliHome()
   const { child, link, done, tail } = login(exe, home)
   const url = await Promise.race([link, new Promise((r) => setTimeout(() => r(""), LINK_WAIT))])
@@ -568,7 +652,7 @@ async function signIn() {
     method: "auto",
     callback: async () => {
       const r = await done
-      const { c, why } = r.ok ? look(home) : { c: null, why: "" }
+      const { c, why } = r.ok ? await read(home) : { c: null, why: "" }
       // a sign-in beside the CLI's own needs to know whose it is, so the
       // same account signed in again replaces it instead of adding a second
       if (!c || (own && !c.who)) {
@@ -654,7 +738,7 @@ async function importCPA(inputs) {
         rmSync(home, { recursive: true, force: true })
         throw error
       }
-      return saved(home, credential(home))
+      return saved(home, await credential(home))
     },
   }
 }
@@ -669,8 +753,8 @@ function saved(home, c) {
 async function current() {
   if (!executable()) throw new Error(NO_CLI)
   const home = cliHome()
-  if (!credential(home)) throw new Error("Grok Build is not signed in; run `grok login`, or sign in with the device code")
-  const c = await token(home, false)
+  if (!(await credential(home))) throw new Error("Grok Build is not signed in; run `grok login`, or sign in with the device code")
+  const c = await token(home)
   return {
     url: "",
     instructions: c.email ? `Grok Build is signed in as ${c.email}.` : "Grok Build is signed in.",
@@ -729,7 +813,7 @@ async function usage(key) {
   } catch (e) {
     return { error: netError(url, e), windows: [] }
   }
-  if (!res.ok) return { error: statusText(res.status), windows: [] }
+  if (!res.ok) return { error: statusText(res.status), windows: [], status: res.status }
   let data
   try {
     data = JSON.parse(text)
@@ -850,20 +934,21 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
       async refresh(auth) {
         const home = auth?.refresh
         if (auth?.type !== "oauth" || !home) return undefined
-        let c = credential(home)
+        let c = await credential(home)
         // renewed already (by the CLI, or before a request), the store not
         // yet saying so
         const renewed = c && c.key !== auth.access && c.expires - Date.now() >= LEAD_MS
         const exe = executable()
+        let r
         if (!renewed && exe) {
-          await renew(exe, home)
-          c = credential(home)
+          r = await renew(exe, home)
+          c = await credential(home)
         }
         // the CLI holds no sign-in there any more (`grok logout`): one
         // has to be made again
-        if (!c) throw Object.assign(new Error("Grok is not signed in; run `grok login`"), { signIn: "expired" })
+        if (!c) throw Object.assign(new Error(notSignedIn(home)), { signIn: "expired" })
         // the CLI couldn't renew it: tried again later
-        if (exe && c.expires && c.expires <= Date.now()) throw new Error("Grok's sign-in has expired and Grok Build couldn't renew it")
+        if (exe && c.expires && c.expires <= Date.now()) throw unrenewed(home, r)
         if (c.key === auth.access && c.expires === auth.expires) return undefined
         // magpie saves what this gives
         const out = { access: c.key, expires: c.expires }
@@ -889,10 +974,9 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
                 parsed = JSON.parse(body) ?? {}
               } catch {}
             }
-            const c = await token(home, false)
+            let c = await token(home)
             await remember(auth, c)
             const headers = new Headers(req.headers)
-            await sign(headers, c.key)
             const asked = modelOf(parsed.model)
             if (asked.model) {
               headers.set("x-grok-model-override", asked.model)
@@ -904,10 +988,35 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
             if (asked.window) headers.set("x-grok-context-window", String(asked.window))
             if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
             headers.delete("content-length")
-            // sent once, as the built-in sent it: Grok's answer goes on as
-            // it came, the account kept, as the built-in never marked a Grok
-            // account lapsed nor cleared one
-            const res = await fetch(req.url, { ...init, method: req.method, headers, body })
+            const send = async (key) => {
+              await sign(headers, key)
+              return fetch(req.url, { ...init, method: req.method, headers, body })
+            }
+            // Grok's answer goes on as it came, the account kept, as the
+            // built-in never marked a Grok account lapsed nor cleared one.
+            // A token Grok turns away before its time (it can, ahead of
+            // expires_at) is renewed by Grok Build and the request sent once
+            // more; one Grok Build couldn't renew is a 401 saying so, and
+            // what helps.
+            let res = await send(c.key)
+            if (res.status === 401 && (typeof body === "string" || body == null)) {
+              try {
+                c = await token(home, c.key)
+              } catch (e) {
+                const said = (await res.text().catch(() => "")).slice(0, 300)
+                note(home, res)
+                return kept(
+                  new Response(JSON.stringify({ error: { message: `${e.message}${said ? `. Grok said: ${said}` : ""}`, type: "authentication_error", code: "sign_in_unrenewed" } }), {
+                    status: 401,
+                    statusText: res.statusText,
+                    headers: { "content-type": "application/json" },
+                  }),
+                )
+              }
+              await res.body?.cancel().catch(() => {})
+              await remember(auth, c)
+              res = await send(c.key)
+            }
             note(home, res)
             return kept(res)
           },
@@ -947,12 +1056,23 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
         let c
         try {
           if (!auth || auth.type !== "oauth" || !auth.refresh) throw new Error("Grok is not signed in; run `grok login`")
-          c = await token(auth.refresh, false)
+          c = await token(auth.refresh)
         } catch (e) {
           return { error: e.message, windows: [], signIn: "kept" }
         }
         await remember(auth, c)
-        const u = await usage(c.key)
+        let u = await usage(c.key)
+        // a token turned away is renewed once, as a request's is
+        if (u.status === 401) {
+          try {
+            c = await token(auth.refresh, c.key)
+          } catch (e) {
+            return { error: e.message, windows: [], signIn: "kept" }
+          }
+          await remember(auth, c)
+          u = await usage(c.key)
+        }
+        delete u.status
         if (!u.error) u.windows = [...rateWindow(auth.refresh), ...u.windows]
         return { ...u, signIn: "kept" }
       },
@@ -965,7 +1085,18 @@ export const GrokAuthPlugin = async ({ client, magpie }) => {
         if (!auth || auth.type !== "oauth" || !auth.refresh) return have
         // a list Grok couldn't give is a failure, not the few configured:
         // magpie keeps the list it had
-        const list = await listModels((await token(auth.refresh, false)).key)
+        let c = await token(auth.refresh)
+        let list
+        try {
+          list = await listModels(c.key)
+        } catch (e) {
+          if (e?.status !== 401) throw e
+          // turned away before its time: renewed once, as a request's is
+          c = await token(auth.refresh, c.key)
+          list = await listModels(c.key).catch((e) => {
+            throw e?.status === 401 ? new Error(dead(auth.refresh)) : e
+          })
+        }
         const base = have["grok-4.7"] ?? Object.values(have)[0] ?? {}
         const out = {}
         for (const m of list) {

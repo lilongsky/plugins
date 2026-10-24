@@ -184,7 +184,7 @@ test("the tool catalog writes each tool as its CallDynamicTool call", () => {
   const s = _internal.catalog(tools)
   expect(s).not.toContain("<tool name=")
   for (const t of tools) {
-    expect(s).toContain(`<call>CallDynamicTool({"namespace":"magpie","toolName":"${t.name}","arguments":{...}})\n${t.description}\narguments schema: ${t.schemaText}\n</call>`)
+    expect(s).toContain(`<call>CallDynamicTool({"namespace":"tools","toolName":"${t.name}","arguments":{...}})\n${t.description}\narguments schema: ${t.schemaText}\n</call>`)
   }
   expect(_internal.catalog([])).toBe("")
 })

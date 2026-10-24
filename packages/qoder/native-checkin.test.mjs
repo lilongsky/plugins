@@ -10,12 +10,14 @@ import { QoderAuthPlugin, QoderCNAuthPlugin } from "./index.mjs"
 
 const real = globalThis.fetch
 const originalRuntime = process.env.QODER_RUNTIME_INFO
+const originalCNRuntime = process.env.QODERCN_RUNTIME_INFO
 const MACHINE_TYPE = "cfe111111111111111"
 let sandbox, native, reads, nativeError, nativeOutput
 beforeEach(() => {
   sandbox = mkdtempSync(join(tmpdir(), "qoder-native-checkin-"))
   process.env.QODER_RUNTIME_INFO = join(sandbox, process.platform === "win32" ? "runtime-info.exe" : "runtime-info")
   writeFileSync(process.env.QODER_RUNTIME_INFO, "fixture")
+  process.env.QODERCN_RUNTIME_INFO = process.env.QODER_RUNTIME_INFO
   reads = []
   nativeError = null
   nativeOutput = (uid) => JSON.stringify({ machineToken: "sdk-token-" + uid, machineType: MACHINE_TYPE })
@@ -35,6 +37,8 @@ afterEach(() => {
   native.mockRestore()
   if (originalRuntime === undefined) delete process.env.QODER_RUNTIME_INFO
   else process.env.QODER_RUNTIME_INFO = originalRuntime
+  if (originalCNRuntime === undefined) delete process.env.QODERCN_RUNTIME_INFO
+  else process.env.QODERCN_RUNTIME_INFO = originalCNRuntime
   const target = realpathSync(sandbox)
   if (!target.startsWith(realpathSync(tmpdir()) + sep)) throw new Error("test directory escaped temp root")
   rmSync(target, { recursive: true, force: true })
@@ -76,9 +80,26 @@ test("an already-claimed campaign is done without another claim", async () => {
   expect(p.seen.map((x) => x.path)).toEqual(["/sash/api/v1/me/campaigns"])
 })
 
-test("no benefit campaign is inactive", async () => {
+// plugins#304 (ReneXiong): the identity was read and sent, and the list
+// still had no CLAIM_BENEFIT. Qoder decides that per device, so the answer
+// says it was this device's identity that was offered nothing, and that
+// Qoder desktop can still claim it, instead of a bare "inactive".
+test("no benefit campaign is inactive, saying this device's identity was offered none", async () => {
   const p = await checkin(QoderAuthPlugin, () => json({ campaigns: [{ campaignId: "x", actionType: "VIEW_DETAILS", claimStatus: "CLAIMABLE" }] }))
-  expect(p.out).toEqual({ outcome: "inactive" })
+  expect(p.out.outcome).toBe("inactive")
+  expect(p.out.message).toContain("Qoder offered this device's identity")
+  expect(p.out.message).toContain("no daily credits campaign")
+  expect(p.out.message).toContain("claim them there")
+  expect(p.out.message).toContain("Qoder desktop")
+  expect(reads).toHaveLength(1)
+})
+
+test("CN offered nothing with Qoder CN's own identity is inactive, naming Qoder CN", async () => {
+  const p = await checkin(QoderCNAuthPlugin, () => json({ campaigns: [] }), "https://openapi.qoder.com.cn")
+  expect(p.out.outcome).toBe("inactive")
+  expect(p.out.message).toContain("Qoder CN offered this device's identity")
+  expect(p.out.message).toContain("Qoder CN desktop")
+  expect(reads).toHaveLength(1)
 })
 
 test("a claim answer with nested data is read", async () => {
@@ -86,14 +107,67 @@ test("a claim answer with nested data is read", async () => {
   expect(p.out).toEqual({ outcome: "claimed", credit: 100 })
 })
 
+// Qoder CN on no device: no runtime anywhere, as on a machine that never had
+// Qoder CN desktop or its CLI.
+async function noRuntime(run) {
+  delete process.env.QODER_RUNTIME_INFO
+  delete process.env.QODERCN_RUNTIME_INFO
+  const nowhere = spyOn(fsPromises, "stat").mockImplementation(() => Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })))
+  try {
+    return await run()
+  } finally {
+    nowhere.mockRestore()
+  }
+}
+
 test("CN claims without the native runtime", async () => {
-  process.env.QODER_RUNTIME_INFO = join(sandbox, "not-installed")
-  const p = await checkin(QoderCNAuthPlugin, (u, init) => {
+  const p = await noRuntime(() => checkin(QoderCNAuthPlugin, (u, init) => {
     expect(init.headers["Cosy-MachineToken"]).toBeUndefined()
     return u.pathname.endsWith("/claim") ? json({ status: "CLAIMED" }) : json(LIST)
-  }, "https://openapi.qoder.com.cn")
+  }, "https://openapi.qoder.com.cn"))
   expect(p.out).toEqual({ outcome: "claimed", credit: 100 })
   expect(reads).toHaveLength(0)
+})
+
+// #2911, plugins#304 (10-22): Qoder CN desktop 0.4.9 and its CLI ask
+// Qoder CN's runtime-info for environment 0 and send what it says on every
+// campaigns request; the plugin sent nothing for CN. With Qoder CN
+// installed, the check-in carries the same identity.
+test("CN claims with Qoder CN's own device identity, environment 0", async () => {
+  const p = await checkin(QoderCNAuthPlugin, (u, init) => {
+    const identified = init.headers["Cosy-MachineToken"] === "sdk-token-u1" && init.headers["Cosy-MachineType"] === MACHINE_TYPE
+    if (u.pathname.endsWith("/claim")) return json(identified ? { status: "CLAIMED" } : { status: "INELIGIBLE" })
+    return json(identified ? LIST : { campaigns: [] })
+  }, "https://openapi.qoder.com.cn")
+  expect(p.out).toEqual({ outcome: "claimed", credit: 100 })
+  expect(reads).toHaveLength(1)
+  expect(reads[0].args).toEqual(process.platform === "linux" ? ["0"] : ["0", "--account-stdin"])
+  if (process.platform !== "linux") expect(reads[0].input).toEqual({ account: "u1" })
+})
+
+// Offered nothing without the identity, the CN check-in says why and what to
+// install, as the international one does, instead of "inactive".
+test("CN offered nothing with no Qoder CN on this machine is ineligible, naming Qoder CN", async () => {
+  const p = await noRuntime(() => checkin(QoderCNAuthPlugin, () => json({ campaigns: [] }), "https://openapi.qoder.com.cn"))
+  expect(p.out.outcome).toBe("ineligible")
+  expect(p.out.message).toContain("Install Qoder CN desktop")
+  expect(p.out.message).toContain("QODERCN_RUNTIME_INFO")
+  expect(reads).toHaveLength(0)
+})
+
+// The helper is there but didn't answer: ask again later, not for the day.
+test("CN offered nothing when Qoder CN's helper failed is a failure to retry", async () => {
+  nativeError = new Error("fixture helper unavailable")
+  const p = await checkin(QoderCNAuthPlugin, () => json({ campaigns: [] }), "https://openapi.qoder.com.cn")
+  expect(p.out.outcome).toBe("failed")
+  expect(p.out.message).toContain("Qoder CN check-in: could not read device identity")
+})
+
+// The helper failing never stops a check-in the server still serves.
+test("CN still claims when Qoder CN's helper fails", async () => {
+  nativeError = new Error("fixture helper unavailable")
+  const p = await checkin(QoderCNAuthPlugin, (u) => (u.pathname.endsWith("/claim") ? json({ status: "CLAIMED" }) : json(LIST)), "https://openapi.qoder.com.cn")
+  expect(p.out).toEqual({ outcome: "claimed", credit: 100 })
 })
 
 // plugins#304: on a machine that never had Qoder there is no helper to read

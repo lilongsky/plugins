@@ -1,5 +1,8 @@
+import { noRealGrok } from "./nocli.mjs"
 import { expect, test } from "bun:test"
 import { _internal } from "./index.mjs"
+
+noRealGrok()
 
 // magpie hands a request that turned tools off with none declared
 // "tool_choice": "none" (yetone/magpie#3110); Grok refuses a tool_choice

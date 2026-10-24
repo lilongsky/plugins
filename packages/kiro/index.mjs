@@ -1097,7 +1097,12 @@ async function* events(body, model, budget) {
   let tool = ""
   let tools = 0
   let stop = ""
-  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  // reported: Kiro sent a tokenUsage. It doesn't today: a reply has a
+  // contextUsageEvent and a meteringEvent (credits) and nothing more, and
+  // kiro-cli 2.32's own trace log shows its MetadataEvent with every token
+  // count None, while a repeated prompt is billed about half the credits,
+  // so Kiro does cache and doesn't say how much
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false }
   let pct = 0
   let said = 0
   let failed = ""
@@ -1147,6 +1152,7 @@ async function* events(body, model, budget) {
         if (m.stopReason) stop = m.stopReason
         const tu = m.tokenUsage
         if (tu && typeof tu === "object") {
+          usage.reported = true
           usage.input += tu.uncachedInputTokens || tu.inputTokens || 0
           usage.output += tu.outputTokens || 0
           usage.cacheRead += tu.cacheReadInputTokens || 0
@@ -1192,12 +1198,15 @@ function finished(content) {
   return content
 }
 
-const anthropicUsage = (u) => ({
-  input_tokens: u.input,
-  output_tokens: u.output,
-  cache_read_input_tokens: u.cacheRead,
-  cache_creation_input_tokens: u.cacheWrite,
-})
+// anthropicUsage is the usage in Messages' words. With no tokenUsage from
+// Kiro the input is reckoned from how full the context is, and what of it
+// Kiro read from its cache is unknown, not 0: the cache fields are left
+// out and magpie is told so (magpie_cache_unknown), so it shows no hit
+// rate rather than 0%.
+const anthropicUsage = (u) =>
+  u.reported
+    ? { input_tokens: u.input, output_tokens: u.output, cache_read_input_tokens: u.cacheRead, cache_creation_input_tokens: u.cacheWrite }
+    : { input_tokens: u.input, output_tokens: u.output, magpie_cache_unknown: true }
 
 // quotaWords are magpie's (internal/gateway/fallback.go): how a vendor says
 // "out of quota" or "slow down".

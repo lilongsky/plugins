@@ -672,3 +672,131 @@ test("overseas chat: a spent quota on the first host isn't asked of the second, 
     globalThis.fetch = realFetch
   }
 })
+
+// 小八 (Discord, 2026-10-23): a banned AutoClaw account answers every route
+// with exactly these bytes. It is the account, not an expired sign-in:
+// magpie must keep the token and show the vendor's words.
+const BANNED = '{"code":410004,"message":"The account has been banned"}'
+
+test("bannedSaid reads the code or message field, never the whole body", () => {
+  const { bannedSaid } = _internal
+  expect(bannedSaid(JSON.parse(BANNED))).toBe("The account has been banned")
+  expect(bannedSaid({ code: 410004 })).toBe("account refused (code 410004)")
+  expect(bannedSaid({ code: 1, msg: "账号已被封禁" })).toBe("账号已被封禁")
+  expect(bannedSaid({ error: { message: "账号异常，请联系客服" } })).toBe("账号异常，请联系客服")
+  // a true expiry, and "banned" outside the code/message fields, are not a ban
+  expect(bannedSaid({ code: 401, message: "token invalid" })).toBe("")
+  expect(bannedSaid({ code: 401001, msg: "invalid_grant", detail: "The account has been banned" })).toBe("")
+  expect(bannedSaid({ code: 401, message: "token expired" })).toBe("")
+})
+
+test("overseas chat: a banned account is a 403 with the vendor's words, the sign-in kept, the second host not asked", async () => {
+  const realFetch = globalThis.fetch
+  const urls = []
+  let answer = () => new Response(BANNED, { status: 403, headers: { "content-type": "application/json" } })
+  globalThis.fetch = async (input) => {
+    urls.push(String(input))
+    return answer()
+  }
+  try {
+    const hooks = await AutoclawAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const body = JSON.stringify({ model: "zai_glm-5.3-flash", messages: [{ role: "user", content: "hi" }] })
+    const banned = await loader.fetch("x", { method: "POST", body })
+    expect(banned.status).toBe(403)
+    expect(banned.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    const e = (await banned.json()).error
+    expect(e.message).toBe("AutoClaw: The account has been banned")
+    expect(e.type).toBe("permission_error")
+    expect(e.code).toBe(410004)
+    expect(urls.length).toBe(1)
+
+    // a token both hosts refuse as expired is still the sign-in
+    urls.length = 0
+    answer = () => new Response('{"code":401,"message":"token expired"}', { status: 401 })
+    const dead = await loader.fetch("x", { method: "POST", body })
+    expect(dead.status).toBe(401)
+    expect(dead.headers.get("X-Magpie-Sign-In")).toBe("expired")
+    expect(urls.length).toBe(2)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("CN chat: a banned account is a 403 with the vendor's words, and the sign-in is kept", async () => {
+  const realFetch = globalThis.fetch
+  let answer = () => new Response(BANNED, { status: 403 })
+  globalThis.fetch = async () => answer()
+  try {
+    const hooks = await AutoclawCnAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "a1" }))
+    const body = JSON.stringify({ model: "zaicoding_glm-5.3", messages: [{ role: "user", content: "hi" }] })
+    const banned = await loader.fetch("x", { method: "POST", body })
+    expect(banned.status).toBe(403)
+    expect(banned.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect((await banned.json()).error.message).toBe("AutoClaw: The account has been banned")
+
+    answer = () => new Response('{"code":401,"message":"token invalid"}', { status: 403 })
+    const dead = await loader.fetch("x", { method: "POST", body })
+    expect(dead.status).toBe(401)
+    expect(dead.headers.get("X-Magpie-Sign-In")).toBe("expired")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("refreshTokens keeps a banned account's sign-in and says why", async () => {
+  const realFetch = globalThis.fetch
+  const requests = []
+  globalThis.fetch = async (input) => {
+    requests.push(String(input))
+    return new Response(BANNED, { status: 403 })
+  }
+  try {
+    let threw
+    try { await refreshTokens(jwt({ source_id: "google" }), []) } catch (e) { threw = e }
+    expect(threw).toBeInstanceOf(Error)
+    expect(threw.message).toBe("AutoClaw: The account has been banned")
+    expect(threw.signIn).toBe("kept")
+    expect(requests.length).toBe(1)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("refreshTokens keeps the sign-in for a ban without an envelope code", async () => {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('{"message":"The account has been banned"}', { status: 403 })
+  try {
+    let threw
+    try { await refreshTokens(jwt({ source_id: "google" }), []) } catch (e) { threw = e }
+    expect(threw.message).toBe("AutoClaw: The account has been banned")
+    expect(threw.signIn).toBe("kept")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("usage and check-in of a banned account say the ban and keep the sign-in", async () => {
+  const realFetch = globalThis.fetch
+  const urls = []
+  globalThis.fetch = async (input) => {
+    urls.push(String(input))
+    return new Response(BANNED, { status: 403 })
+  }
+  try {
+    for (const plugin of [AutoclawAuthPlugin, AutoclawCnAuthPlugin]) {
+      const hooks = await plugin({ client: { auth: { set: async () => {} } } }, {})
+      const u = await hooks.auth.usage(async () => ({ type: "oauth", access: "a1", refresh: "r1" }))
+      expect(u.error).toBe("AutoClaw: The account has been banned")
+      expect(u.signIn).toBe("kept")
+      urls.length = 0
+      let threw
+      try { await hooks.auth.checkin(async () => ({ type: "oauth", access: "a1", refresh: "r1" })) } catch (e) { threw = e }
+      expect(threw.message).toBe("AutoClaw: The account has been banned")
+      expect(urls.length).toBe(1)
+    }
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

@@ -1,8 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const BEGIN = '<magpie-kimi-shared-instructions>';
-const END = '</magpie-kimi-shared-instructions>';
+// The tag goes upstream with the prompt, so it names neither the app nor
+// the vendor (magpie-community/plugins#356). Turns written before 0.1.3 hold
+// the old tag; both are taken out, so a history never carries two copies.
+const BEGIN = '<shared-instructions>';
+const END = '</shared-instructions>';
+const TAGS = [[BEGIN, END], ['<magpie-kimi-shared-instructions>', '</magpie-kimi-shared-instructions>']];
 const LIMIT = 1024 * 1024;
 
 function linkDirectory(link, target) {
@@ -41,8 +45,8 @@ export function applyInstructions(payload, file) {
   // Remove only our separate system message; leave Kimi's and the user's own
   // instructions, tool messages, image parts and conversation history intact.
   const messages = payload.messages.filter(message => !(message?.role === 'system'
-    && typeof message.content === 'string' && message.content.startsWith(BEGIN + '\n')
-    && message.content.endsWith('\n' + END)));
+    && typeof message.content === 'string' && TAGS.some(([begin, end]) =>
+      message.content.startsWith(begin + '\n') && message.content.endsWith('\n' + end))));
   if (text) {
     let at = 0;
     while (['system', 'developer'].includes(messages[at]?.role)) at++;

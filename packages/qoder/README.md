@@ -98,10 +98,20 @@ itself.
   `cache_control: ephemeral` (nothing is marked when the last turn is a
   tool's result), user turns carry their blocks as `contents` too, and each
   request names its conversation in `session_id`. That id is a hash of
-  Codex's thread (`prompt_cache_key`) when magpie sends one, else of the
-  conversation's start, so every turn of one conversation names the same
-  session; the key itself never goes out. Each request has its own
-  `request_id`.
+  the session the agent names (since 0.2.31, #330: DSH's
+  `x-deepseek-harness-session-id` and the other agents' own session
+  headers, which magpie hands the plugin's `chat.headers` hook, and
+  OpenCode's session), else of Codex's thread (`prompt_cache_key`) when
+  magpie sends one, else of the conversation's start, so every turn of one
+  conversation names the same session; the key itself never goes out.
+  Each request has its own `request_id` and `chat_record_id`.
+- Every call that answers one user prompt goes out as one task, as Qoder's
+  own client sends it (since 0.2.31, #330): one `request_set_id`, which is
+  also `business.id`, and one `business.begin_at` for every call of the
+  tool loop, `business.stage` "start" until a call is answered and
+  "processing" after. A new user prompt in the session is a new task. The
+  plugin keeps at most 512 tasks, each for 2 hours after its last call.
+  Before 0.2.31 each call was a task of its own.
   - The model's own configuration from Qoder's list goes with it.
 - It picks the reasoning effort from the model's own levels:
   - The nearest level to the one asked, the higher one on a tie.
@@ -285,8 +295,35 @@ the account's credentials.
   international account gets no daily claim until Qoder is installed.
 - A helper that is there but can't be read, or gives an invalid identity,
   is `failed` and asked again later, rather than a false "no activity"
-  result. Qoder CN keeps its existing requests and does not need this
-  local helper.
+  result.
+- With the identity read and sent, a list with no daily claim is
+  `inactive`, with a message (since 0.2.32) saying Qoder offered this
+  device's identity no daily credits campaign, that Qoder decides that per
+  device, and that the credits can be claimed in Qoder desktop when it
+  shows them (#304: a Linux CLI identity was offered none while the same
+  account's desktop identity was). The plugin never sends another
+  device's identity.
+
+Qoder CN (since 0.2.30) sends its own device identity the same way when
+Qoder CN is installed: its desktop 0.4.9 and CLI (`qoderclicn`) both ask
+Qoder CN's `runtime-info` for environment `0` (the international one is
+`3`) and send it on the campaigns pages (yetone/magpie#2911, #304).
+
+- The plugin finds Qoder CN desktop's `resources/umid` (`Qoder CN.app` on
+  macOS, `%LOCALAPPDATA%\Programs\Qoder CN` or `%ProgramFiles%\Qoder CN`
+  on Windows, `/opt/Qoder-CN` on Linux) or the runtime its CLI caches in
+  `~/.qoder-cn/.bin` (`QODERCN_CONFIG_DIR`, `QODERCN_CLI_HOME` and
+  `QODERCN_CONFIG_DIR_NAME` move it). `QODERCN_RUNTIME_INFO` names
+  another location; `QODER_RUNTIME_INFO` is only the international one's.
+- Without it the requests go out as before, as Qoder CN's desktop does
+  when it can't read the identity, and a claim the list still offers is
+  made. When the list then offers no daily claim, the check-in is
+  `ineligible` for the day with a message to install Qoder CN desktop (or
+  sign in to its CLI); a helper that is there but can't be read makes it
+  `failed`, asked again later.
+- Not tried with a real Qoder CN account: whether Qoder CN now hides the
+  daily claim from a request without the identity, as the international
+  site does, is inferred from its clients, not seen.
 
 - **List:** `GET <openapi>/sash/api/v1/me/campaigns`: `campaigns[]` with
   `campaignId`, `actionType`, `claimStatus` (`CLAIMABLE`, `CLAIMED`),

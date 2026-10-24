@@ -70,8 +70,10 @@ const SITES = {
     brand: "ASUS TUF Gaming A15 FA507RM_FA507RM",
     // the IDE's chat functions: the classic IDE's agent, then SOLO's Work
     // mode, then the TRAE agent (solo_agent, which has deepseek-v4.1-flash),
-    // then SOLO Lite's agent
-    functions: ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"],
+    // then SOLO Lite's agent, then SOLO's coder roster, which lists models no
+    // other chat function does (glm-5v-turbo, kimi-k2.5, minimax-m2.7,
+    // qwen-3.6-plus — each answers through it)
+    functions: ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite", "solo_coder"],
     // what Trae CN's chat_v3 is known to serve; the live list replaces it
     // (the MODEL defaults are spread in at the end of the module, once MODEL
     // is defined, so a site's entry only names what differs)
@@ -172,7 +174,7 @@ const SITES = {
     clientVersionCode: "20260917",
     pluginVersion: "2.3.62834",
     brand: "ASUS TUF Gaming A15 FA507RM_FA507RM",
-    functions: ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"],
+    functions: ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite", "solo_coder"],
     // what Trae Global's chat is known to serve (its catalog barely overlaps
     // the CN one's); the live list replaces it
     models: {
@@ -283,6 +285,13 @@ const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is renewed before a request
 const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const DAY = 24 * 3600 * 1000
+// REREAD_MS is how long a list read keeps its answer before a request that
+// wants levels may read the list again: it holds whether the read produced an
+// entry for the model or not, so a list answering badly (or one that doesn't
+// name the model) costs one read, not one per request. A request path that
+// reads on every attempt would otherwise pay two 20s timeouts on each turn —
+// the branch costs the chat itself nothing to answer from.
+const REREAD_MS = 5 * 60 * 1000
 
 // a reply limit of 0 is one Trae doesn't say: magpie then takes models.dev's
 // for the model (magpie's catalog), where a made-up 32K told agents a far
@@ -1168,7 +1177,12 @@ function sessionOf(headers) {
 // tool result sent back, a retry, another function answering) shows up in the
 // usage detail as several, each under no title at all. request_id stays a
 // fresh id per request, being that request's own.
-function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees = false) {
+//
+// levels is the model's own levels (levelsOf of its entry): the effort the
+// request asks for is sent as the Trae name that model takes, and left out
+// when it takes none of that name — Trae rejects a level a model has no entry
+// for, and serves its default when none is asked.
+function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees = false, levels = null) {
   const config = max?.base ?? req.model
   const body = {
     messages: traeMessages(req, sees),
@@ -1180,6 +1194,8 @@ function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees =
     request_id: randomUUID(),
     session_id: session || randomUUID(),
   }
+  const effort = effortOf(levels, req.reasoning_effort ?? req.reasoningEffort)
+  if (effort) body.reasoning_effort = effort
   const asked = req.max_completion_tokens ?? req.max_tokens
   if (Number.isFinite(asked) && asked > 0) body.max_tokens = most > 0 ? Math.min(Math.floor(asked), most) : Math.floor(asked)
   if (max?.window) {
@@ -1332,7 +1348,8 @@ class TextTools {
       const r = this.buf.search(REASON_AT)
       const sm = this.buf.match(STRAY_AT)
       const s = sm ? sm.index : -1
-      if (s >= 0 && [i, d, r].every((x) => x < 0 || s < x)) {
+      const x = this.buf.search(XML_AT)
+      if (s >= 0 && [i, d, r, x].every((y) => y < 0 || s < y)) {
         // a close with no call open, with what GLM left before it
         // (}}</tool_call>, magpie#1945): not the answer, dropped; in code,
         // shown
@@ -1351,7 +1368,7 @@ class TextTools {
         this.after = true
         continue
       }
-      if (r >= 0 && (i < 0 || r < i) && (d < 0 || r < d)) {
+      if (r >= 0 && (i < 0 || r < i) && (d < 0 || r < d) && (x < 0 || r < x)) {
         const o = objectEnd(this.buf, r)
         if (o === -1 && !end) {
           // not whole yet: held, the text before it sent
@@ -1371,7 +1388,39 @@ class TextTools {
         this.buf = this.buf.slice(r + 1)
         continue
       }
-      if (i < 0 && d < 0) break
+      if (i < 0 && d < 0 && x < 0) break
+      if (x >= 0 && (i < 0 || x < i) && (d < 0 || x < d)) {
+        // Anthropic's <function_calls><invoke name="…"> or Qwen's
+        // <function=…>, as Kimi and MiMo write a call (01huadalang on
+        // magpie's Discord, dsh): a call only for a tool the request
+        // declared, and never in a code fence or backticks
+        const head = this.buf.slice(0, x)
+        const at = this.buf.slice(x)
+        const opener = at.match(/^<[^<>]*>?/)[0]
+        if (quoted(this.sent + text + head)) {
+          text += head + opener
+          this.buf = at.slice(opener.length)
+          continue
+        }
+        const b = this.xmlCall(at, end)
+        if (b.wait) break
+        if (b.text) {
+          text += head + opener
+          this.buf = at.slice(opener.length)
+          continue
+        }
+        text += head
+        if (b.error) {
+          this.buf = ""
+          this.sent += text
+          return { text, calls, reasoning, error: b.error }
+        }
+        calls.push(b.call)
+        this.mark = this.sent.length + text.length
+        this.buf = b.rest
+        this.after = true
+        continue
+      }
       if (d >= 0 && (i < 0 || d < i)) {
         text += this.buf.slice(0, d)
         this.buf = this.buf.slice(d)
@@ -1462,7 +1511,7 @@ class TextTools {
       this.buf = ""
     } else {
       // keep back an opened block, or what may be the start of one
-      const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT)].filter((x) => x >= 0)
+      const at = [this.buf.search(OPEN_AT), this.buf.search(OPEN_HOLD), this.buf.search(DSML_AT), this.buf.search(REASON_AT), this.buf.search(XML_AT), this.buf.search(XML_HOLD)].filter((x) => x >= 0)
       let keep = at.length ? this.buf.length - Math.min(...at) : 0
       if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
       // and braces, brackets, quotes or a > a close may still come after
@@ -1473,6 +1522,60 @@ class TextTools {
     }
     this.sent += text
     return { text, calls, reasoning }
+  }
+
+  // xmlCall reads a call written in Anthropic's tags (<function_calls>
+  // around one or more <invoke name="…"><parameter name="k">v</parameter>
+  // </invoke>) or Qwen's (<function=…><parameter=k>v</parameter>
+  // </function>), s starting at its first tag: {call, rest}, {wait}
+  // while it may still become one, {text} when it is no call (a tool the
+  // request didn't declare, a tag named in prose), {error} for one cut
+  // short. Each invoke is a call of its own; the tags between them are
+  // dropped as the leftovers of one.
+  xmlCall(s, end) {
+    const w = s.match(/^<(?:antml:)?function_calls>/)
+    if (w) {
+      const rest = s.slice(w[0].length).replace(/^\s+/, "")
+      if (!end && (!rest || XML_STARTS.some((k) => k.startsWith(rest)))) return { wait: true }
+      return this.xmlInvoke(rest, end)
+    }
+    return this.xmlInvoke(s, end)
+  }
+
+  xmlInvoke(s, end) {
+    let m = s.match(/^<(?:antml:)?invoke\s+name\s*=\s*"([^"<>]+)"\s*>/)
+    let closeRe = /<\/(?:antml:)?invoke\s*>/
+    if (!m) {
+      m = s.match(/^<function=([^\s<>]+?)\s*>/)
+      closeRe = /<\/function\s*>/
+    }
+    if (!m) {
+      // an opener still being written
+      if (!end && (XML_STARTS.some((k) => k.startsWith(s)) || /^<(?:antml:)?(?:invoke\s|function=)[^<>]{0,300}$/.test(s))) return { wait: true }
+      return { text: true }
+    }
+    const declared = this.tools.map((t) => (t.function ?? t)?.name).filter(Boolean)
+    const name = toolNamed(m[1].trim(), this.tools)
+    if (!declared.includes(name)) return { text: true }
+    const body = s.slice(m[0].length)
+    const c = body.match(closeRe)
+    const n = body.search(XML_NEXT)
+    let stop = c ? c.index : -1
+    if (n >= 0 && (stop < 0 || n < stop)) stop = n
+    if (stop < 0) {
+      if (!end) return { wait: true }
+      stop = body.length
+    }
+    const whole = !!c && c.index === stop
+    const region = body.slice(0, stop).replace(/<(\/?)antml:parameter\b/g, "<$1parameter")
+    const p = paramArgs(region, name, this.tools)
+    if (!whole && !p.closed) {
+      // no parameter and no close: a tag named in passing; a parameter
+      // left open: the call cut short (plugins#38)
+      if (!/<parameter\b/.test(region)) return { text: true }
+      return { error: CUT_SHORT }
+    }
+    return { call: { name, arguments: JSON.stringify(p.args) }, rest: whole ? body.slice(stop + c[0].length) : body.slice(stop) }
   }
 
   // block reads what follows a <tool_call> opener: {call, rest} for a
@@ -1960,11 +2063,18 @@ const DSML_INVOKE = new RegExp(String.raw`^<\s*[|｜][\s|｜]*DSML[\s|｜]*invok
 const DSML_INVOKE_AT = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=`)
 const DSML_CLOSE = new RegExp(String.raw`<\s*\/\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s*>`)
 const DSML_PARAM = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>([\s\S]*?)` + DSML + String.raw`parameter\s*>`, "g")
+// Anthropic's and Qwen's call tags (xmlCall): where one starts, an
+// opener still being written, the openers a wrapper is followed by, and
+// the next call's opener
+const XML_AT = /<(?:antml:)?(?:function_calls>|invoke\s+name\s*=|function=)/
+const XML_HOLD = /<(?:antml:)?(?:invoke\s[^<>]{0,300}|function=[^<>]{0,300})$/
+const XML_STARTS = ["<invoke ", "<antml:invoke ", "<function="]
+const XML_NEXT = /<(?:antml:)?invoke\s+name\s*=|<function=/
 // what is left after a call: blanks, our close, DeepSeek's tags but the
-// next call's
-const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_?calls?>|<tool_?calls>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
+// next call's, the closes of Anthropic's and Qwen's
+const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_?calls?>|<tool_?calls>|<\/(?:antml:)?(?:function_calls|invoke|function)>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
 // what text may be the start of, so held back
-const MARKS = [OPEN, CLOSE, "<toolcall>", "</toolcall>", "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|", '{"reasoning_content"']
+const MARKS = [OPEN, CLOSE, "<toolcall>", "</toolcall>", "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|", '{"reasoning_content"', "<function_calls>", "</function_calls>", "<antml:function_calls>", "</antml:function_calls>", "<invoke ", "<antml:invoke ", "</invoke>", "</antml:invoke>", "<function=", "</function>"]
 // reasoning a model wrote into its text as JSON
 const REASON_AT = /\{\s*"reasoning_content"\s*:/
 const MARK_MAX = Math.max(...MARKS.map((m) => m.length))
@@ -2456,6 +2566,55 @@ const maxModel = (...ms) => {
 // deepseek-v4.1-flash in Max mode
 const MAX = "-max"
 
+// ---- reasoning levels --------------------------------------------------------------
+//
+// A list entry carries a reasoning_effort_config: the levels its model takes
+// (light, high, extra_high) and the one it defaults to. The request takes the
+// same names, as reasoning_effort, so a level an agent picks is sent as Trae
+// spells it. OpenCode knows the three as low/high/xhigh, so the map goes both
+// ways.
+//
+// An entry without the config takes no level: Trae serves it at its own
+// default and nothing is sent. The plugin used to send none for every model,
+// which read as "Trae takes no level" — it takes them, per model, and an
+// entry that names none is the exception rather than the rule.
+const LEVELS = { light: "low", high: "high", extra_high: "xhigh" }
+
+// levelsOf is an entry's levels in OpenCode's names, in Trae's order: [] when
+// the entry names none, null when it names ones this map can't spell (so a
+// caller can tell "takes no level" from "takes a level we can't name").
+const levelsOf = (m) => {
+  const cfg = m?.reasoning_effort_config
+  if (!cfg || typeof cfg !== "object") return []
+  const options = Array.isArray(cfg.options) ? cfg.options : []
+  const known = options.filter((o) => typeof o === "string" && LEVELS[o])
+  return known.length ? known.map((o) => LEVELS[o]) : options.length ? null : []
+}
+
+// variantsOf is a model's levels as OpenCode's variants. The value is the
+// effort OpenCode puts in the request body, so it names the level the way this
+// plugin's levels do: an agent in OpenCode writes `reasoning_effort` straight
+// from it, and effortOf below turns that name into Trae's. Naming Trae's
+// spelling here would make the body say "light", which is not one of the
+// levels this plugin offers, and the field would then be dropped. {} when the
+// model takes none.
+const variantsOf = (levels) => Object.fromEntries((levels ?? []).map((level) => [level, { reasoningEffort: level }]))
+
+// effortOf is the name to send Trae for an effort the request carries, or
+// undefined when the model doesn't take that one: a level Trae has no entry for
+// is rejected, so nothing is sent instead. The effort arrives in either
+// spelling — this plugin's own (low/high/xhigh) from its variants, or Trae's
+// (light/extra_high) from a client that read them off the list — and both name
+// the same level.
+const effortOf = (levels, effort) => {
+  if (typeof effort !== "string" || !levels) return undefined
+  const mine = Object.values(LEVELS).includes(effort) ? effort
+    : Object.prototype.hasOwnProperty.call(LEVELS, effort) ? LEVELS[effort]
+    : undefined
+  if (mine === undefined || !levels.includes(mine)) return undefined
+  return Object.keys(LEVELS).find((k) => LEVELS[k] === mine)
+}
+
 // ---- usage ------------------------------------------------------------------------
 
 // credits adds up the account's entitlement packs as the IDE shows them:
@@ -2516,6 +2675,88 @@ const makePlugin = (site) => async ({ client }) => {
   const maxes = new Map()
   // whether each model the list last read takes images (its multimodal)
   const sight = new Map()
+  // the entry the lists last gave each model, for what only the entry says:
+  // the reasoning levels it takes (reasoning_effort_config)
+  const liveEntry = new Map()
+  const liveEntryOf = (id) => liveEntry.get(String(id)) ?? site.models?.[String(id)]?.entry ?? null
+  // when each account's list was last read, and what that read returned:
+  // {at, p, done, expired}. A read that answered, failed or hung all leave
+  // their stamp, so a list that fails or leaves the model out costs one read
+  // per REREAD_MS rather than one per request. The promise is kept beside the
+  // stamp because a caller that arrives while a read is in flight must ride
+  // THAT read, not start a second and not skip the answer it was about to
+  // learn: agents send parallel requests at a session's start (a title request
+  // beside the first turn, subagents), and a caller that skipped the entry a
+  // read just produced would send a Max out under the agent's own id, which
+  // Trae's list doesn't name.
+  //
+  // The record is the thing the promise resolves to, so a joiner sees the same
+  // outcome the read settled on — including an expiry it hit — rather than the
+  // bare `null` a failed read answers. One account per key; a read is that
+  // account's.
+  const readAt = new Map()
+  // runRead starts the one read behind readList and answers its record. `p`
+  // resolves to that record — not to the models — so a caller that joins a
+  // read in flight sees the same outcome the read settled on, an expiry
+  // included, rather than the bare null a failed read answers.
+  const runRead = (a, who) => {
+    const rec = { at: Date.now(), p: null, done: undefined, expired: null }
+    // the record goes in BEFORE the read starts, so a caller arriving during it
+    // finds `rec.p` and joins; `p` resolves to this same record
+    readAt.set(who, rec)
+    const body = (async () => {
+      try {
+        return await liveModels(a)
+      } catch (e) {
+        // a request's read swallows this (the chat can still answer); a caller
+        // that must hear it reads `expired` off the record. Recorded on the
+        // record, so a joiner hears it too.
+        if (e instanceof Expired) rec.expired = e
+        return null
+      }
+    })()
+    // every rejection is claimed here, at creation: a read nobody awaits (the
+    // host's refresh ending early, a caller that walked away) must not surface
+    // as an unhandled rejection. `p` itself never rejects — the expiry rides on
+    // the record instead.
+    body.catch(() => {})
+    rec.p = body.then((models) => {
+      // only this read settles its own record: a later read may have replaced it
+      if (readAt.get(who) === rec) {
+        rec.at = Date.now()
+        rec.done = models ?? []
+        rec.p = null
+      }
+      return rec
+    })
+    rec.p.catch(() => {})
+    return rec.p
+  }
+  // readList answers the models of the read this caller rode on (its own, or
+  // the one in flight, whose record it waits for and then reads), and whether
+  // that read found the account lapsed. The record is the account's, not the
+  // token's: a re-sign-in is the same account's list, and the host's refresh is
+  // strict, so it reads again rather than serving a cached lapse. A request
+  // path only reaches here for a model it has no entry for, and that read is
+  // the one that fills the entry in.
+  //
+  // The lapse is answered, not thrown: several callers can ride one read, and a
+  // throw out of a shared promise surfaces once as an unhandled rejection for
+  // the callers that did not expect it. Each caller decides — provider.models
+  // raises it, a request path keeps going. `strict` only says whether a cached
+  // lapse is worth reading again for (the host wants the truth; a request does
+  // not pay a round trip to learn it).
+  const readList = async (a, { strict = false } = {}) => {
+    const who = a.uid || a.name || String(site.id)
+    const was = readAt.get(who)
+    let rec
+    if (was === undefined) rec = await runRead(a, who)
+    else if (was.p) rec = await was.p
+    else if (was.done === undefined || Date.now() - was.at >= REREAD_MS) rec = await runRead(a, who)
+    else if (strict && was.expired) rec = await runRead(a, who)
+    else rec = was
+    return { models: rec.done, expired: rec.expired }
+  }
 
   const save = async (auth) => {
     try {
@@ -2786,8 +3027,16 @@ const makePlugin = (site) => async ({ client }) => {
     }
     // a function's entry is worth more when it names a __dev model, then
     // when it isn't misnamed, then when it carries the name its lists agree
-    // on; the first of the best is taken
-    const worth = (fn, m) => (devModel(m) ? 2 : 0) + (misnamed(fn, m) ? 0 : 1) + (nameOf(m) === agreed.get(String(m.config_name)) ? 1 : 0)
+    // on; the first of the best is taken. Those three decide first, so the
+    // entry kept is the one Trae's own client asks through.
+    //
+    // Last among equals comes whether the entry names reasoning levels: the
+    // entry kept is the one the request is asked through, and so the one
+    // whose reasoning_effort_config the request is held to (liveEntryOf). An
+    // entry that names none while a sibling names some would leave the model
+    // with no level to pick although Trae serves it with levels — doubling
+    // the three keeps them decisive and lets this only break a tie.
+    const worth = (fn, m) => ((devModel(m) ? 2 : 0) + (misnamed(fn, m) ? 0 : 1) + (nameOf(m) === agreed.get(String(m.config_name)) ? 1 : 0)) * 2 + (levelsOf(m)?.length ? 1 : 0)
     const out = new Map()
     for (const fn of site.functions) {
       for (const m of lists[fn] ?? []) {
@@ -2799,6 +3048,7 @@ const makePlugin = (site) => async ({ client }) => {
     }
     for (const [id, { m, fn }] of out) {
       listedBy.set(id, fn)
+      liveEntry.set(id, m)
       const sees = seesOf(m)
       if (sees === null) sight.delete(id)
       else sight.set(id, sees)
@@ -2822,7 +3072,17 @@ const makePlugin = (site) => async ({ client }) => {
         modelNames.delete(id + MAX)
       }
     }
-    return [...out.values()].map((x) => x.m)
+    // this account's list has just answered: recorded, so a request that wants
+    // levels for a model the list doesn't name waits REREAD_MS before reading
+    // again, and a request arriving meanwhile joins this read instead of
+    // asking — the catalog read a host makes counts as that read too
+    const models = [...out.values()].map((x) => x.m)
+    const who = a.uid || a.name || String(site.id)
+    const at = readAt.get(who)
+    // a readList run records itself; a read nobody recorded (a caller reaching
+    // liveModels directly) is recorded here, unless a read is in flight
+    if (at === undefined || !at.p) readAt.set(who, { at: Date.now(), p: null, done: models, expired: null })
+    return models
   }
 
   // modelOf is a model of the account's list as OpenCode's provider
@@ -2860,9 +3120,13 @@ const makePlugin = (site) => async ({ client }) => {
         input: sees === null ? inputs : { ...inputs, image: sees },
         output: was.capabilities?.output ?? { text: true, image: false, audio: false, video: false, pdf: false },
       },
-      // Trae's request takes no effort or thinking level, so a model has
-      // none to pick from (see the README's Reasoning)
-      variants: was.variants ?? {},
+      // the levels this entry takes, as OpenCode's variants: Trae's own
+      // reasoning_effort_config, which a model without one doesn't carry (it
+      // is then served at Trae's default, with no level to pick). A config
+      // model with an empty variants says nothing — magpie's host fills one in
+      // for every model it hands over — so only a non-empty one is kept, or a
+      // model in the fallback table would lose the levels its entry names.
+      variants: Object.keys(was.variants ?? {}).length ? was.variants : variantsOf(levelsOf(m)),
     }
   }
 
@@ -2888,11 +3152,19 @@ const makePlugin = (site) => async ({ client }) => {
     },
     provider: {
       id: site.id,
-      // the account's own list, when Trae answers; else the list above
+      // the account's own list, when Trae answers; else the list above.
+      // A refresh rides readList's one read per REREAD_MS, so a request that
+      // wants levels while the host is refreshing joins that read instead of
+      // asking for the list a second time (and vice versa).
       async models(provider, { auth }) {
         if (auth?.type !== "oauth" || !auth.access) return provider.models
         try {
-          const ms = await liveModels(await fresh(async () => auth))
+          const { models: ms, expired } = await readList(await fresh(async () => auth), { strict: true })
+          // a lapse must reach the host here, so the account is marked: a
+          // request path deliberately lets it pass instead. A fresh instance:
+          // the recorded one already served as a rejection inside the read, and
+          // re-throwing that same object carries its unhandled state with it
+          if (expired) throw new Expired(expired.message)
           if (!ms.length) return provider.models
           const ids = new Set(ms.map((m) => String(m.config_name)))
           return Object.fromEntries(ms.flatMap((m) => {
@@ -2949,8 +3221,12 @@ const makePlugin = (site) => async ({ client }) => {
             let last
             let named = modelNames.get(String(req.model))
             if (!named && String(req.model).endsWith(MAX)) {
-              // a Max asked before the list was read here: read it
-              await liveModels(a).catch(() => {})
+              // a Max asked before the list was read here: read it (or ride
+              // the read already in flight), once per REREAD_MS — a list that
+              // doesn't name this Max is not read for again on every request
+              // (the chat can answer without it), and a Max the read does name
+              // is asked through its base, not under this unlisted id
+              await readList(a)
               named = modelNames.get(String(req.model))
               if (named) fns.unshift(named.fn)
             }
@@ -2959,6 +3235,24 @@ const makePlugin = (site) => async ({ client }) => {
             // sends them only to a model it was told takes them
             const base = max?.base ?? String(req.model)
             const sees = sight.get(base) ?? (site.models[base]?.modalities?.input?.includes("image") ?? true)
+            // the levels the base model takes, from the entry its lists gave
+            // it: what the request's effort is sent as, and left out when the
+            // model has no entry for it. An entry naming levels this build
+            // can't spell counts as no level here — levelsOf says null for it
+            // so a caller can tell the two apart, and this one sends nothing
+            // either way.
+            //
+            // The list is read once per REREAD_MS for a model it hasn't named,
+            // and a read already in flight is shared rather than skipped: a
+            // parallel request that skipped it would drop its level for that
+            // turn. An answer that leaves the model out — a list that failed,
+            // or one that simply doesn't name it — is remembered too, instead
+            // of being asked for again on every request that carries an effort.
+            let levels = levelsOf(liveEntryOf(base)) ?? []
+            if (!liveEntry.has(base) && (req.reasoning_effort ?? req.reasoningEffort)) {
+              await readList(a)
+              levels = levelsOf(liveEntryOf(base)) ?? []
+            }
             // the answer's own signal: the caller's abort (a cancelled
             // request) and the stream's cancel both stop Trae's fetch, so
             // no read is left hanging on a connection the agent walked
@@ -2978,7 +3272,7 @@ const makePlugin = (site) => async ({ client }) => {
               const res = await fetch(apiOf(a, site) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, site, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max, session, sees)),
+                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max, session, sees, levels)),
                 signal: ac.signal,
               })
               if (!res.ok) {
@@ -3029,4 +3323,4 @@ const makePlugin = (site) => async ({ client }) => {
 export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
 export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
 
-export const _internal = { ownClient, clientStoragePaths, clientDevice, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID }
+export const _internal = { ownClient, clientStoragePaths, clientDevice, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf }

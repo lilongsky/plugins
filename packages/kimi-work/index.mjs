@@ -8,9 +8,57 @@ const BASE = 'https://agent-gw.kimi.com/coding/v1';
 const MEMBER = 'https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/';
 const REFRESH = 'https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken';
 const REFRESH_LEAD = 60000;
-const {version} = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
-const UA = 'Magpie Kimi Work provider/' + version;
-const expired = () => Object.assign(Error('请先在本机 Kimi 桌面版登录 Work，再重新连接 Kimi Work 供应商。'), {signIn:'expired',code:'kimi_work_login_expired'});
+// Kimi's desktop builds its Work model menu from this call, not from
+// agent-gw's /models: models plus moreModels, each with the id Work's
+// gateway takes (requestParams.modelId). An account's tier models, K3.1 Pro
+// on the 99 plan among them, are listed here and not in /models.
+const CONFIG = 'https://www.kimi.com/apiv2/kimi.gateway.config.v1.ConfigService/DescribeKimiWorkConfig';
+// What Kimi's own Work client sends agent-gw (Kimi 3.2.20's daimon 0.6.10,
+// createDaimonKimiCodeRequestHeaders): the vendored Kimi Code's version as
+// "kimi-code-cli/<version>" (no daimon caller passes a suffix), and the
+// X-Msh device headers beside it (magpie-community/plugins#353).
+const KIMI_CODE_VERSION = '0.36.0';
+const DAIMON_VERSION = '0.6.10';
+const UA = 'kimi-code-cli/' + KIMI_CODE_VERSION;
+// What Kimi's desktop sends www.kimi.com/apiv2 besides the sign-in (its
+// Connect interceptor: x-msh-platform "mac" or "windows" on the desktop,
+// "web" otherwise, x-msh-version the desktop's version, R-Timezone). They
+// are not decoration: asked without them DescribeKimiWorkConfig answers
+// with the web menu (k3-agent, k3-agent-swarm, k2d8-preview), and asked as
+// the desktop asks with its own (k3d1-agent, K3.1 Pro, first), so through
+// 0.1.8 K3.1 Pro was never listed (tests/fixtures/work-config.*.json).
+const DESKTOP_VERSION = '3.2.20';
+function webHeaders(platform=process.platform) {
+  return {'User-Agent':UA,'x-msh-platform':platform==='darwin'?'mac':platform==='win32'?'windows':'web',
+    'x-msh-version':DESKTOP_VERSION,'R-Timezone':Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'};
+}
+// AuthService is a desktop Connect client, not the Work/Code gateway. These
+// public client fields come from an observed Kimi 3.2.17 RefreshToken call.
+// Connect's JSON representation is also used by that SDK (KIMI_CAPTURE mode).
+// Browser-owned device/session IDs and ShieldData are deliberately not copied.
+const AUTH_VERSION='3.2.17';
+function refreshHeaders(platform=process.platform) {
+  const system=platform==='darwin'?'Macintosh; Intel Mac OS X 10_15_7'
+    :platform==='win32'?'Windows NT 10.0; Win64; x64':'X11; Linux x86_64';
+  return {...webHeaders(platform),'x-msh-version':AUTH_VERSION,
+    'User-Agent':`Mozilla/5.0 (${system}) AppleWebKit/537.36 (KHTML, like Gecko) kimi-desktop/${AUTH_VERSION} Chrome/150.0.7871.250 Electron/43.7.3 Safari/537.36`,
+    'X-Language':Intl.DateTimeFormat().resolvedOptions().locale||'en-US'};
+}
+const ascii = (v, fallback = 'unknown') => String(v ?? '').replace(/[^\x20-\x7e]/g, '').trim() || fallback;
+function deviceModel() {
+  const t = os.type(), r = os.release(), a = os.arch();
+  if (t === 'Darwin') return 'macOS ' + r + ' ' + a;
+  if (t === 'Windows_NT') return 'Windows ' + r + ' ' + a;
+  return (t + ' ' + r + ' ' + a).trim();
+}
+function workHeaders(deviceId) {
+  return {'User-Agent':UA,...(deviceId?{'X-Msh-Device-Id':deviceId}:{}),
+    'X-Msh-Device-Model':ascii(deviceModel()),'X-Msh-Device-Name':ascii(os.hostname()),'X-Msh-Os-Version':ascii(os.release()),
+    'X-Msh-Platform':'kimi-code-cli','X-Msh-Version':KIMI_CODE_VERSION,'X-Msh-Daimon-Version':DAIMON_VERSION};
+}
+// The host's quota RPC preserves message alone; this marker selects its
+// localized signed-out card and the account's reconnect action.
+const expired = () => Object.assign(Error('Kimi Work sign-in has expired. Sign in to Kimi desktop Work if needed, then reconnect Kimi Work (magpie plugin login kimi-work).'), {signIn:'expired',code:'kimi_work_login_expired'});
 const unavailable = error => Object.assign(Error('Kimi Work 连接失败：' + (error?.cause?.code || error?.message || '未知网络错误'), {cause:error}), {code:'kimi_work_connection_failed'});
 const percent = x => typeof x === 'number' && Number.isFinite(x) ? Math.max(0,Math.min(100,x*100)) : undefined;
 function tokenClaims(token) {
@@ -211,8 +259,20 @@ function desktopFile({home=os.homedir(), platform=process.platform, appdata=proc
   return path.join(parent,'kimi-desktop','daimon-share','daimon','config.json');
 }
 
+// The install id Kimi's daimon made for its Kimi Code home
+// (<daimon>/runtime/kimi-code/home/device_id, a randomUUID it writes once)
+// and sends as X-Msh-Device-Id. It is read, never made or written here: the
+// desktop app owns it, and without it the header is left out.
+function readDeviceId(file) {
+  try {
+    const id=fs.readFileSync(path.join(path.dirname(file),'runtime','kimi-code','home','device_id'),'utf8').trim();
+    return /^[\x21-\x7e]{1,128}$/.test(id)?id:undefined;
+  } catch {return undefined;}
+}
+
 // Work credentials still follow the desktop file. Web credentials are imported
 // into the host's private auth store and renewed there, never written here.
+
 function readDesktop(file=desktopFile()) {
   try {
     const st=fs.statSync(file);
@@ -221,7 +281,7 @@ function readDesktop(file=desktopFile()) {
     const work=doc.credentials?.kimiCode, web=doc.credentials?.kimiWeb;
     if(typeof work?.apiKey!=='string'||!work.apiKey || typeof web?.accessToken!=='string'||!web.accessToken
       || typeof web.userId!=='string'||!web.userId || work.baseUrl?.replace(/\/$/,'')!==BASE) throw expired();
-    return {workToken:work.apiKey,webToken:web.accessToken,
+    return {workToken:work.apiKey,webToken:web.accessToken,deviceId:readDeviceId(file),
       webRefresh:typeof web.refreshToken==='string' ? web.refreshToken : '',
       uid:createHash('sha256').update('kimi-work-account\0'+web.userId).digest('hex')};
   } catch {throw expired();}
@@ -231,13 +291,15 @@ function modelRows(payload) {
   if(!Array.isArray(payload?.data)||payload.has_more||payload.data.length>100) throw Error('Kimi Work 模型目录暂不可用。');
   const out={};
   for(const m of payload.data) {
-    if(typeof m.id!=='string'||!m.id||m.id.length>256||/[\x00-\x20/]/.test(m.id)) continue;
+    if(!isObj(m)||typeof m.id!=='string'||!m.id||m.id.length>256||/[\x00-\x20/]/.test(m.id)) continue;
+    // One model's effort list in a shape not seen before costs that model
+    // its unreadable levels, not the account its whole catalog: a throw
+    // here left only the fallback k3-agent listed. Only levels Kimi lists
+    // are kept, so none is guessed.
     const variants=Object.create(null);
-    if(m.reasoningEffortOptions!==undefined&&!Array.isArray(m.reasoningEffortOptions))throw Error('Kimi Work 思考档位格式无效。');
-    for(const x of m.reasoningEffortOptions||[]) {
-      const effort=String(x.effort||'').replace(/^REASONING_EFFORT_/,'').toLowerCase();
-      if(!/^[a-z][a-z0-9_-]{0,63}$/.test(effort))throw Error('Kimi Work 思考档位格式无效。');
-      variants[effort]={reasoningEffort:effort};
+    for(const x of Array.isArray(m.reasoningEffortOptions)?m.reasoningEffortOptions:[]) {
+      const effort=String(isObj(x)&&typeof x.effort==='string'?x.effort:'').replace(/^REASONING_EFFORT_/,'').toLowerCase();
+      if(/^[a-z][a-z0-9_-]{0,63}$/.test(effort))variants[effort]={reasoningEffort:effort};
     }
     out[m.id]={id:m.id,name:m.display_name||m.id,
       api:{id:m.id,url:BASE,npm:'@ai-sdk/openai-compatible'},
@@ -252,19 +314,63 @@ function modelRows(payload) {
   return out;
 }
 
-function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Date.now}={}) {
+// DescribeKimiWorkConfig's reply, Connect JSON (camelCase, or the proto's
+// own snake_case names, which the desktop asks for).
+const pick=(o,a,b)=>isObj(o)?(o[a]??o[b]):undefined;
+const EFFORTS=new Set(['off','low','medium','high','xhigh','max']);
+function workConfigRows(payload) {
+  const list=[...(Array.isArray(pick(payload,'models','models'))?pick(payload,'models','models'):[]),
+    ...(Array.isArray(pick(payload,'moreModels','more_models'))?pick(payload,'moreModels','more_models'):[])];
+  if(list.length>100)throw Error('Kimi Work 模型目录暂不可用。');
+  const out={};
+  for(const m of list) {
+    const rp=pick(m,'requestParams','request_params'),display=pick(m,'display','display');
+    const dc=pick(m,'daimonModelConfig','daimon_model_config');
+    const id=String(pick(rp,'modelId','model_id')??'').trim();
+    if(!id||id.length>256||/[\x00-\x20/]/.test(id)||out[id])continue;
+    const variants=Object.create(null);
+    // The levels requestParams lists, else the daimon's supportEfforts, as
+    // the desktop does; "off" is REASONING_EFFORT_NONE there.
+    const opts=pick(rp,'reasoningEffortOptions','reasoning_effort_options');
+    for(const x of Array.isArray(opts)?opts:[]) {
+      const effort=String(pick(x,'reasoningEffort','reasoning_effort')||pick(x,'effort','effort')||'').trim().replace(/^REASONING_EFFORT_/,'').toLowerCase();
+      if(/^[a-z][a-z0-9_-]{0,63}$/.test(effort)&&effort!=='unspecified')variants[effort]={reasoningEffort:effort};
+    }
+    const support=pick(dc,'supportEfforts','support_efforts');
+    if(!Object.keys(variants).length)for(const x of Array.isArray(support)?support:[]) {
+      const effort=String(x).trim().toLowerCase();
+      if(EFFORTS.has(effort))variants[effort==='off'?'none':effort]={reasoningEffort:effort==='off'?'none':effort};
+    }
+    const caps=pick(dc,'capabilities','capabilities');
+    const has=c=>Array.isArray(caps)&&caps.includes(c);
+    const image=has('image_in'),thinking=has('thinking')||Object.keys(variants).length>0;
+    const max=Number(pick(dc,'maxContextSize','max_context_size'))||262144;
+    const output=Number(pick(rp,'maxTokens','max_tokens'))||32768;
+    out[id]={id,name:String(pick(display,'displayName','display_name')||'').trim()||id,
+      api:{id,url:BASE,npm:'@ai-sdk/openai-compatible'},
+      // Standard context, as /models' rows: XL is a header the desktop
+      // sends only when the user picks it.
+      limit:{context:Math.min(max,262144),output},
+      capabilities:{reasoning:thinking,toolcall:true,attachment:image,
+        input:{text:true,image,video:false,audio:false,pdf:false},output:{text:true}},
+      variants};
+  }
+  return out;
+}
+
+function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,platform=process.platform,now=Date.now}={}) {
   const current=auth=>{
     const session=readSession();
     if(auth?.source!=='kimi-work-desktop'||auth.uid!==session.uid)throw expired();
     return session;
   };
-  async function jsonRequest(url,token,body,signal) {
+  async function jsonRequest(url,token,body,signal,deviceId) {
     const response=await fetchImpl(url,{method:body===undefined?'GET':'POST',
-      headers:{...(token?{Authorization:'Bearer '+token}:{}),'User-Agent':UA,'Accept':'application/json',
+      headers:{...(token?{Authorization:'Bearer '+token}:{}),...(url===REFRESH?refreshHeaders(platform):url.startsWith(BASE)?workHeaders(deviceId):webHeaders(platform)),'Accept':'application/json',
         ...(body===undefined?{}:{'Content-Type':'application/json','Connect-Protocol-Version':'1'})},
       ...(body===undefined?{}:{body:JSON.stringify(body)}),signal:signal||AbortSignal.timeout(15000),redirect:'error'});
-    if(response.status===401)throw expired();
-    if(!response.ok)throw Error('Kimi Work 服务暂不可用（HTTP '+response.status+'）。');
+    if(response.status===401)throw Object.assign(expired(),{status:401});
+    if(!response.ok)throw Object.assign(Error('Kimi Work 服务暂不可用（HTTP '+response.status+'）。'),{status:response.status});
     if(Number(response.headers.get('content-length')||0)>2*1024*1024)throw Error('Kimi Work 响应过大。');
     const text=await response.text();
     if(Buffer.byteLength(text)>2*1024*1024)throw Error('Kimi Work 响应过大。');
@@ -326,11 +432,39 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
       return {...auth,...pair};
     } finally {if(renewing.get(key)===run)renewing.delete(key);}
   }
+  // Work's menu, as the desktop asks it with its web sign-in. When that
+  // ask fails (the web sign-in in Kimi's file has gone stale, which
+  // www.kimi.com answers 401 "invalid user token"; any other status; a
+  // reply with no models), the menu is asked again with no sign-in, as the
+  // desktop asks it before one: www.kimi.com answers that with the same
+  // desktop menu (tests/fixtures/work-config.mac.json, K3.1 Pro first).
+  // Through 0.1.9 a failed ask was dropped without a word, so the list was
+  // /models' alone (k3-agent, k2d8-preview) and K3.1 Pro was missing with
+  // nothing in the log. Each failure is logged now, without the token.
+  async function menu(s) {
+    let why='no web sign-in';
+    if(s.webToken) {
+      try {
+        const rows=workConfigRows(await jsonRequest(CONFIG,s.webToken,{}));
+        if(Object.keys(rows).length)return rows;
+        why='a reply with no models';
+      } catch(error) {why=error?.status?'HTTP '+error.status:(error?.name==='TimeoutError'?'timed out':error?.cause?.code||error?.message||String(error));}
+    }
+    console.warn('kimi-work: DescribeKimiWorkConfig with the web sign-in failed ('+why+'); asking it without one');
+    try {return workConfigRows(await jsonRequest(CONFIG,'',{}));}
+    catch(error) {
+      console.warn('kimi-work: DescribeKimiWorkConfig without a sign-in failed ('+(error?.status?'HTTP '+error.status:error?.message||String(error))+'); listing /models alone');
+      throw error;
+    }
+  }
   return {
     config:async cfg=>{
       cfg.provider??={};
       cfg.provider[ID]??={name:'Kimi Work',npm:'@ai-sdk/openai-compatible',api:BASE,
-        models:{'k3-agent':{name:'K3 · Work',limit:{context:262144,output:32768},tool_call:true,reasoning:true}}};
+        // Shown until the account's own list is read, and kept when it can't
+        // be: the two ids Work's /models has listed (tests/fixtures).
+        models:{'k3-agent':{name:'K3 · Work',limit:{context:262144,output:32768},tool_call:true,reasoning:true},
+          'k2d8-preview':{name:'K2.8 Preview · Work',limit:{context:262144,output:32768},tool_call:true,reasoning:true}}};
     },
     auth:{
       provider:ID,
@@ -341,7 +475,7 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
           try{
             const s=readSession();
             if(!s.webRefresh)throw expired();
-            await jsonRequest(BASE+'/models',s.workToken);
+            await jsonRequest(BASE+'/models',s.workToken,undefined,undefined,s.deviceId);
             return {type:'success',access:s.webToken,refresh:s.webRefresh,expires:expiry(s.webToken),source:'kimi-work-desktop',
               accountId:'Kimi Work (local)',uid:s.uid};
           }catch{return {type:'failed',error:'没有可用的本机 Kimi Work 登录，请先打开 Kimi 并登录 Work。'};}
@@ -366,8 +500,10 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
           const s=current(await getAuth());
           const headers=new Headers(request?request.headers:init.headers);
           for(const key of ['authorization','x-api-key','cookie','host','content-length','origin'])headers.delete(key);
+          // magpie's own x-magpie-* hints are for the plugin, not for Kimi.
+          for(const key of [...headers.keys()])if(key.startsWith('x-magpie-'))headers.delete(key);
           headers.set('Authorization','Bearer '+s.workToken);
-          headers.set('User-Agent',UA);
+          for(const [k,v] of Object.entries(workHeaders(s.deviceId)))headers.set(k,v);
           headers.set('Content-Type','application/json');
           // Preserve messages, stream and abort signal, and tools but for
           // the schema shapes Kimi refuses (moonshotTools). There is no
@@ -407,10 +543,22 @@ function createPlugin({readSession=readDesktop,fetchImpl=globalThis.fetch,now=Da
     },
     provider:{id:ID,models:async(provider,{auth}={})=>{
       if(auth?.source!=='kimi-work-desktop')return provider.models;
-      const s=current(auth);return modelRows(await jsonRequest(BASE+'/models',s.workToken));
+      const s=current(auth);
+      // Both lists, the desktop's menu first. Either one failing leaves the
+      // other; both failing throws, so the last good list is kept.
+      const [cfgList,gw]=await Promise.allSettled([
+        menu(s),
+        jsonRequest(BASE+'/models',s.workToken,undefined,undefined,s.deviceId).then(modelRows)]);
+      const a=cfgList.status==='fulfilled'?cfgList.value:{},b=gw.status==='fulfilled'?gw.value:{};
+      if(gw.status==='rejected'&&!Object.keys(a).length)throw gw.reason;
+      const out={...a};
+      // An id both list keeps /models' row (the gateway's own context and
+      // image flags) under the desktop's name for it.
+      for(const [id,row] of Object.entries(b))out[id]=out[id]?{...row,name:out[id].name}:row;
+      return out;
     }},
   };
 }
 
 export default async function KimiWorkProvider(){return createPlugin();}
-export const _internal={createPlugin,moonshotTools,moonshotSchema,readDesktop,desktopFile,modelRows,BASE,MEMBER,REFRESH,REFRESH_LEAD,UA,expiry};
+export const _internal={createPlugin,moonshotTools,moonshotSchema,readDesktop,desktopFile,modelRows,workConfigRows,BASE,MEMBER,CONFIG,UA,workHeaders,webHeaders,refreshHeaders,readDeviceId,REFRESH,REFRESH_LEAD,expiry};

@@ -56,6 +56,22 @@ Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
 built-in WorkBuddy does.
 
+A chat or usage read WorkBuddy answers 401 (since 0.1.31) is renewed once,
+whatever the token's time, and sent once more. A token another process
+saved since is taken first instead of spending the refresh token again. A
+desktop sign-in is never renewed for it: the app's file is read again, and
+its token is used if the app signed in again. A 401 again, or no new
+token, ends in a 401 that says to sign in again (Providers → WorkBuddy →
+this account's Sign in again in magpie; WorkBuddy desktop for a desktop
+sign-in). The plugin marks the account expired in magpie
+(`X-Magpie-Sign-In: expired`, usage's `signIn`) only on WorkBuddy's word
+that the sign-in is gone: the refresh token refused (401, `invalid_grant`),
+or the access token refused (`WWW-Authenticate: … error="invalid_token"`)
+with no refresh token left to renew it with or just after renewing. A
+failed renewal for another reason, or a bare 401 without `invalid_token`,
+leaves the account as it is; a desktop sign-in is never marked. A 401
+after a renewal takes a mark off (`renewed`).
+
 ## Requests
 
 Chats are chat completions (`@ai-sdk/openai-compatible`) at `<API>/chat/completions`.
@@ -92,8 +108,11 @@ WorkBuddy's default system prompt in its place: WorkBuddy checks only the
 system and assistant messages, and the line it matched is then in neither.
 A system message later in the chat becomes a user message where it stands.
 The plugin remembers each refused system prompt while it is loaded, so that
-agent's next chats go moved at once. A refusal that stands after the move
-(words in an assistant message) ends in a hint that names no one client
+agent's next chats go moved at once. The move can't reach an assistant
+message, so words the model quotes back into one keep that chat refused
+until they are in the list reworded in every message (since 0.1.30, the "Web GUI whose URL the runtime
+context names" line, #291); otherwise only a new chat clears it. A refusal
+that stands after the move ends in a hint that names no one client
 (since 0.1.28): WorkBuddy refused words in this client's prompt; use it from
 Hermes, OpenCode or Pi, or add another provider to the group. Neither
 refusal rests the account.

@@ -841,12 +841,16 @@ function cacheMarked(msgs) {
 // sessionOf is the session_id a request goes out under: one for every turn
 // of a conversation and another for each conversation, as Qoder's client
 // sends its own session's (#290). Qoder can keep a conversation where its
-// prompt is cached only when its turns say they are one. It is the
-// client's prompt_cache_key (Codex's thread), else its user, else the
+// prompt is cached only when its turns say they are one. It is the session
+// the agent named (named: DSH's x-deepseek-harness-session-id, OpenCode's
+// session, as the chat.headers hook is told it, #330), else the client's
+// prompt_cache_key (Codex's thread), else its user, else the
 // conversation's opening (its system prompt and first user turn), hashed,
-// so no key of the client's goes to Qoder as it is.
-function sessionOf(chat) {
-  let seed = String(chat.prompt_cache_key ?? "").trim() ? "key\0" + chat.prompt_cache_key : String(chat.user ?? "").trim() ? "user\0" + chat.user : ""
+// so no key of the client's goes to Qoder as it is. DSH changes its system
+// prompt mid-task (yetone/magpie#3298), so its own session is the one that
+// holds for the whole task.
+function sessionOf(chat, named = "") {
+  let seed = named ? "session\0" + named : String(chat.prompt_cache_key ?? "").trim() ? "key\0" + chat.prompt_cache_key : String(chat.user ?? "").trim() ? "user\0" + chat.user : ""
   if (!seed) {
     const msgs = chat.messages ?? []
     const sys = msgs.filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content))
@@ -857,9 +861,69 @@ function sessionOf(chat) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
 }
 
+// SESSION carries the session magpie (or OpenCode) names a request's
+// conversation by, from the chat.headers hook to the loader's fetch. It
+// goes no further: nothing of the request's headers is sent to Qoder.
+const SESSION = "x-magpie-qoder-session"
+
+// namedSession is the session a chat.headers hook is told, "" when it
+// names none. magpie, with no session header from the agent, makes one of
+// the conversation's first user message ("magpie-" and 24 hex digits):
+// that names no session, and sessionOf's own hash is taken instead.
+function namedSession(input) {
+  const s = String(input?.sessionID ?? "").trim()
+  if (!s || /^magpie-[0-9a-f]{24}$/.test(s)) return ""
+  return s.slice(0, 128)
+}
+
+// A task is what Qoder's client sends under one request_set_id and one
+// business record (#330): every model call that answers one user prompt,
+// the tool loop's turns included. qoder-agent-sdk (Qoder.app's
+// qoder-worker-runtime, AgentLifecycle) makes the record once per prompt
+// (business.id the prompt's requestSetId, begin_at when the prompt
+// started, stage "start"), keeps it for each call of the loop, and moves
+// stage to "processing" once a call is answered; only request_id and
+// chat_record_id are new on every call. The plugin made a new record for
+// every call, so a 265-call DSH task was 265 tasks to Qoder. A task here is
+// a session's last user turn: the tool loop repeats it, and a new prompt
+// is a new one. TASKS holds at most TASK_MAX of them, each for TASK_IDLE
+// after its last call, so a long-running magpie doesn't grow with them.
+const TASKS = new Map()
+const TASK_MAX = 512
+const TASK_IDLE = 2 * 60 * 60 * 1000
+
+// taskName is the business record's name for a task whose prompt is
+// prompt, as Qoder's client names an agent task: the prompt's first ten
+// characters (qoder-agent-sdk's AgentLifecycle, hdr → C6s: type
+// "code_review" takes the session id, every other the prompt, sliced to
+// 10 when longer).
+const taskName = (prompt) => (prompt.length > 10 ? prompt.slice(0, 10) : prompt)
+
+// taskOf is the task chat's call belongs to, in session sid: made on its
+// first call, the same one on every call after.
+function taskOf(sid, chat, now = Date.now()) {
+  const msgs = chat.messages ?? []
+  const at = msgs.findLastIndex((x) => x?.role === "user")
+  const key = createHash("sha256").update(JSON.stringify([sid, at, at < 0 ? null : msgs[at].content ?? null])).digest("hex")
+  for (const [k, t] of TASKS) {
+    if (now - t.used <= TASK_IDLE) break
+    TASKS.delete(k)
+  }
+  let t = TASKS.get(key)
+  if (t && now - t.used > TASK_IDLE) t = undefined
+  TASKS.delete(key)
+  t ??= { id: randomUUID(), begin: now, answered: false, name: taskName(at < 0 ? "" : textOf(msgs[at].content)) }
+  t.used = now
+  TASKS.set(key, t)
+  while (TASKS.size > TASK_MAX) TASKS.delete(TASKS.keys().next().value)
+  return t
+}
+
 // qoderBody is the plaintext agent_chat_generation takes for a chat
-// completion request, for model m.
-function qoderBody(chat, m) {
+// completion request, for model m, in the session the agent named (named,
+// "" when none) and the task it is a call of (taskOf's, a new one when
+// none is given).
+function qoderBody(chat, m, named = "", task) {
   const system = (chat.messages ?? []).filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n")
   const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
   let sysText = system ? QODER_SYS + "\n\n" + system : QODER_SYS
@@ -871,13 +935,15 @@ function qoderBody(chat, m) {
   const window = windowFor(chat, m, params.max_tokens)
   if (window > 0) params.context_length = window
   const request = randomUUID()
+  const session = sessionOf(chat, named)
+  task ??= taskOf(session, chat)
   const body = {
     request_id: request,
-    request_set_id: request,
+    request_set_id: task.id,
     chat_record_id: request,
-    session_id: sessionOf(chat),
+    session_id: session,
     parameters: params,
-    business: { product: "app", version: COSY_VERSION, type: "agent", id: hexID(), name: "magpie session", begin_at: Date.now(), stage: "start" },
+    business: { product: "app", version: COSY_VERSION, type: "agent", id: task.id, name: task.name ?? "", begin_at: task.begin, stage: task.answered ? "processing" : "start" },
     agent_id: "agent_common",
     task_id: "common",
     session_type: "app",
@@ -1526,23 +1592,45 @@ const CAMPAIGN_MACHINE_TTL = 60 * 60 * 1000 // Qoder's desktop client renews its
 //     (or .qoder): a file runtime-info-<platform>-<arch>-<hash> on macOS and
 //     Linux, a folder umid-win32-<arch>-<hash> holding runtime-info.exe on
 //     Windows.
-async function campaignRuntime({ home = homedir(), platform = process.platform, arch = process.arch, env = process.env, opt = "/opt" } = {}) {
-  if (env.QODER_RUNTIME_INFO) return resolve(env.QODER_RUNTIME_INFO)
+//
+// Qoder CN keeps its own (Qoder CN desktop 0.4.9's packages, qoderclicn
+// 1.1.77): Qoder CN.app on macOS (its installer's expectedBundleName),
+// /opt/Qoder-CN on Linux (the .deb), Qoder CN on Windows (the user
+// installer's "Uninstall Qoder CN.exe", electron-builder's
+// Programs\<productName>); its CLI's config is QODERCN_CONFIG_DIR, else
+// QODERCN_CLI_HOME (or home) joined with QODERCN_CONFIG_DIR_NAME (or
+// .qoder-cn). Both ask the helper for environment 0, the international
+// ones for 3 (the desktop's `regionCode === "global" ? 3 : 0`, the CLI's
+// UMID environment ONLINE = 0, US_ONLINE = 3).
+//
+// required: international Qoder lists the daily credits only on a request
+// carrying the identity. Qoder CN's desktop sends it when it can read it
+// and goes on without it when it can't, and a Qoder CN account was offered
+// and claimed the credits without one (0.2.21), so there it is sent when
+// Qoder CN is installed and left out when it isn't.
+const RUNTIMES = {
+  qoder: { name: "Qoder", environment: "3", override: "QODER_RUNTIME_INFO", app: "Qoder", linux: "Qoder", cli: "QODER_", dir: ".qoder", required: true },
+  "qoder-cn": { name: "Qoder CN", environment: "0", override: "QODERCN_RUNTIME_INFO", app: "Qoder CN", linux: "Qoder-CN", cli: "QODERCN_", dir: ".qoder-cn", required: false },
+}
+
+async function campaignRuntime({ home = homedir(), platform = process.platform, arch = process.arch, env = process.env, opt = "/opt", runtime = RUNTIMES.qoder } = {}) {
+  if (env[runtime.override]) return resolve(env[runtime.override])
   const name = platform === "win32" ? "runtime-info.exe" : "runtime-info"
   const isFile = async (path) => (await stat(path).catch(() => null))?.isFile() ?? false
   const paths = []
   if (platform === "win32") {
     const local = env.LOCALAPPDATA || join(home, "AppData", "Local")
-    paths.push(join(local, "Programs", "Qoder", "resources", "umid", name))
+    paths.push(join(local, "Programs", runtime.app, "resources", "umid", name))
     // the machine-wide installer, as VS Code's system setup places it
-    for (const dir of [env.ProgramFiles || env.PROGRAMFILES, env.ProgramW6432]) if (dir) paths.push(join(dir, "Qoder", "resources", "umid", name))
+    for (const dir of [env.ProgramFiles || env.PROGRAMFILES, env.ProgramW6432]) if (dir) paths.push(join(dir, runtime.app, "resources", "umid", name))
   } else if (platform === "darwin") {
-    for (const dir of ["/Applications", join(home, "Applications")]) paths.push(join(dir, "Qoder.app", "Contents", "Resources", "umid", name))
+    for (const dir of ["/Applications", join(home, "Applications")]) paths.push(join(dir, runtime.app + ".app", "Contents", "Resources", "umid", name))
   } else if (platform === "linux") {
-    paths.push(join(opt, "Qoder", "resources", "umid", name))
+    paths.push(join(opt, runtime.linux, "resources", "umid", name))
   }
   for (const path of paths) if (await isFile(path)) return path
-  const config = env.QODER_CONFIG_DIR || join(env.QODER_CLI_HOME || env.GEMINI_CLI_HOME || home, env.QODER_CONFIG_DIR_NAME || ".qoder")
+  const cli = (key) => env[runtime.cli + key]
+  const config = cli("CONFIG_DIR") || join(cli("CLI_HOME") || env.GEMINI_CLI_HOME || home, cli("CONFIG_DIR_NAME") || runtime.dir)
   const cache = join(config, ".bin")
   const entries = await readdir(cache, { withFileTypes: true }).catch(() => [])
   const found = []
@@ -1556,7 +1644,7 @@ async function campaignRuntime({ home = homedir(), platform = process.platform, 
     if (path && (await isFile(path))) found.push({ path, time: (await stat(path)).mtimeMs })
   }
   if (found.length) return found.sort((a, b) => b.time - a.time)[0].path
-  throw new RuntimeMissing()
+  throw new RuntimeMissing(runtime)
 }
 
 // RuntimeMissing: no Qoder desktop or CLI on this machine to read the
@@ -1566,19 +1654,27 @@ async function campaignRuntime({ home = homedir(), platform = process.platform, 
 // never makes up. Asking again won't change that until the user installs
 // Qoder, so the check-in says what to do once instead of "tries again later".
 class RuntimeMissing extends Error {
-  constructor() {
+  constructor(runtime = RUNTIMES.qoder) {
+    const { name, override } = runtime
     super(
-      "Qoder check-in: device identity runtime not found. Qoder gives the daily credits only to a device its own app identifies, and this machine has neither Qoder desktop nor Qoder CLI to read that identity from. Install Qoder desktop (or install Qoder CLI and sign in to it once), or set QODER_RUNTIME_INFO to its runtime-info executable; magpie checks in again the next day",
+      `${name} check-in: device identity runtime not found. ${name} gives the daily credits only to a device its own app identifies, and this machine has neither ${name} desktop nor ${name} CLI to read that identity from. Install ${name} desktop (or install ${name} CLI and sign in to it once), or set ${override} to its runtime-info executable; magpie checks in again the next day`,
     )
   }
 }
 
-// Read the SDK identity as Qoder does: environment 3 is international; on
-// Windows and macOS the uid goes over stdin, never into the command line.
-async function campaignMachine(uid) {
+// noCampaign is why a check-in asked with this machine's own device
+// identity found nothing to claim: all the list says is that it offered
+// that identity no daily credits, not why.
+const noCampaign = (name) =>
+  `${name} check-in: ${name} offered this device's identity, read from this machine's own ${name} runtime-info, no daily credits campaign right now. ${name} decides per device whether to offer it; if ${name} desktop shows today's credits, claim them there`
+
+// Read the SDK identity as Qoder does: environment 3 is international, 0
+// Qoder CN; on Windows and macOS the uid goes over stdin, never into the
+// command line.
+async function campaignMachine(uid, runtime = RUNTIMES.qoder) {
   if (!uid) throw new Error("Qoder check-in: device identity needs the account uid; sign in again")
-  const file = await campaignRuntime()
-  const args = process.platform === "linux" ? ["3"] : ["3", "--account-stdin"]
+  const file = await campaignRuntime({ runtime })
+  const args = process.platform === "linux" ? [runtime.environment] : [runtime.environment, "--account-stdin"]
   const text = await new Promise((resolve, reject) => {
     const child = execFile(file, args, { timeout: 20_000, windowsHide: true, maxBuffer: 1 << 20 }, (err, out) => {
       if (err) reject(err)
@@ -1587,7 +1683,7 @@ async function campaignMachine(uid) {
     child.stdin?.on("error", () => {})
     child.stdin?.end(process.platform === "linux" ? undefined : JSON.stringify({ account: uid }) + "\n")
   }).catch(() => {
-    throw new Error("Qoder check-in: could not read device identity; restart or update Qoder, or check QODER_RUNTIME_INFO")
+    throw new Error(`${runtime.name} check-in: could not read device identity; restart or update ${runtime.name}, or check ${runtime.override}`)
   })
   try {
     const identity = JSON.parse(text.trim().split(/\r?\n/, 1)[0])
@@ -1599,7 +1695,7 @@ async function campaignMachine(uid) {
     }
     return headers
   } catch {
-    throw new Error("Qoder check-in: invalid device identity from Qoder; restart or update Qoder")
+    throw new Error(`${runtime.name} check-in: invalid device identity from ${runtime.name}; restart or update ${runtime.name}`)
   }
 }
 
@@ -1754,12 +1850,13 @@ const makePlugin = (site) => async ({ client }) => {
   const ID = site.id
   // The SDK identity is account-specific. Share an in-flight read, refresh
   // after an hour, and leave a failed read available for the next attempt.
+  const runtime = RUNTIMES[ID]
   const campaignMachines = new Map()
   const machineForCampaign = async (uid) => {
     const now = Date.now()
     let entry = campaignMachines.get(uid)
     if (!entry || now - entry.at >= CAMPAIGN_MACHINE_TTL) {
-      entry = { at: now, promise: campaignMachine(uid) }
+      entry = { at: now, promise: campaignMachine(uid, runtime) }
       campaignMachines.set(uid, entry)
     }
     try {
@@ -1767,6 +1864,16 @@ const makePlugin = (site) => async ({ client }) => {
     } catch (e) {
       if (campaignMachines.get(uid) === entry) campaignMachines.delete(uid)
       throw e
+    }
+  }
+  // campaignIdentity: the headers a campaigns request carries, and why
+  // there are none where the site goes on without them (Qoder CN).
+  const campaignIdentity = async (uid) => {
+    if (runtime.required) return { machine: await machineForCampaign(uid) }
+    try {
+      return { machine: await machineForCampaign(uid) }
+    } catch (e) {
+      return { machine: {}, unread: e }
     }
   }
   // serializes checking, rotating and saving tokens: a refresh token is
@@ -1927,7 +2034,7 @@ const makePlugin = (site) => async ({ client }) => {
     if (!url) return errorResponse({ status: 404, message: "only chat completions are served" })
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase()
     try {
-      const machine = site.id === "qoder" ? await machineForCampaign(cred.uid) : {}
+      const { machine } = await campaignIdentity(cred.uid)
       // A PAT account has no device token: its job token signs the campaigns
       // pages too, as it does the usage read. Nothing is rotated on that
       // path — the refusal is the answer.
@@ -1956,7 +2063,7 @@ const makePlugin = (site) => async ({ client }) => {
     const base = campaignTarget(site, siteOf(site, cred), site.openapi + CAMPAIGNS)
     if (!base) return { outcome: "inactive", message: "no campaigns page for this account" }
     try {
-      const machine = site.id === "qoder" ? await machineForCampaign(cred.uid) : {}
+      const { machine, unread } = await campaignIdentity(cred.uid)
       // A PAT account has no device token: the campaigns pages take the job
       // token the exchange gave, as the usage endpoint does. A live Qoder CN
       // PAT account answered 200 to the list and CLAIMED to a claim, so the
@@ -1994,7 +2101,17 @@ const makePlugin = (site) => async ({ client }) => {
           const amount = Number(done.benefit?.amount)
           return { outcome: "done", ...(Number.isFinite(amount) && amount > 0 ? { credit: amount } : {}) }
         }
-        return campaigns.length ? { outcome: "failed", message: "campaigns: today's credits aren't offered yet" } : { outcome: "inactive" }
+        if (campaigns.length) return { outcome: "failed", message: "campaigns: today's credits aren't offered yet" }
+        // Asked without Qoder CN's identity and offered nothing: what an
+        // international list says to a request without one, so say why
+        // (no Qoder CN on this machine) or ask again (it didn't answer).
+        if (unread instanceof RuntimeMissing) return { outcome: "ineligible", message: unread.message }
+        if (unread) return { outcome: "failed", message: unread.message }
+        // Asked with this machine's own identity and still offered nothing:
+        // Qoder decides per device (plugins#304, a Linux CLI identity was
+        // offered none while the same account's desktop identity was), so
+        // say that much, and where the credits can still be claimed.
+        return { outcome: "inactive", message: noCampaign(site.name) }
       }
       const claimRes = await call(base.replace(/\/$/, "") + "/" + encodeURIComponent(campaign.campaignId) + "/claim", "POST", "{}")
       let claim = {}
@@ -2028,7 +2145,7 @@ const makePlugin = (site) => async ({ client }) => {
     })
 
   // ask is the answer to a chat completion on the live account cred.
-  const ask = async (chat, cred, init) => {
+  const ask = async (chat, cred, init, named = "") => {
     let m
     try {
       m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
@@ -2039,7 +2156,8 @@ const makePlugin = (site) => async ({ client }) => {
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
     const api = siteOf(site, cred).api
     const CHAT_URL = api + CHAT_PATH
-    const body = qoderBody(chat, m)
+    const task = taskOf(sessionOf(chat, named), chat)
+    const body = qoderBody(chat, m, named, task)
     const wire = encodeBody(JSON.stringify(body))
     // Qoder's queue is waited out (queueWait) and the same request, its
     // request_set_id the one the queue knows, sent again
@@ -2061,6 +2179,8 @@ const makePlugin = (site) => async ({ client }) => {
         return errorResponse({ status: 502, message: e.message })
       }
       const f = !res.ok ? failure(res.status, (await res.text()).slice(0, 1 << 20)) : open.first.value?.error
+      // an answered call moves its task on, as Qoder's client moves it
+      if (!f) task.answered = true
       if (!f?.queue || waited >= QUEUE.recoveries) return f && !res.ok ? errorResponse(f) : answer(open, chat)
       try {
         if (!(await queueWait(api, cred, ask, f.queue, init.signal, deadline))) return errorResponse(f)
@@ -2071,6 +2191,16 @@ const makePlugin = (site) => async ({ client }) => {
   }
 
   return {
+    // the session the request is part of, for session_id and its task
+    // (#330): magpie names it here (DSH's x-deepseek-harness-session-id
+    // among the agents' own), as OpenCode does, and the loader's fetch
+    // reads it back. Every plugin's hook sees every provider's requests,
+    // so it is put on this site's alone.
+    async "chat.headers"(input, output) {
+      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
+      const s = namedSession(input)
+      if (s) output.headers[SESSION] = s
+    },
     auth: {
       provider: ID,
       // magpie renews the chat token RENEW_LEAD before its end, once for
@@ -2123,7 +2253,9 @@ const makePlugin = (site) => async ({ client }) => {
             } catch (e) {
               return signedInError(e)
             }
-            return signed(await ask(chat, cred, init), renewed(cred))
+            const h = new Headers(input instanceof Request ? input.headers : undefined)
+            new Headers(init.headers ?? {}).forEach((v, k) => h.set(k, v))
+            return signed(await ask(chat, cred, init, h.get(SESSION)?.trim().slice(0, 128) ?? ""), renewed(cred))
           },
         }
       },
@@ -2233,4 +2365,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { campaignRuntime, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
