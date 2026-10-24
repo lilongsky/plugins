@@ -57,7 +57,7 @@ The separate MIT-licensed [`kimi-work-opencode`](https://www.npmjs.com/package/k
 
 ## Compatibility and validation
 
-These are undocumented desktop interfaces, not a supported public Kimi API. Windows and Apple-silicon macOS have been tested with real Work inference, including streaming. The [macOS record](COMPATIBILITY.md) includes the Kimi build, observed file/fields, real Magpie route and test limits. Linux and Intel macOS remain unverified. Changed desktop layouts stop with a sign-in error; changed upstream schemas stop model discovery or usage with an error. Inference failures are returned without retrying against Code or another service. Users remain responsible for their subscription's terms.
+These are undocumented desktop interfaces, not a supported public Kimi API. Windows and Apple-silicon macOS have historical real Work inference coverage, including streaming. The [compatibility record](COMPATIBILITY.md) includes the tested Kimi build, renewal request comparison, observed coexistence interval and test limits; current renewal checks and historical inference coverage are distinguished there. Linux and Intel macOS remain unverified. Changed desktop layouts stop with a sign-in error; changed upstream schemas stop model discovery or usage with an error. Inference failures are returned without retrying against Code or another service. Users remain responsible for their subscription's terms.
 
 ```sh
 bun test packages/kimi-work

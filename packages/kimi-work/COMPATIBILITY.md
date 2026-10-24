@@ -2,7 +2,7 @@
 
 ## Scope
 
-This candidate incorporates upstream through `c9a0215f31d401ca4249fac33d03e6b97e44ebbb` (kimi-work 0.1.10), including the model-effort parser, desktop Work menu, device headers and unauthenticated menu retry. Membership renewal and the single monthly shared-pool meter are additions to that baseline. The interfaces are undocumented and can change.
+This candidate incorporates upstream through `28f9cbb3b26ccc3a7739c8e21ebee0cda3d929d4` (kimi-work 0.1.10), including the model-effort parser, desktop Work menu, device headers and unauthenticated menu retry. Membership renewal and the single monthly shared-pool meter are additions to that baseline. The interfaces are undocumented and can change.
 
 The current live renewal test uses Apple-silicon macOS and official Kimi Desktop **3.2.17** (build 3.2.17.4). A fresh, user-completed login belongs to disposable profiles. The installed application and everyday Magpie/Kimi profiles are not the test credential source. A temporary application copy keeps the original `app.asar` byte-for-byte; its main-source SHA-256 is `6a37077974207f7b501add47d9756eaff8d41eb87347e05b11f59f7b2386c439`. Test-only launch instrumentation redirects profile paths and exposes the original AuthService and TokenStore methods for invocation/observation; no refresh response is substituted.
 
@@ -56,7 +56,7 @@ All official reference-only accounts through 0.1.10 require an explicit reconnec
 
 ## Regression validation
 
-On Bun 1.4.3 with disposable HOME/XDG directories: **76 plugin tests passed**, 0 failed, 316 assertions; the full upstream-baseline suite passed **2482 tests**, 0 failed, 14985 assertions, 215 files; the focused hook check and all **25** plugin hook checks passed. An initial restricted-sandbox run could not bind test loopback ports or reach the public model catalog; the same tests passed with those facilities available, without changing any other package. Tests use synthetic credentials and preserve the real-profile guards.
+On Bun 1.4.3 with disposable HOME/XDG directories: **76 plugin tests passed**, 0 failed, 316 assertions; the focused hook check and all **25** plugin hook checks passed. Full-repository test results and the exact final commit are recorded in PR #218's CI evidence. An initial restricted-sandbox run could not bind test loopback ports or reach the public model catalog; the same tests passed with those facilities available, without changing any other package. Tests use synthetic credentials and preserve the real-profile guards.
 
 The independent code review found no new P1/P2. It separately reran the 76 focused tests and confirmed that upstream's model/header/menu helpers are retained, exact-pair concurrency and host conditional-save ownership remain intact, and the English reconnect marker reaches Magpie's localized signed-out card. This does not claim a new live persistence-failure or OpenCode renewal test. Streaming-body cancellation retains its original abort reason and sends no request after cancellation.
 
