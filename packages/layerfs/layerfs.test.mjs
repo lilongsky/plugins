@@ -1,14 +1,17 @@
 import { afterAll, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync,
-  symlinkSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
+  rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs"
+import { get as httpGet } from "node:http"
+import { createServer as netServer, connect as netConnect } from "node:net"
 import { homedir, tmpdir } from "node:os"
 import { basename, dirname, join } from "node:path"
 import { LayerfsTools } from "./index.mjs"
 import {
-  IMPORT_MAX_FILES, SimBackend, checkSourceDir, createBackend, scanImportTree,
+  DEFAULT_ROOT, IMPORT_MAX_FILES, LEGACY_ROOT, SimBackend, checkSourceDir, createBackend,
+  defaultRoot, scanImportTree,
 } from "./layerfs.mjs"
 
 const sha = (s) => createHash("sha256").update(s).digest("hex")
@@ -23,11 +26,20 @@ function mkTmp(prefix, base = tmpdir()) {
   tmpDirs.push(d)
   return d
 }
+// The cleanup's time grows with the machine's disk load, not with the
+// suite: on a loaded box removing every dir took over bun's default 5s
+// hook bar (#362), so the hook carries its own.
 afterAll(() => {
   for (const d of tmpDirs) rmSync(d, { recursive: true, force: true })
   for (const k of Object.keys(process.env)) if (!(k in envSnapshot)) delete process.env[k]
   Object.assign(process.env, envSnapshot)
-})
+}, 120_000)
+
+// Suite hygiene (0.10.0 review, item 3): no test may touch the real
+// HOME — the first test calls LayerfsTools with no env at all, so the
+// suite pins a scratch home before any test runs; simTools still gives
+// each test its own home.
+process.env.MAGPIE_LAYERFS_HOME = mkTmp("layerfs-suite-home-")
 
 function fixture() {
   const src = mkTmp("layerfs-src-")
@@ -43,21 +55,84 @@ async function simTools(opts = { exec: true }) {
   const home = mkTmp("layerfs-home-")
   process.env.MAGPIE_LAYERFS_HOME = home
   process.env.MAGPIE_LAYERFS_BACKEND = "sim"
-  delete process.env.LAYERFS_SDK_PATH
-  delete process.env.LAYERFS_STORE_PATH
   delete process.env.MAGPIE_LAYERFS_EXEC
-  delete process.env.MAGPIE_LAYERFS_NATIVE
+  delete process.env.MAGPIE_LAYERFS_EXEC2
+  delete process.env.MAGPIE_LAYERFS_INSTALL_DIR
+  delete process.env.MAGPIE_LAYERFS_DATA_DIR
+  delete process.env.MAGPIE_LAYERFS_PAGE_DIR
+  delete process.env.MAGPIE_LAYERFS_PAGE_PORT
+  // Each instance gets its own service port: the host starts one per
+  // LayerfsTools(), and two instances sharing a port would leave the
+  // second silently serviceless.
+  const port = await freePort()
   const src = fixture()
   // ctx.directory is magpie's CONFIG directory in the real host — the
   // harness models it as its own temp dir, never the source
-  const { tool } = await LayerfsTools({ directory: mkTmp("magpie-config-") }, opts)
+  const { tool } = await LayerfsTools({ directory: mkTmp("magpie-config-") }, { ...opts, pagePort: port })
   // provision's source is a required argument since 0.7.0: the wrapper
   // passes the fixture explicitly, the way a caller now must
   const call = (name, args) => tool[name].execute(
     name === "provision" && args.source === undefined ? { ...args, source: src } : args,
     { agent: "test", abort: AbortSignal.timeout(5000) })
-  return { call, home, src, tool }
+  return { call, home, src, tool, port, url: `http://127.0.0.1:${port}/` }
 }
+
+// A port nothing holds right now: bind 0, read it back, let go. The
+// window between release and the service's bind is small, and a test
+// that polls the service fails loudly if it ever loses the race.
+const freePort = () => new Promise((resolve, reject) => {
+  const s = netServer()
+  s.once("error", reject)
+  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)) })
+})
+
+// Poll the service until its embedded trajectory holds the expected
+// state: the service starts off the tool calls' path, so a test that
+// needs it waits for the state, not for a fixed duration.
+async function serviceData(url, want, ms = 8000) {
+  const deadline = Date.now() + ms
+  for (;;) {
+    try {
+      const res = await fetch(url)
+      if (res.ok) {
+        const html = await res.text()
+        const m = html.match(/<script type="application\/json" id="data">(.*?)<\/script>/s)
+        if (m) {
+          const data = JSON.parse(m[1])
+          if (want(data)) return { data, html }
+        }
+      }
+    } catch { /* the service is not up yet */ }
+    if (Date.now() > deadline) throw new Error("the service never served the expected state")
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
+// One GET with caller-chosen headers: the Origin check's own test
+// needs the header set, which fetch would also do — but this keeps the
+// status, headers and body together for the assertions.
+const get = (url, headers = {}) => new Promise((resolve, reject) => {
+  const req = httpGet(url, { headers }, (res) => {
+    let body = ""
+    res.on("data", (c) => (body += c))
+    res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }))
+  })
+  req.on("error", reject)
+  req.end()
+})
+
+// One raw request with an explicit Host header: a client library would
+// overwrite it with the target, and the Host check's test needs the
+// header to say something other than the loopback it connects to.
+const rawRequest = (port, host, path = "/") => new Promise((resolve, reject) => {
+  let buf = ""
+  const sock = netConnect(port, "127.0.0.1", () => {
+    sock.write(`GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`)
+  })
+  sock.on("data", (c) => (buf += c))
+  sock.on("end", () => resolve(buf))
+  sock.on("error", reject)
+})
 
 test("gives eight tools, each with a JSON Schema and an execute", async () => {
   const { tool } = await LayerfsTools({})
@@ -310,7 +385,10 @@ test("item 3: an import skips secret-shaped files and reports them", async () =>
   const ws = await call("provision", { project: "website" })
   expect(ws.files).toBe(4) // only the fixture's real files
   expect(ws.importSkipped).toBe(6) // .env, docs/.env.local, .git, id_rsa, cert.pem, sub/.ssh
-  expect(ws.skippedSecrets).toContain(".env")
+  // the full sorted list, not a containment check: the old slice(0, 5)
+  // dropped whichever name readdir order put sixth, so this passed on
+  // APFS and failed on ext4 (#477)
+  expect(ws.skippedSecrets).toEqual([".env", ".git", "cert.pem", "docs/.env.local", "id_rsa", "sub/.ssh"])
   expect(existsSync(join(ws.path, ".env"))).toBe(false)
   expect(existsSync(join(ws.path, "id_rsa"))).toBe(false)
   expect(existsSync(join(ws.path, ".git"))).toBe(false)
@@ -339,42 +417,87 @@ test("item 4: the store is private, and a file's mode survives the store", async
   expect(mode(join(home, "accounting.json"))).toBe(0o600) // record files stay private
 })
 
-test("r2 item 4: this package is sim-only — asking for the native backend is a clear error", async () => {
-  const sim1 = await createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-auto-") })
-  expect(sim1).toBeInstanceOf(SimBackend)
-  // an SDK path changes nothing here: auto still means sim
-  const sim2 = await createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-auto-"), LAYERFS_SDK_PATH: "/x/index.js" })
+test("the registry package ships the sim backend only; native is refused, never silently substituted", async () => {
+  const sim = await createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-sim-") })
+  expect(sim).toBeInstanceOf(SimBackend)
+  // an SDK path lying around changes nothing: there is no native backend to turn on
+  const sim2 = await createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-sim-"), LAYERFS_SDK_PATH: "/x/index.js" })
   expect(sim2).toBeInstanceOf(SimBackend)
-  // every way of asking for native is refused, and says why
-  await expect(createBackend({ MAGPIE_LAYERFS_BACKEND: "native" })).rejects.toThrow("sim-only")
-  await expect(createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-auto-"), MAGPIE_LAYERFS_NATIVE: "1" }))
-    .rejects.toThrow("follow-up PR once @layerfs/sdk is published")
-  await expect(createBackend({ MAGPIE_LAYERFS_HOME: mkTmp("layerfs-auto-") }, { native: true }))
-    .rejects.toThrow("sim-only")
+  // an explicit native request — env or option — is refused loudly
+  await expect(createBackend({ MAGPIE_LAYERFS_BACKEND: "native" })).rejects.toThrow("not shipped")
+  await expect(createBackend(
+    { MAGPIE_LAYERFS_HOME: mkTmp("layerfs-sim-") }, { native: true })).rejects.toThrow("not shipped")
   await expect(createBackend({ MAGPIE_LAYERFS_BACKEND: "bogus" })).rejects.toThrow("auto or sim")
 })
 
-test("item 8 + r2 item 3: no trajectory file is maintained per call; the trajectory builds on demand", async () => {
-  const pageFile = join(import.meta.dir, "page", "trajectory.js")
-  const before = readFileSync(pageFile, "utf8")
+test("item 8 + r2 item 3: no trajectory file in the store, and no tool call writes into the page folder", async () => {
+  const pageDir = join(import.meta.dir, "page")
+  const listedBefore = readdirSync(pageDir).sort()
   const { call, home } = await simTools()
   await call("provision", { project: "website" })
   await call("fork", { project: "website", branch: "feat" })
   const feat = await call("provision", { project: "website", branch: "feat" })
   writeFileSync(join(feat.path, "f.txt"), "f\n")
   await call("checkpoint", { project: "website", branch: "feat", message: "work" })
-  expect(readFileSync(pageFile, "utf8")).toBe(before) // the shipped file is a sample, untouched (item 8)
+  // the registry review's install-folder rule: a run of mutating calls
+  // leaves the page folder exactly as shipped — no live file, no tmp file
+  expect(readdirSync(pageDir).sort()).toEqual(listedBefore)
   // 0.7.0 refreshed <root>/trajectory.json after every call; 0.7.1
   // dropped that — the refresh re-walked branch chains per call for a
-  // file nothing reads (r2 item 3)
+  // file nothing read (r2 item 3), and nothing writes one now either
   expect(existsSync(join(home, "trajectory.json"))).toBe(false)
   // the trajectory itself is still there, built when asked
   const traj = await new SimBackend(home).trajectory()
-  const proj = traj.projects.find((p) => p.name === "website")
-  expect(proj.branches.map((x) => x.name).sort()).toEqual(["feat", "main"])
-  const featSlice = proj.branches.find((x) => x.name === "feat")
-  expect(featSlice.commits.at(-1).message).toBe("work")
+  const proj2 = traj.projects.find((p) => p.name === "website")
+  expect(proj2.branches.map((x) => x.name).sort()).toEqual(["feat", "main"])
+  const featSlice2 = proj2.branches.find((x) => x.name === "feat")
+  expect(featSlice2.commits.at(-1).message).toBe("work")
   expect(traj.totals.logicalBytes).toBeGreaterThan(0)
+})
+
+test("trajectory() rebuilds read only new commits: a second rebuild reads none", async () => {
+  const { call, home } = await simTools()
+  await call("provision", { project: "website" })
+  const b = new SimBackend(home)
+  await b.trajectory() // first build parses every record once
+  // guard: summaries are cached per project/id, so a rebuild with
+  // nothing new must not touch the store's records again
+  let reads = 0
+  const orig = b.readCommit.bind(b)
+  b.readCommit = (...a) => { reads++; return orig(...a) }
+  await b.trajectory()
+  expect(reads).toBe(0)
+  await call("checkpoint", { project: "website", message: "second" })
+  reads = 0
+  const t = await b.trajectory()
+  const main = t.projects.find((p) => p.name === "website").branches.find((x) => x.name === "main")
+  expect(main.commits).toHaveLength(2)
+  expect(main.commits[0].message).toMatch(/^Import /)
+  expect(main.commits.at(-1).message).toBe("second")
+  expect(reads).toBe(1) // only the new checkpoint's record
+})
+
+test("calls record the real calling agent on commits and events; the trajectory carries it", async () => {
+  const { call, tool, home } = await simTools()
+  await call("provision", { project: "website" }) // agent "test" imports main
+  await call("fork", { project: "website", branch: "claude", from: "main" })
+  const ws = await call("provision", { project: "website", branch: "claude" })
+  writeFileSync(join(ws.path, "claude-work.txt"), "claude was here\n")
+  // a second agent checkpoints on the branch: the commit names the agent that made it
+  await tool.checkpoint.execute(
+    { project: "website", branch: "claude", message: "claude: first edit" },
+    { agent: "claude", abort: AbortSignal.timeout(5000) })
+  const b = new SimBackend(home)
+  const traj = await b.trajectory()
+  const proj = traj.projects.find((p) => p.name === "website")
+  const mainImport = proj.branches.find((x) => x.name === "main").commits[0]
+  expect(mainImport.agent).toBe("test") // the importing agent, not a guess from the branch name
+  const claudeCommit = proj.branches.find((x) => x.name === "claude").commits.at(-1)
+  expect(claudeCommit.agent).toBe("claude")
+  // events carry it too
+  const events = b.readEvents()
+  expect(events.find((e) => e.kind === "provision" && e.branch === "main").agent).toBe("test")
+  expect(events.find((e) => e.kind === "checkpoint" && e.branch === "claude").agent).toBe("claude")
 })
 
 test("items 9+10: slash branches are distinct, flat, and listed everywhere", async () => {
@@ -524,3 +647,174 @@ test("r2 item 7: storedBytes grows by the commit record's size, not just the cha
   // pre-fix the growth was 1 (the blob alone); the manifest record is counted now
   expect(after.storedBytes - before.storedBytes).toBe(recordBytes + 1)
 })
+
+// #360: workspace paths go upstream in tool results, so the default root
+// names neither the app nor the host, and an existing ~/.magpie-layerfs
+// is moved once with a link left behind.
+test("#360: a fresh home gets a default root that does not name magpie", () => {
+  const home = mkTmp("lfs-home-")
+  const root = defaultRoot(home)
+  expect(root).toBe(join(home, DEFAULT_ROOT))
+  expect(/magpie/i.test(DEFAULT_ROOT)).toBe(false)
+  expect(existsSync(join(home, LEGACY_ROOT))).toBe(false) // nothing made at the old name
+})
+
+test("#360: a 0.7.2 root is moved once, its workspaces answer the new path, and the old path still resolves", async () => {
+  const home = mkTmp("lfs-home-")
+  const legacy = join(home, LEGACY_ROOT)
+  const old = new SimBackend(legacy) // what 0.7.2 made at the old default
+  const ws = await old.provision("website", "main", fixture())
+  writeFileSync(join(ws.path, "kept.txt"), "work in progress\n")
+
+  const root = defaultRoot(home)
+  expect(root).toBe(join(home, DEFAULT_ROOT))
+  expect(lstatSync(legacy).isSymbolicLink()).toBe(true)
+  expect(realpathSync(legacy)).toBe(realpathSync(root))
+  expect(readFileSync(join(ws.path, "kept.txt"), "utf8")).toBe("work in progress\n") // old path, via the link
+
+  const b = new SimBackend(root)
+  const again = await b.provision("website", "main")
+  expect(again.reused).toBe(true)
+  expect(again.path).toBe(join(root, "workspaces", "website", "main"))
+  expect(readFileSync(join(again.path, "kept.txt"), "utf8")).toBe("work in progress\n")
+  const cp = await b.checkpoint("website", "main", "after the move")
+  expect(cp.added).toBe(1)
+
+  expect(defaultRoot(home)).toBe(root) // the second call moves nothing
+  expect(lstatSync(legacy).isSymbolicLink()).toBe(true)
+})
+
+test("#360: a legacy root the user made a link is used where it is", () => {
+  const home = mkTmp("lfs-home-")
+  const elsewhere = mkTmp("lfs-elsewhere-")
+  symlinkSync(elsewhere, join(home, LEGACY_ROOT), "dir")
+  expect(defaultRoot(home)).toBe(join(home, LEGACY_ROOT))
+  expect(existsSync(join(home, DEFAULT_ROOT))).toBe(false)
+})
+
+// ---- 0.10.0: the page is served by the host's own localhost service ----
+// The 0.9.0 review holds: nothing writes into the installed plugin's own
+// folder — no live file, no link, no rename. The host serves the page
+// itself (page-service.mjs): the installed page/index.html only
+// navigates its frame to it, and the service embeds backend.trajectory()
+// in the HTML it returns. The tests below drive the service over HTTP
+// the way a browser would, and the install folder is asserted untouched
+// by the run.
+
+test("0.10.0: the service serves the live trajectory, and tool calls write nothing into the package's page folder", async () => {
+  const { call, url } = await simTools()
+  const before = readdirSync(join(import.meta.dir, "page")).sort()
+  await call("provision", { project: "website" })
+  const { data, html } = await serviceData(url, (x) => !!x.projects.find((p) => p.name === "website"))
+  expect(data.projects.at(-1).name).toBe("website")
+  expect(html).toContain('id="graph"')
+  expect(html).toContain("location.reload()") // the page refreshes itself for liveness
+  // the answer's shape: HTML only, no-store, nosniff, and no CORS
+  const res = await fetch(url)
+  expect(res.status).toBe(200)
+  expect(res.headers.get("content-type")).toContain("text/html")
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff")
+  expect(res.headers.get("cache-control")).toContain("no-store")
+  expect(res.headers.get("access-control-allow-origin")).toBeNull()
+  // the package's own page folder is exactly as it was: no live file,
+  // no link, nothing renamed in or out
+  expect(readdirSync(join(import.meta.dir, "page")).sort()).toEqual(before)
+  const st = lstatSync(join(import.meta.dir, "page"))
+  expect(st.isSymbolicLink()).toBe(false)
+  expect(st.isDirectory()).toBe(true)
+}, 30000)
+
+test("0.10.0: the service refuses cross-origin reads, foreign hosts, and non-root routes", async () => {
+  const { call, url, port } = await simTools()
+  await call("provision", { project: "website" })
+  await serviceData(url, (x) => !!x.projects.find((p) => p.name === "website"))
+  // a sandboxed iframe's fetch sends Origin: null; a real site's sends
+  // its own origin — both are refused, and neither gets CORS headers
+  for (const origin of ["null", "https://evil.example"]) {
+    const r = await get(url, { origin })
+    expect(r.status).toBe(403)
+    expect(r.headers["access-control-allow-origin"]).toBeUndefined()
+  }
+  // a DNS-rebinding name arrives with the attacker's Host
+  const evil = await rawRequest(port, `evil.example:${port}`)
+  expect(evil).toMatch(/^HTTP\/1\.1 403/)
+  // the loopback names pass, as does a plain navigation (no Origin)
+  const local = await rawRequest(port, `localhost:${port}`)
+  expect(local).toMatch(/^HTTP\/1\.1 200/)
+  const plain = await get(url)
+  expect(plain.status).toBe(200)
+  // there is no .js data file to steal, and no asset route at all
+  for (const p of ["trajectory-live.js", "app.js", "view.js", "style.css", "trajectory.html"]) {
+    expect((await get(`${url}${p}`)).status).toBe(404)
+  }
+}, 30000)
+
+test("0.10.0: a commit message cannot break out of the embedded data script", async () => {
+  const { call, url } = await simTools()
+  const evil = "x</script><script>alert(1)</script>y"
+  await call("provision", { project: "website" })
+  await call("checkpoint", { project: "website", message: evil })
+  const { data, html } = await serviceData(url,
+    (x) => (x.projects.find((p) => p.name === "website")?.branches.find((b) => b.name === "main")?.commits ?? [])
+      .some((c) => c.message === evil))
+  // the breakout is escaped in the raw HTML, and parses back whole
+  expect(html).not.toContain("</script><script>alert(1)")
+  const commit = data.projects.find((p) => p.name === "website").branches
+    .find((b) => b.name === "main").commits.find((c) => c.message === evil)
+  expect(commit.message).toBe(evil)
+}, 30000)
+
+test("0.10.0: the served trajectory carries per-agent tool-call events", async () => {
+  const { call, url } = await simTools()
+  await call("provision", { project: "website" })
+  await call("fork", { project: "website", branch: "claude", from: "main" })
+  const ws = await call("provision", { project: "website", branch: "claude" })
+  writeFileSync(join(ws.path, "x.txt"), "x\n")
+  await call("checkpoint", { project: "website", branch: "claude", message: "agent work" })
+  // wait for the checkpoint this test asserts — the one on the claude
+  // branch — not for any write or any event that happens to arrive
+  const { data } = await serviceData(url,
+    (d) => (d.events ?? []).some((e) => e.kind === "checkpoint" && e.branch === "claude"))
+  // each event names the calling agent, the tool kind, project, branch and time
+  const e = data.events.filter((x) => x.kind === "checkpoint").at(-1)
+  expect(e.agent).toBe("test")
+  expect(e.project).toBe("website")
+  expect(e.branch).toBe("claude")
+  expect(typeof e.t).toBe("string")
+  // provision events carry the workspace path
+  const p = data.events.find((x) => x.kind === "provision")
+  expect(p.path).toContain("website")
+}, 30000)
+
+test("0.10.0: the service starts only once a store exists — empty or foreign folders start nothing", async () => {
+  const home = mkTmp("layerfs-home-")
+  process.env.MAGPIE_LAYERFS_HOME = home
+  process.env.MAGPIE_LAYERFS_BACKEND = "sim"
+  delete process.env.MAGPIE_LAYERFS_INSTALL_DIR
+  delete process.env.MAGPIE_LAYERFS_DATA_DIR
+  delete process.env.MAGPIE_LAYERFS_PAGE_DIR
+  // (a) a projects folder holding nothing: no service, and the backend
+  // is never built — its constructor is what creates the rest of the store
+  mkdirSync(join(home, "projects"))
+  const portA = await freePort()
+  await LayerfsTools({ directory: mkTmp("magpie-config-") }, { pagePort: portA })
+  await new Promise((r) => setTimeout(r, 300))
+  await expect(fetch(`http://127.0.0.1:${portA}/`)).rejects.toThrow()
+  expect(existsSync(join(home, "store"))).toBe(false)
+  // (b) an entry that is no project: the backend's own answer decides,
+  // so nothing listens
+  writeFileSync(join(home, "projects", "not-a-project.txt"), "x")
+  const portB = await freePort()
+  await LayerfsTools({ directory: mkTmp("magpie-config-") }, { pagePort: portB })
+  await new Promise((r) => setTimeout(r, 300))
+  await expect(fetch(`http://127.0.0.1:${portB}/`)).rejects.toThrow()
+  // (c) a real project: one instance provisions it, and a fresh instance
+  // on the same home serves it from the factory call, no tool call needed
+  const portD = await freePort()
+  const { tool } = await LayerfsTools({ directory: mkTmp("magpie-config-") }, { pagePort: portD })
+  await tool.provision.execute({ project: "website", source: fixture() }, { agent: "test", abort: AbortSignal.timeout(5000) })
+  const portE = await freePort()
+  await LayerfsTools({ directory: mkTmp("magpie-config-") }, { pagePort: portE })
+  const { data } = await serviceData(`http://127.0.0.1:${portE}/`, (x) => !!x.projects.find((p) => p.name === "website"))
+  expect(data.projects.at(-1).name).toBe("website")
+}, 30000)

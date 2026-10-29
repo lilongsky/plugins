@@ -2,7 +2,8 @@
 // (qoder-agent-sdk's worker in Qoder.app 0.4.3, "[ModelQueue]"): it asks
 // /api/v2/service/ask/queue/status with the request's requestSetId, the
 // model and the queueType until isQueued is false, waits that state's
-// retryAfterSeconds and sends the same request again. wallance on Discord:
+// retryAfterSeconds and sends the request again (its request_set_id, a new
+// request_id). wallance on Discord:
 // Qoder's free dfmodel answered "Qoder queued the request for dfmodel (this
 // plan's queue: p3); try again in 30s" through magpie, while Qoder's client
 // answered, slowly. The refusal is the shape of the real one in
@@ -66,7 +67,7 @@ async function loader({ chats, statuses }) {
   return { fetch: l.fetch, sent }
 }
 
-test("a queued request waits its turn in Qoder's queue and is sent again, the same request, once the queue lets it through", async () => {
+test("a queued request waits its turn in Qoder's queue and is sent again, in the same request set under a new request id, once the queue lets it through", async () => {
   const { fetch, sent } = await loader({
     chats: (n) => (n === 1 ? refused() : answered()),
     statuses: (n) => status(n < 3 ? { ...QUEUED, queueCount: 3 - n, retryAfterSeconds: 12 } : { isQueued: false, modelKey: "dfmodel", queueType: "p3", retryAfterSeconds: 1, serviceAvailable: true }),
@@ -78,9 +79,13 @@ test("a queued request waits its turn in Qoder's queue and is sent again, the sa
   // its own retryAfterSeconds before the request goes again
   expect(pauses).toEqual([12_000, 12_000, 1_000])
   expect(sent.chats.length).toBe(2)
-  // the same request: the queue knows it by its request_set_id
+  // the queue knows it by its request_set_id; the resend is a new call in
+  // it, a new request_id and chat_record_id, as Qoder's client sends it
+  // (o4i before each resend)
   expect(sent.chats[1].request_set_id).toBe(sent.chats[0].request_set_id)
-  expect(sent.chats[1].request_id).toBe(sent.chats[0].request_id)
+  expect(sent.chats[1].request_id).not.toBe(sent.chats[0].request_id)
+  expect(sent.chats[1].chat_record_id).toBe(sent.chats[1].request_id)
+  expect(sent.chats[1].session_id).toBe(sent.chats[0].session_id)
   expect(sent.chats[1].messages).toEqual(sent.chats[0].messages)
   const first = sent.statuses[0]
   expect(first.url.origin + first.url.pathname).toBe("https://api3.qoder.sh/algo/api/v2/service/ask/queue/status")
@@ -88,6 +93,39 @@ test("a queued request waits its turn in Qoder's queue and is sent again, the sa
   expect(first.headers["X-Request-ID"]).toBe(sent.chats[0].request_id)
   expect(first.headers["X-Session-ID"]).toBe(sent.chats[0].session_id)
   expect(first.headers.Authorization).toStartWith("Bearer COSY.")
+})
+
+test("a refusal's stream is closed before the wait, and the status asks after a resend name the resend", async () => {
+  // Qoder keeps a 10605 stream open after its one event (seen on a real
+  // qoder.com account, plugins#427): it is closed, not held through the
+  // wait and the resend
+  const signals = []
+  const auth = { type: "oauth", access: "jt", refresh: "rt", expires: Date.now() + 3_600_000, accountId: "one@x", uid: "u1", machineId: "m1" }
+  const chats = []
+  const statuses = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url))
+    if (u.pathname.endsWith("/model/list")) return json(LISTING)
+    if (u.pathname.endsWith("/queue/status")) {
+      statuses.push(init.headers["X-Request-ID"])
+      return status(statuses.length % 2 ? QUEUED : { isQueued: false, serviceAvailable: true })
+    }
+    chats.push(JSON.parse(_internal.decodeBody(init.body)))
+    signals.push(init.signal)
+    if (chats.length === 3) return answered()
+    const ev = new TextEncoder().encode(line({ code: "10605", message: JSON.stringify(QUEUED) }, 403))
+    return new Response(new ReadableStream({ start: (c) => c.enqueue(ev) }), { headers: { "Content-Type": "text/event-stream" } })
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await hooks.auth.loader(async () => auth)
+  const res = await l.fetch(API_CHAT, ask())
+  expect(res.status).toBe(200)
+  expect((await res.json()).choices[0].message.content).toBe("hello")
+  expect(chats.length).toBe(3)
+  expect(signals.map((s) => s.aborted)).toEqual([true, true, false])
+  expect(new Set(chats.map((c) => c.request_id)).size).toBe(3)
+  expect(new Set(chats.map((c) => c.request_set_id)).size).toBe(1)
+  expect(statuses).toEqual([chats[0].request_id, chats[0].request_id, chats[1].request_id, chats[1].request_id])
 })
 
 test("the queue's refusal in the stream is waited out the same way", async () => {
@@ -109,11 +147,28 @@ test("a wait held past the budget is the 503 with Retry-After it was, the reques
   const res = await fetch(API_CHAT, ask())
   expect(res.status).toBe(503)
   expect(res.headers.get("Retry-After")).toBe("30")
-  expect((await res.json()).error.message).toBe("Qoder queued the request for dfmodel (this plan's queue: p3); try again in 30s")
+  expect((await res.json()).error.message).toBe("Qoder queued the request for dfmodel (this plan's queue: p3, 3 ahead); try again in 30s")
   expect(sent.chats.length).toBe(1)
   // 30s pauses, the last cut to what was left of the budget
   expect(pauses.reduce((a, b) => a + b, 0)).toBe(QUEUE.budget)
   expect(Math.max(...pauses)).toBe(30_000)
+})
+
+// With another candidate after it (magpie's X-Magpie-Fallback: the model's
+// next account or provider, a routing group's next member), a queued
+// request isn't waited out: its 503 goes back at once, with where it stood
+// in the queue, and magpie asks the next (axuhere on X: a free model held
+// at "预计等待超过 10 分钟" while another provider could answer). The last
+// candidate isn't told, and waits as Qoder's client does (above).
+test("told another candidate follows, a queued request is answered at once with the queue's reason", async () => {
+  const { fetch, sent } = await loader({ chats: () => refused(), statuses: () => status(QUEUED) })
+  const res = await fetch(API_CHAT, { ...ask(), headers: { "x-magpie-fallback": "1" } })
+  expect(res.status).toBe(503)
+  expect(res.headers.get("Retry-After")).toBe("30")
+  expect((await res.json()).error.message).toBe("Qoder queued the request for dfmodel (this plan's queue: p3, 3 ahead); try again in 30s")
+  expect(sent.chats.length).toBe(1)
+  expect(sent.statuses.length).toBe(0)
+  expect(pauses).toEqual([])
 })
 
 test("the pause is the queue's retryAfterSeconds held to 0.5s..30s, and 30s when it says none", async () => {

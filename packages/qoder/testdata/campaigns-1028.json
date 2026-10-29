@@ -1,0 +1,65 @@
+{
+ "showCampaign": true,
+ "claimable": true,
+ "campaignUrl": "",
+ "campaigns": [
+  {
+   "campaignId": "01a17b2f-85d0-70e9-9c27-4a1fcc314a48",
+   "campaignKey": "act-20261027-207",
+   "actionType": "CLAIM_BENEFIT",
+   "startAt": 1793066400,
+   "endAt": 1793152740,
+   "claimStatus": "CLAIMABLE",
+   "benefit": {
+    "kind": "CREDITS",
+    "amount": 100,
+    "modelScope": {
+     "modelSeries": {
+      "key": "ALL_MODELS"
+     }
+    },
+    "validity": {
+     "mode": "RELATIVE_DAYS",
+     "days": 30
+    }
+   },
+   "placements": [
+    {
+     "type": "POPUP",
+     "campaignUrl": "https://openapi.qoder.sh/growth-page/activity-iframe",
+     "content": {
+      "en": {
+       "buttonText": "",
+       "description": "Daily reset: 10:00 (UTC+8). Valid for 30 days after claiming.",
+       "detailUrl": "https://docs.qoder.com/events/100credits",
+       "title": "Claim 100 Credits Daily"
+      },
+      "zh": {
+       "buttonText": "",
+       "description": "每日 10:00（UTC+8）刷新，领取后 30 天有效",
+       "detailUrl": "https://docs.qoder.com/zh/events/100credits",
+       "title": "每天领 100 Credits"
+      }
+     }
+    },
+    {
+     "type": "USAGE",
+     "content": {
+      "en": {
+       "buttonText": "",
+       "description": "Daily reset: 10:00 (UTC+8). Valid for 30 days after claiming.",
+       "detailUrl": "https://docs.qoder.com/events/100credits",
+       "title": "Claim 100 Credits Daily"
+      },
+      "zh": {
+       "buttonText": "",
+       "description": "每日 10:00（UTC+8）刷新，领取后 30 天有效",
+       "detailUrl": "https://docs.qoder.com/zh/events/100credits",
+       "title": "每天领 100 Credits"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

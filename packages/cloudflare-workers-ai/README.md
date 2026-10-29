@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-[![npm version](https://img.shields.io/badge/npm%20version-0.0.3-EA4335.svg)](https://www.npmjs.com/package/@magpie-community/opencode-cloudflare-workers-ai-auth)
+[![npm version](https://img.shields.io/badge/npm%20version-0.0.4-EA4335.svg)](https://www.npmjs.com/package/@magpie-community/opencode-cloudflare-workers-ai-auth)
 [![License: MIT](https://img.shields.io/badge/License-MIT-FBBC05.svg)](https://opensource.org/licenses/MIT)
 
 A provider plugin for [OpenCode](https://opencode.ai) 1.x and
@@ -18,12 +18,16 @@ and a daily Neurons allowance row in `magpie quota`.
 | Item | Where to find it |
 |---|---|
 | Cloudflare Account ID | 32 hex characters, on the dashboard's **Account home** → right sidebar |
-| Cloudflare API token | Dashboard → avatar → **My Profile** → API Tokens → create a **Custom Token** with `Account → Workers AI → Edit` (add `Account Settings → Read` if you also want the plan name in `magpie quota`) |
+| Cloudflare API token | Dashboard → avatar → **My Profile** → API Tokens → create a **Custom Token** with `Account → Workers AI → Edit` (add `Account Settings → Read` for the plan name and `Account Analytics → Read` for today's actually-used Neurons in `magpie quota`) |
 | magpie | 0.1.1110 or later, or OpenCode 1.x |
 
 No zones need to be selected on the token. Free and Paid plans both get
 **10,000 Neurons/day** free; eight frontier models need Workers Paid or prepaid
 AI Gateway credits (flagged below).
+
+The quota card shows the daily free allowance as a count and a Used / Left
+percentage, resetting at 00:00 UTC. Paid or unconfirmed plans keep this window
+informational; only a confirmed Free plan stops routing when it is spent.
 
 ## Install in magpie
 
@@ -123,12 +127,13 @@ https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1
 | `Model … absent from the current catalog` | the model id isn't in models.dev's cloudflare-workers-ai section; pick a listed model |
 | 400 on a (Paid) model | your plan is Free and the model needs Workers Paid or AI Gateway credits |
 | Quota row shows the fallback plan text | the token lacks `Account Settings → Read`; the escalation is purely cosmetic — the Neurons window is still shown |
+| Quota row shows 10,000 / 10,000 remaining but requests fail with `used up your daily free allocation` | the token lacks `Account Analytics → Read`, so the used amount is unknown and magpie renders the allowance as untouched — grant that scope and refresh |
 
 ## Development
 
 ```sh
 node --check src/index.mjs       # parse guard (the upstream bug that started this fork)
-node --test                     # 11 tests, no network needed
+node --test                     # 23 tests, no network needed
 sh scripts/sandbox.sh login      # magpie 0.1.1326 in a throwaway HOME
 sh scripts/sandbox.sh test       # provider test inside that sandbox
 sh scripts/sandbox.sh json       # plugin --json inside that sandbox
@@ -152,7 +157,7 @@ magpie, agents and sign-ins are never touched.
 
 | | |
 |---|---|
-| **Version** | 0.0.3 |
+| **Version** | 0.0.4 |
 | **License** | [MIT](LICENSE) — Copyright (c) 2026 Guislabert |
 | **Runtime** | Node.js >= 20, ESM only |
 | **Author** | [@Guislabert](https://github.com/Guislabert) |

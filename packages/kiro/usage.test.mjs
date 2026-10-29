@@ -45,10 +45,12 @@ test("a free account's credits and trial", async () => {
     plan: "Kiro Free",
     user: "me@example.com",
     windows: [
-      { name: "Free trial", used: 20, resetsAt: new Date(1791000000_000).toISOString(), display: "100 / 500" },
-      { name: "Credits", used: 25, resetsAt: new Date(1790000000_000).toISOString(), display: "12.5 / 50", span: 30 * 24 * 3600 },
+      { name: "Free trial", used: 20, resetsAt: new Date(1791000000_000).toISOString(), display: "100 / 500",
+        amount: 100, limit: 500, unit: "credits" },
+      { name: "Credits", used: 25, resetsAt: new Date(1790000000_000).toISOString(), display: "12.5 / 50",
+        amount: 12.5, limit: 50, unit: "credits", span: 30 * 24 * 3600 },
     ],
-    signIn: "kept",
+    signIn: "renewed",
   })
   const u = new URL(calls[0].url)
   expect(u.pathname).toEndWith("/Get-Usage-Limits")
@@ -70,6 +72,8 @@ test("names, resets and counts as Go says them", () => {
     ["Credits", "150.1 / 100", new Date(1800000000_000).toISOString()],
   ])
   expect(windows[1].used).toBeCloseTo(150.1) // the host clamps it to 100; Go's built-in didn't
+  // #408: the count goes along, so magpie's "left" shows 0 / 100, not the used text
+  expect(windows.map((w) => [w.amount, w.limit, w.unit])).toEqual([[1.005, 1000000, "credits"], [150.1, 100, "credits"]])
 })
 
 test("Kiro's refusal is the card's error", async () => {
@@ -115,10 +119,14 @@ test("errors don't name Kiro, which magpie adds", async () => {
   expect(await ask(auth)).toEqual({ status: 500, message: "boom", signIn: "kept" })
 })
 
-// The built-in's usage read neither marked nor cleared the account: a
-// refusal that says to sign in again is kept too, not read by magpie's words.
-test("a usage read that finds the sign-in refused keeps the account", async () => {
+// A sign-in Kiro refuses marks the account signed out, so magpie passes
+// over it and its row offers Sign in again (blue12345655 on Discord: a
+// signed-out plugin account had no Sign in again on its list row). A
+// refresh that fails another way keeps it.
+test("a usage read that finds the sign-in refused marks the account signed out", async () => {
   answer(401, { error: "invalid_grant" })
   expect(await usage({ ...auth, expires: Date.now() - 60_000 })).toEqual({
-    error: "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE", signIn: "kept" })
+    error: "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE", signIn: "expired" })
+  answer(500, "")
+  expect((await usage({ ...auth, expires: Date.now() - 60_000 })).signIn).toBe("kept")
 })

@@ -20,7 +20,9 @@ http2.connect = (origin, ...rest) => {
 }
 afterAll(() => (http2.connect = connect))
 
-const jwt = (exp) => ["e30", Buffer.from(JSON.stringify({ exp })).toString("base64url"), "sig"].join(".")
+// a token of this file's own: another file's {exp} alone can be the same
+// token, and would find the endpoint and list kept for it
+const jwt = (exp) => ["e30", Buffer.from(JSON.stringify({ exp, sub: "conversation-" + Math.random() })).toString("base64url"), "sig"].join(".")
 let n = 0
 // a sign-in of its own, so no list or endpoint kept for another is used
 const fresh = () => ({ type: "oauth", access: jwt(Math.floor(Date.now() / 1000) + 7200 + ++n), refresh: "", expires: 0, accountId: "a@b.c" })

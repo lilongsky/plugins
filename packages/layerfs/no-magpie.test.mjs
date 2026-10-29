@@ -11,11 +11,18 @@ import { createBackend } from "./layerfs.mjs"
 const envSnapshot = { ...process.env }
 const dirs = []
 const mk = (p) => { const d = mkdtempSync(join(tmpdir(), p)); dirs.push(d); return d }
+// Suite hygiene (0.10.0 review, item 3): no test may touch the real
+// HOME — the first test calls LayerfsTools with no env at all, so the
+// suite pins a scratch home before any test runs.
+process.env.MAGPIE_LAYERFS_HOME = mk("lfs-suite-home-")
+// The cleanup's time grows with the machine's disk load, not with the
+// suite: on a loaded box removing every dir took over bun's default 5s
+// hook bar (#362), so the hook carries its own.
 afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true })
   for (const k of Object.keys(process.env)) if (!(k in envSnapshot)) delete process.env[k]
   Object.assign(process.env, envSnapshot)
-})
+}, 120_000)
 
 const named = (s) => /magpie/i.test(String(s))
 const message = async (p) => { try { await p; return "" } catch (e) { return String(e?.message ?? e) } }
@@ -31,7 +38,6 @@ test("the errors a call answers name neither magpie nor its settings", async () 
   process.env.MAGPIE_LAYERFS_HOME = mk("lfs-home-")
   process.env.MAGPIE_LAYERFS_BACKEND = "sim"
   delete process.env.MAGPIE_LAYERFS_EXEC
-  delete process.env.MAGPIE_LAYERFS_NATIVE
   const cfg = mk("app-config-")
   const { tool } = await LayerfsTools({ directory: cfg }, { exec: false })
   const call = (name, args) => tool[name].execute(args, { agent: "test", abort: AbortSignal.timeout(5000) })

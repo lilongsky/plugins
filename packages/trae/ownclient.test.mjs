@@ -4,7 +4,7 @@
 import "./nonet.mjs"
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { createCipheriv, createHash, randomBytes } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, sep } from "node:path"
 import { TraeCNAuthPlugin, _internal } from "./index.mjs"
@@ -18,6 +18,15 @@ beforeEach(() => {
   file = join(dir, "storage.json")
   _internal.ownClient.paths = () => [join(dir, "missing.json"), file]
 })
+
+// clientFile writes a client's storage.json at p: its sign-in as userId,
+// and the device ids dcs (the key iCubeAuthInfo://icube-dc:<id>)
+function clientFile(p, userId, { encoded = true, dcs = [DC] } = {}) {
+  const auth = JSON.stringify({ token: "client-jwt", refreshToken: "client-refresh", userId, host: "https://api.trae.cn" })
+  const doc = { "telemetry.machineId": "m".repeat(64), [`iCubeAuthInfo://icube.cloudide`]: encoded ? encode(auth) : auth }
+  for (const d of dcs) doc[`iCubeAuthInfo://icube-dc:${d}`] = "device-key-pair"
+  writeFileSync(p, JSON.stringify(doc))
+}
 afterEach(() => {
   f?.close()
   f = undefined
@@ -40,11 +49,8 @@ function encode(text, header = "746305100000") {
 }
 const xor = (a, b) => Buffer.from(a.map((x, i) => x ^ b[i]))
 
-function client(userId, { encoded = true, dcs = [DC] } = {}) {
-  const auth = JSON.stringify({ token: "client-jwt", refreshToken: "client-refresh", userId, host: "https://api.trae.cn" })
-  const doc = { "telemetry.machineId": "m".repeat(64), [`iCubeAuthInfo://icube.cloudide`]: encoded ? encode(auth) : auth }
-  for (const d of dcs) doc[`iCubeAuthInfo://icube-dc:${d}`] = "device-key-pair"
-  writeFileSync(file, JSON.stringify(doc))
+function client(userId, opts) {
+  clientFile(file, userId, opts)
 }
 
 async function checkIn(auth = signedIn()) {
@@ -122,6 +128,40 @@ test("a client file that can't be made out names no device", async () => {
   plugins(await checkIn())
 })
 
+// A machine can hold more than one Trae CN client profile (Trae CN and
+// TRAE SOLO CN both write one, and so does a client started with its own
+// --user-data-dir). Each profile's storage.json names the account that
+// profile is signed in as, and that account's device — so two accounts can
+// each have a real client's device, which is what a check-in needs. The
+// plugin read only the first profile, and gave up on all of them the moment
+// one named an account it wasn't looking for.
+test("each account finds its own profile's client device, not the first profile's", async () => {
+  const other = join(dir, "other.json")
+  _internal.ownClient.paths = () => [file, other]
+  clientFile(file, "u-1", { dcs: [DC] })
+  clientFile(other, "u-2", { dcs: ["7654321098765432"] })
+  // u-2's device is in the second profile: reading only the first said no
+  expect((await checkIn(signedIn({ uid: "u-2" }))).get("x-device-id")).toBe("7654321098765432")
+  // and u-1's is still in the first
+  expect((await checkIn(signedIn({ uid: "u-1" }))).get("x-device-id")).toBe(DC)
+})
+
+test("a profile signed in as someone else doesn't hide a later profile's device", async () => {
+  const other = join(dir, "other.json")
+  _internal.ownClient.paths = () => [file, other]
+  clientFile(file, "someone-else", { dcs: [DC] })
+  clientFile(other, "u-2", { dcs: ["7654321098765432"] })
+  expect((await checkIn(signedIn({ uid: "u-2" }))).get("x-device-id")).toBe("7654321098765432")
+})
+
+test("a profile that can't be read doesn't hide a later profile's device", async () => {
+  const other = join(dir, "other.json")
+  _internal.ownClient.paths = () => [file, other]
+  writeFileSync(file, "{not json")
+  clientFile(other, "u-2", { dcs: ["7654321098765432"] })
+  expect((await checkIn(signedIn({ uid: "u-2" }))).get("x-device-id")).toBe("7654321098765432")
+})
+
 test("no client on this machine: the account's own device, as before", async () => {
   plugins(await checkIn())
 })
@@ -145,33 +185,53 @@ test("where each OS keeps the client's storage.json", () => {
   // the paths are joined with this system's separator: the composition is
   // what is checked, so they are read as one system spells them
   const same = (ps) => ps.map((x) => x.replaceAll(sep, "/"))
-  expect(same(p("darwin", "/Users/a", {}))).toEqual(["/Users/a/Library/Application Support/Trae CN/User/globalStorage/storage.json"])
+  // a profile is the IDE's, TRAE SOLO CN's, or the trae-cn folder some
+  // installs use: each is a client of the same realm with its own sign-in
+  expect(same(p("darwin", "/Users/a", {}))).toEqual([
+    "/Users/a/Library/Application Support/Trae CN/User/globalStorage/storage.json",
+    "/Users/a/Library/Application Support/TRAE SOLO CN/User/globalStorage/storage.json",
+  ])
   expect(same(p("win32", "/h", { APPDATA: "/h/Roam" }))).toEqual([
     "/h/Roam/Trae CN/User/globalStorage/storage.json",
+    "/h/Roam/TRAE SOLO CN/User/globalStorage/storage.json",
     "/h/Roam/trae-cn/User/globalStorage/storage.json",
     "/h/AppData/Roaming/Trae CN/User/globalStorage/storage.json",
+    "/h/AppData/Roaming/TRAE SOLO CN/User/globalStorage/storage.json",
     "/h/AppData/Roaming/trae-cn/User/globalStorage/storage.json",
   ])
-  expect(same(p("linux", "/home/a", {}))[0]).toBe("/home/a/.config/trae-cn/User/globalStorage/storage.json")
-  expect(same(p("linux", "/home/a", { XDG_CONFIG_HOME: "/x" }))[0]).toBe("/x/trae-cn/User/globalStorage/storage.json")
+  // linux lists the same three profiles under .config, in the same order
+  expect(same(p("linux", "/home/a", {}))).toEqual([
+    "/home/a/.config/Trae CN/User/globalStorage/storage.json",
+    "/home/a/.config/TRAE SOLO CN/User/globalStorage/storage.json",
+    "/home/a/.config/trae-cn/User/globalStorage/storage.json",
+  ])
+  expect(same(p("linux", "/home/a", { XDG_CONFIG_HOME: "/x" }))).toEqual([
+    "/x/Trae CN/User/globalStorage/storage.json",
+    "/x/TRAE SOLO CN/User/globalStorage/storage.json",
+    "/x/trae-cn/User/globalStorage/storage.json",
+  ])
   // a root named twice is asked once: APPDATA the same as the home's own
   expect(same(p("win32", "/h", { APPDATA: "/h/AppData/Roaming" }))).toEqual([
     "/h/AppData/Roaming/Trae CN/User/globalStorage/storage.json",
+    "/h/AppData/Roaming/TRAE SOLO CN/User/globalStorage/storage.json",
     "/h/AppData/Roaming/trae-cn/User/globalStorage/storage.json",
   ])
   // the same folder spelled with another case, separator or a trailing one
   // is still that folder (the fix: string equality read it twice)
-  expect(same(p("win32", "/h", { APPDATA: "\\H\\APPDATA\\roaming\\" })).length).toBe(2)
+  expect(same(p("win32", "/h", { APPDATA: "\\H\\APPDATA\\roaming\\" })).length).toBe(3)
   // and a different APPDATA is a root of its own, beside the home's
   expect(same(p("win32", "/h", { APPDATA: "/other/Roam" }))).toEqual([
     "/other/Roam/Trae CN/User/globalStorage/storage.json",
+    "/other/Roam/TRAE SOLO CN/User/globalStorage/storage.json",
     "/other/Roam/trae-cn/User/globalStorage/storage.json",
     "/h/AppData/Roaming/Trae CN/User/globalStorage/storage.json",
+    "/h/AppData/Roaming/TRAE SOLO CN/User/globalStorage/storage.json",
     "/h/AppData/Roaming/trae-cn/User/globalStorage/storage.json",
   ])
   // no APPDATA at all: the home's own alone
   expect(same(p("win32", "/h", {}))).toEqual([
     "/h/AppData/Roaming/Trae CN/User/globalStorage/storage.json",
+    "/h/AppData/Roaming/TRAE SOLO CN/User/globalStorage/storage.json",
     "/h/AppData/Roaming/trae-cn/User/globalStorage/storage.json",
   ])
 })
@@ -182,4 +242,64 @@ test("this machine's OS as the client names it", () => {
   expect(w.os).toMatch(/^Windows /)
   expect(_internal.thisMachine("darwin")).toEqual({ type: "mac", os: expect.stringMatching(/^macOS \d/) })
   expect(_internal.thisMachine("linux").type).toBe("linux")
+})
+
+// plugins#436 (moxuanchen, Windows 11, TRAE CN 3.4.4, plugin 0.2.24): two
+// accounts, A and B. Both of that machine's profiles, %APPDATA%\Trae CN and
+// %APPDATA%\TRAE SOLO CN, were signed in as A, with the same device. A
+// checked in (100 credits); B got 9074, and the reporter had to run
+// clientDevice by hand to learn that B's claim had gone on magpie's own
+// device. The message says which device a refused claim went on, and why.
+async function refused(uid, answer = { code: 9074, message: "当前参与用户太多，请稍后再试" }) {
+  f?.close()
+  f = fakeTrae()
+  f.route("POST /trae/api/v2/ug/checkin_credits/status", () => json({ code: 0, enable: true, checked_in: false }))
+  f.route("POST /trae/api/v2/ug/checkin_credits/claim", () => json(answer))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  return hooks.auth.checkin(async () => signedIn({ uid }))
+}
+
+function reporterProfiles() {
+  const cn = join(dir, "Trae CN", "storage.json")
+  const solo = join(dir, "TRAE SOLO CN", "storage.json")
+  for (const p of [cn, solo]) mkdirSync(join(p, ".."), { recursive: true })
+  _internal.ownClient.paths = () => [cn, solo]
+  clientFile(cn, "uid-a", { dcs: [DC] })
+  clientFile(solo, "uid-a", { dcs: [DC] })
+}
+
+test("B's 9074 says it went on magpie's own device, since both profiles here are A's (#436)", async () => {
+  reporterProfiles()
+  const out = await refused("uid-b")
+  expect(out).toEqual({
+    outcome: "ineligible",
+    message: "当前参与用户太多，请稍后再试 (9074) — Trae CN did not take this check-in for this account's device (sent on magpie's own device for this account: 2 Trae CN client profiles are on this machine, none signed in as this account)",
+  })
+  // it names neither uid nor either device
+  expect(out.message).not.toContain("uid-a")
+  expect(out.message).not.toContain(DC)
+  expect(f.seen.at(-1).headers.get("x-device-id")).toBe(_internal.ugDevice(signedIn({ uid: "uid-b" })))
+})
+
+test("A's refusal says it went on the client's device; one account in two profiles is no conflict (#436)", async () => {
+  reporterProfiles()
+  const out = await refused("uid-a", { code: 9095, message: "this device has checked in today" })
+  expect(out).toEqual({ outcome: "ineligible", message: "this device has checked in today (sent on this machine's Trae CN client's device, signed in as this account)" })
+  expect(f.seen.at(-1).headers.get("x-device-id")).toBe(DC)
+})
+
+test("a client device another account's profile also has is named as shared (#436)", async () => {
+  const other = join(dir, "other.json")
+  _internal.ownClient.paths = () => [file, other]
+  clientFile(file, "uid-a", { dcs: [DC] })
+  clientFile(other, "uid-b", { dcs: [DC] })
+  const out = await refused("uid-b", { code: 9095, message: "this device has checked in today" })
+  expect(out.message).toContain("another profile here, signed in as another account, has the same device")
+  expect(f.seen.at(-1).headers.get("x-device-id")).toBe(DC)
+})
+
+test("one profile, signed in as someone else, is counted in the singular (#436)", async () => {
+  client("uid-a")
+  const out = await refused("uid-b")
+  expect(out.message).toContain("(sent on magpie's own device for this account: 1 Trae CN client profile is on this machine, none signed in as this account)")
 })

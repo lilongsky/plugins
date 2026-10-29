@@ -8,6 +8,8 @@ accounts exist only on their own:
 |---|---|---|---|
 | `qoder` | qoder.com (international) | Google, GitHub or email | `QoderAuthPlugin` |
 | `qoder-cn` | qoder.cn ([Qoder CN](#qoder-cn)) | Alibaba Cloud or phone number | `QoderCNAuthPlugin` |
+| `qwenwork` | gateway.qwenwork.cn ([QwenWork](#qwenwork-千问办公)) | phone number or email | `QwenWorkAuthPlugin` |
+| `qwenwork-enterprise` | the enterprise's own domain ([QwenWork](#qwenwork-千问办公)) | email OTP or enterprise SSO | `QwenWorkEnterpriseAuthPlugin` |
 
 What follows is about `qoder`. Qoder CN works the same way on its own
 hosts; [its section](#qoder-cn) says what differs.
@@ -66,6 +68,21 @@ Refreshing:
 - Only one refresh runs at a time. A request that reads the sign-in before
   magpie saved a renewal uses the renewed pair, and a renewal handed a pair
   a request already spent gives what that request got.
+- A job token's end is what Qoder says: `expire_time` or `expires_at` (a
+  date, or an epoch in seconds or milliseconds), then `expires_in`
+  (milliseconds), then a day.
+- A chat Qoder answers 401 or 403 with no other code ("Login expired") is
+  sent again once: with the pair saved since, when another request, magpie
+  or another process renewed it meanwhile, else after one refresh, under the
+  same lock. A token renewed less than 5 minutes ago and refused again isn't
+  renewed again; the refusal is the answer.
+- A model Qoder serves that the account's listing has off or leaves out is
+  asked for the same way: the job token is renewed once (or the pair saved
+  since is used) and the list read again, before the request is answered
+  `unknown or disabled model`. On a job token Qoder no longer honours in
+  full, the listing can have only the free models on (#484). The same
+  5-minute rule holds, and an id Qoder has never served is said unknown at
+  once, with no renewal.
 - The device token, which reads usage, has no end on record: it is rotated
   when Qoder refuses it. On a [Qoder CN](#qoder-cn) device-token account it
   is the chat token too, and is renewed as above.
@@ -142,6 +159,13 @@ itself.
   the agent or magpie can try again. A call whose JSON is whole when the
   stream ends without its close is still the call; a tag in code or prose
   stays text.
+- A call written in Anthropic's or Qwen's tags with no `<tool_call>`
+  around it (since 0.2.36, #323), `<function_calls>` around one or more
+  `<invoke name="…"><parameter name="k">v</parameter></invoke>`, or
+  `<function=name><parameter=k>v</parameter></function>`, is a call too,
+  but only for a tool the request declared; for any other, or in
+  backticks or a code fence, it stays text. A parameter's value is JSON
+  unless the tool's schema says string, in these and in `<tool_call>`.
 
 **Errors**
 
@@ -149,13 +173,28 @@ itself.
 |---|---|
 | A refused sign-in (no code, or code 105) | 401 |
 | A quota (codes 110, 112–119, 122) | 429 |
-| Busy or queued for the model (code 10605) | Since 0.2.28 the request waits in Qoder's queue as Qoder's client does (below), then is sent again; past the wait, 503 with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none). The sign-in is untouched |
+| Busy or queued for the model (code 10605) | Since 0.2.28 the request waits in Qoder's queue as Qoder's client does (below), then is sent again; past the wait, 503 with `Retry-After` from Qoder's `retryAfterSeconds` (30s when it gives none). Since 0.2.40, when magpie has another candidate after this request (`x-magpie-fallback: 1`), the 503 comes at once, saying the queue and how many are ahead, and magpie asks the next. The sign-in is untouched |
 | A refusal of the request itself (codes 406, 416, 430, 80411, 80412, 100400–100403) | 400, with Qoder's words |
 | "Error in upstream response", the model's own vendor behind Qoder failing, which Qoder sends as a 400 (since 0.2.24) | 502, so magpie asks again or another account; the sign-in is untouched |
 | A failure before the answer starts | Qoder's status |
 | A failure after the answer has started | The stream ends with an error |
 
 ## Models
+
+Chat responses report the display name from the same model-list entry
+used to build the request, in both JSON completions and every SSE chunk
+(including usage). A blank name or a name equal to the slot key falls
+back to the requested model ID. This shared behavior applies to Qoder,
+Qoder CN, QwenWork and QwenWork Enterprise, including tier labels.
+
+Reporting the name does not fetch the model list again. The existing
+cache and model-list refresh behavior remain in place: a model missing
+from the cache still forces a refresh, and normal list refreshes update
+the configuration and name together. Model-list keys, API IDs,
+`X-Model-Key` and `model_config` are unchanged; slots with the same display
+name remain independently selectable. The name describes the catalog
+entry used for the request, not an attestation of the backend that
+executed it.
 
 The `provider.models` hook reads the account's own list, as Qoder's client
 asks for it (`/algo/api/v2/model/list`). It keeps the enabled models of the
@@ -183,6 +222,14 @@ app's Fast from 2026-10-12:
 - MiniMax-M3
 
 Every model speaks chat completions (`@ai-sdk/openai-compatible`).
+
+Every model a site ships also says, either way, whether it takes images:
+`attachment` and `modalities.input` are set on every `config` entry, image
+or no image. A kind left out is not "text only" to magpie but "the vendor
+didn't say", and magpie then falls back to models.dev's vote by bare model
+ID — where a same-named model of another vendor may take images, so this
+one gets sent them. QwenWork's three models and Qoder CN's Lite shipped no
+image key; since 0.2.47 they say text alone.
 
 ## Qoder CN
 
@@ -254,6 +301,58 @@ paths, client id and protocol are the public ones:
 
 The hosts and reply shapes come from a real VPC account's report
 (yetone/magpie#312). This plugin has not been tried with a VPC account.
+
+## The card's name
+
+An account signed in with a phone is shown by that phone — masked, `138****8000` — not by
+its `accountId`, which is a uuid. Qoder CN's user info answers the number as `security_mobile`
+(measured `13800138000`), so that is what the card takes.
+
+QwenWork's phone accounts answer only the last four digits, as `name`, beside a synthetic
+`phone_<uuid>@phone.local` email (measured): the card shows `****8000` and never that email.
+An email sign-in keeps its email.
+
+`accountId` stays the account's identity — what magpie keys the user's own name for
+it, its proxy, model picks, caps and a gateway key's account list by — so it never
+changes: it is what a sign-in and every renewal give back. The card's name is usage's
+`user`, a field magpie shows and never keys by.
+
+A sign-in reads the user info, and a renewal reads it again (outside the token lock),
+so an account stored by an earlier version shows the phone on the card at its next
+renewal. A failed read changes nothing and never costs a sign-in.
+
+## QwenWork (千问办公)
+
+`QwenWork` and `QwenWork 企业版` serve Alibaba's own QwenWork (qwenwork.cn)
+on this same protocol, with the desktop client's client id, an RSA key the
+Qoder one's equal, its own `qwork` scene, and the device token as the chat
+token. The public cloud's sign-in is the desktop app's device flow, with
+`redirect_uri=qwenwork-cn://`; usage reads the sign-in's account-context.
+A personal account's quota there has `total` and `used` null, only
+`remaining`, so the card shows what is left as its balance, with each pool
+(daily, monthly, long-term) from `/api/v1/adapter/user/wallets`, as
+QwenWork's own client reads them; no share used is made up. An account
+with a total keeps its used / total window, and a biz account (or the
+enterprise flagship) never asks for the wallets.
+There is no PAT and no daily check-in on it: the `pat: false` and
+`checkin: false` site fields turn both off, so Qoder's device identity is
+never sent there.
+
+The enterprise flagship (企业旗舰版, a VPC / private deployment) serves
+web/openapi/api on the enterprise's **own single domain**, and its device
+flow sends **no `redirect_uri`** (`/device/selectAccounts` refuses one).
+Its sign-in asks for that domain — the host the admin console lives on,
+like `your-company.vpc.qwenwork.cn`; `QWENWORK_ENT_DOMAIN` presets it so
+the sign-in asks nothing. Every call — chat, models, refresh, usage —
+routes to that host, and the account is named `<email|uid> (<domain>)`.
+The login page expires in 5 minutes; a member signing in by email OTP
+must have their email bound to their account in the admin console, or the
+page answers 用户不存在.
+
+The flagship deploys no model-catalog service (`/algo/api/v2/model/list`
+answers 503 there), so its list falls back to the public cloud's qwork
+models shipped in this package: flash, pro and qwen3.8-max-preview. A 503
+falls back; any other error doesn't.
 
 ## Daily check-in
 
@@ -333,6 +432,19 @@ Qoder CN's `runtime-info` for environment `0` (the international one is
 - `<openapi>` is `openapi.qoder.sh` (Qoder) or `openapi.qoder.com.cn`
   (Qoder CN). Other pages on those hosts are still refused.
 
+**When it is asked (0.2.43).** The daily 100 credits are a campaign of
+their own each day, listed from 10:00 (UTC+8) to 09:59 the next day
+(`startAt`/`endAt`; the campaign's own text says "Daily reset: 10:00
+(UTC+8)", a live list on 2026-10-28). A check-in before 10:00 meets the day
+before's campaign: it claims that one if it is still open. Every answer
+that knows the window carries `until`, the next campaign's opening (a day
+after this one's start, or its end when it runs longer) plus a minute, and
+magpie (with `until` support) asks again then, so today's credits are
+claimed a minute or two after 10:00 (UTC+8), whatever the computer's time
+zone, with nothing to set. Between the old campaign's end at 09:59 and
+10:00 the check-in is `failed` with `until` 10:01. An older magpie ignores
+`until` and asks once a Beijing calendar day, as before.
+
 Taken from [wallechfox/qoder-checkin](https://github.com/wallechfox/qoder-checkin),
 which a user reports works, and Qoder desktop 0.4.3's campaign requests.
 International campaign discovery was checked with a real account on
@@ -370,6 +482,14 @@ cancelled request end the wait early. Qoder's client also reports the end
 of its turn to `/api/v2/service/ask/finish`; the plugin doesn't, and
 Qoder releases that lease on its own TTL. `queue.test.mjs` has the wait.
 
+Since **0.2.40** the wait is only for the last candidate: when magpie says
+another account, provider or routing group member follows this request
+(its `x-magpie-fallback: 1` header, which the plugin host keeps from Qoder),
+a queued request is answered at once with the 503 above, e.g. "Qoder queued
+the request for dfmodel (this plan's queue: p3, 3 ahead); try again in
+30s", and magpie asks the next instead of keeping the agent in Qoder's
+queue.
+
 For a bounded offline reproduction, run `packages/qoder/busy.test.mjs`
 from #185 in an isolated temporary HOME. It compares plain queue JSON,
 BOM-prefixed JSON and known message wrappers, keeping explicit login and
@@ -386,6 +506,26 @@ The host's recheck/cache behavior is tracked in
 [magpie#2696](https://github.com/yetone/magpie/issues/2696). Verify a new
 claim against the vendor record; a successful activity query alone is not
 proof that credits arrived.
+
+## protocol
+
+`export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }` is
+the plugin factory and its pieces, for another service on this same
+protocol (QwenWork ships here; a future one can too). Its shape is not a
+stable API — it changes as the packages on it need.
+
+## Free models when the credits run out
+
+Qoder serves its free models after the credits are used up: "When Credits
+run out, you can continue using free basic models, subject to daily and
+monthly limits" ([docs.qoder.com/Credits](https://docs.qoder.com/Credits);
+the zh page says the same). So the credit windows the usage hook gives
+(Qoder and Qoder CN, since 0.2.46) name the account's free models in
+`notModels`: a model listed at 0× (not a discount's 0 for a while), from the
+account's own model list. magpie then doesn't count those models as spent
+on a used-up account, or on a free account's "0 credits left". A list that
+can't be read leaves every model counted. QwenWork reads its usage
+elsewhere and is not changed.
 
 ## Not here
 

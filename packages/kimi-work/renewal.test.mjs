@@ -105,15 +105,18 @@ test('old pending 401 does not block or expire a same-uid fresh reconnect',async
   gate.resolve();const oldError=await oldRun;
   expect(outcome.blocked).toBeUndefined();expect(outcome.value[0]).toBeUndefined();
   expect(outcome.value[1].windows[0].used).toBe(45.15);expect(reads).toBe(1);
-  expect(oldError).toMatchObject({signIn:'expired'});
+  expect(oldError).toMatchObject({signIn:'kept',code:'kimi_work_membership_expired'});
 });
 
-test('usage is read-only and reports a 401 without a forced rotation or direct save',async()=>{
+test('paired usage keeps Work signed in and asks to reconnect after a membership 401 without rotation or writes',async()=>{
   let writes=0;const calls=[];
   const fresh={...account(),...fields(rotated())};
   const p=plugin(async url=>{calls.push(url);return new Response('{}',{status:401});},
     {client:{auth:{set:async()=>{writes++;}}}});
-  await expect(p.auth.usage(async()=>fresh)).rejects.toMatchObject({signIn:'expired'});
+  const usage=await p.auth.usage(async()=>fresh);
+  expect(usage).toMatchObject({signIn:'kept',windows:[]});
+  expect(usage.error).toContain('重新连接 Kimi Work');
+  expect(usage.error).not.toMatch(/sign-in has (expired|lapsed)|sign in again/i);
   expect(calls).toEqual([I.MEMBER+'GetSubscriptionStats']);expect(writes).toBe(0);
 });
 
@@ -128,18 +131,40 @@ test('completion after logout or replacement only returns fields for the host co
   }
 });
 
-test('reference-only legacy accounts require explicit reconnect without hidden desktop import or writes',async()=>{
-  let imports=0,calls=0,writes=0;
-  const legacy={source:'kimi-work-desktop',uid:account().uid,access:'',refresh:'',expires:0};
-  const p=plugin(async()=>{calls++;return Response.json(stats);},{
-    readSession:()=>{imports++;return {uid:legacy.uid,webToken:account().access,webRefresh:account().refresh};},
-    client:{auth:{set:async()=>{writes++;}}},
+for(const fields of [{},{access:'',refresh:'',expires:0}])
+  test('reference-only legacy usage reads desktop webToken without reconnect, migration or rotation: '+JSON.stringify(fields),async()=>{
+    let reads=0,writes=0;const calls=[];
+    const legacy={type:'oauth',source:'kimi-work-desktop',uid:account().uid,...fields},before=structuredClone(legacy);
+    const desktopAccess=rotated('fixture-account','desktop').access_token;
+    const p=plugin(async(url,init)=>{calls.push(url);expect(init.headers.Authorization).toBe('Bearer '+desktopAccess);return Response.json(stats);},{
+      readSession:()=>{reads++;return {uid:legacy.uid,webToken:desktopAccess,webRefresh:'unspent-desktop-refresh'};},
+      client:{auth:{set:async()=>{writes++;}}},
+    });
+    expect(await p.auth.refresh(legacy)).toBeUndefined();
+    expect(reads).toBe(0);expect(calls).toEqual([]);
+    const usage=await p.auth.usage(async()=>legacy);
+    expect(usage).toEqual({plan:'月度共享额度',windows:[{name:'本月',used:45.15,display:'Code 已用 24.22%（占总额）'}]});
+    expect(legacy).toEqual(before);expect(reads).toBe(1);expect(writes).toBe(0);
+    expect(calls).toEqual([I.MEMBER+'GetSubscriptionStats']);
   });
-  expect(await p.auth.refresh(legacy)).toBeUndefined();
-  await expect(p.auth.usage(async()=>legacy)).rejects.toMatchObject({signIn:'expired',code:'kimi_work_login_expired',
-    message:expect.stringContaining('sign-in has expired')});
-  await expect(p.auth.usage(async()=>legacy)).rejects.toThrow('magpie plugin login kimi-work');
-  expect(imports).toBe(0);expect(calls).toBe(0);expect(writes).toBe(0);
+
+test('legacy usage rereads the desktop access after a rotation without copying its refresh',async()=>{
+  const legacy={type:'oauth',source:'kimi-work-desktop',uid:'fixture-account'};let token='synthetic-desktop-first';
+  const sent=[];const p=plugin(async(url,init)=>{expect(url).toBe(I.MEMBER+'GetSubscriptionStats');sent.push(init.headers.Authorization);return Response.json(stats);},{
+    readSession:()=>({uid:legacy.uid,webToken:token,webRefresh:'unspent-desktop-refresh'}),
+  });
+  await p.auth.usage(async()=>legacy);token='synthetic-desktop-next';await p.auth.usage(async()=>legacy);
+  expect(sent).toEqual(['Bearer synthetic-desktop-first','Bearer synthetic-desktop-next']);
+  expect(legacy).toEqual({type:'oauth',source:'kimi-work-desktop',uid:'fixture-account'});
+});
+
+test('a desktop without refresh still signs in as a usable reference-only account',async()=>{
+  const session={uid:'fixture-account',workToken:'synthetic-work-key',webToken:'synthetic-web-access'},calls=[];
+  const p=plugin(async(url,init)=>{calls.push(url);return Response.json(url===I.BASE+'/models'?{data:[]}:stats);},{readSession:()=>session});
+  const auth=await (await p.auth.methods[0].authorize()).callback();
+  expect(auth).toMatchObject({type:'success',source:'kimi-work-desktop',uid:session.uid,accountId:'Kimi Work · fixtur',access:'',refresh:'',expires:0});
+  expect((await p.auth.usage(async()=>auth)).windows[0].used).toBe(45.15);
+  expect(calls).toEqual([I.BASE+'/models',I.MEMBER+'GetSubscriptionStats']);
 });
 
 test('another plugin instance reads the pair persisted by the host without desktop or browser access',async()=>{
@@ -162,14 +187,26 @@ for(const status of [429,503])test('transient refresh HTTP '+status+' does not d
   catch(error) {expect(error.signIn).toBeUndefined();expect(error.message).not.toContain('synthetic secret');}
 });
 
-test('a refused refresh requests sign-in without revealing its response',async()=>{
-  const p=plugin(async()=>new Response('synthetic secret response',{status:401}));
-  const error=await p.auth.refresh(account()).catch(error=>error);
-  expect(error).toMatchObject({signIn:'expired',code:'kimi_work_login_expired'});
-  expect(error.message).toContain('sign-in has expired');
-  expect(error.message).toContain('reconnect Kimi Work');
+test('refused membership renewal and usage keep the independent Work credential usable',async()=>{
+  const auth=account(),before=structuredClone(auth),calls=[];let writes=0;
+  const p=plugin(async(url,init)=>{
+    calls.push(url);
+    if(url===I.REFRESH||url===I.MEMBER+'GetSubscriptionStats')return new Response('synthetic secret response',{status:401});
+    expect(url).toBe(I.BASE+'/chat/completions');
+    expect(new Headers(init.headers).get('authorization')).toBe('Bearer synthetic-work-key');
+    return new Response('synthetic Work answer');
+  },{readSession:()=>({uid:auth.uid,workToken:'synthetic-work-key'}),client:{auth:{set:async()=>{writes++;}}}});
+  const error=await p.auth.refresh(auth).catch(error=>error);
+  expect(error).toMatchObject({signIn:'kept',code:'kimi_work_membership_expired',status:401});
+  expect(error.message).not.toMatch(/sign-in has (expired|lapsed)|sign in again/i);
+  expect(error.message).toContain('重新连接 Kimi Work');
   expect(error.message).toContain('magpie plugin login kimi-work');
   expect(error.message).not.toContain('synthetic secret response');
+  expect(await p.auth.usage(async()=>auth)).toMatchObject({signIn:'kept',windows:[]});
+  const loader=await p.auth.loader(async()=>auth);
+  expect(await (await loader.fetch(I.BASE+'/chat/completions',{method:'POST',body:'{}'})).text()).toBe('synthetic Work answer');
+  expect(calls).toEqual([I.REFRESH,I.MEMBER+'GetSubscriptionStats',I.BASE+'/chat/completions']);
+  expect(auth).toEqual(before);expect(writes).toBe(0);
 });
 
 test('network errors during refresh do not reveal request credentials',async()=>{

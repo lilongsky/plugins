@@ -259,6 +259,101 @@ test("accountIdentityOf reads the signer from the refresh token's user_profile",
   assert.deepEqual(x.accountIdentityOf({ refresh_token: "opaque", user_name: "bob" }), { id: "bob", name: "bob" })
 })
 
+// A credential whose refresh token carries the IAM claims a real one does.
+function credWithProfile(claims) {
+  const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  return {
+    access_key_id: "AK",
+    secret_access_key: "SK",
+    security_token: "ST",
+    refresh_token: `h.${b64u({ user_profile: JSON.stringify(claims) })}.s`,
+  }
+}
+
+test("maskPhone shows a number a person can tell apart, or nothing", () => {
+  // Huawei Cloud IAM answers `0086-13800138000`; the other magpie cards show
+  // `138****8000`.
+  assert.equal(x.maskPhone("0086-13800138000"), "138****8000")
+  assert.equal(x.maskPhone("+86 138 0013 8000"), "138****8000")
+  assert.equal(x.maskPhone("13800138000"), "138****8000")
+  // Too short to be a number: no name, so the caller falls back.
+  assert.equal(x.maskPhone(""), "")
+  assert.equal(x.maskPhone("12345"), "")
+  assert.equal(x.maskPhone(undefined), "")
+})
+
+test("accountIdentityOf names an account by its phone, never by IAM's ids", () => {
+  const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const profile = { principal_urn: "iam::d1:user:hw12323", account_name: "hw12323" }
+  const token = `h.${b64u({ user_profile: JSON.stringify(profile) })}.s`
+  // The phone read from IAM stands in front of `hw12323` and of the URN.
+  assert.deepEqual(x.accountIdentityOf({ refresh_token: token, user_phone: "138****8000" }), {
+    id: "iam::d1:user:hw12323",
+    name: "138****8000",
+  })
+  // Without one, the account name — while `id` stays the URN magpie keys by.
+  assert.deepEqual(x.accountIdentityOf({ refresh_token: token }), { id: "iam::d1:user:hw12323", name: "hw12323" })
+})
+
+test("fetchAccountPhone reads IAM with the account's own credentials, and only once", async () => {
+  const seen = []
+  const cred = credWithProfile({ principal_id: "uid-1" })
+  const fetcher = async (url, init) => {
+    seen.push([String(url), new Headers(init.headers).get("authorization")])
+    return new Response(JSON.stringify({ user: { name: "hw12323", phone: "0086-13800138000" } }), { status: 200 })
+  }
+  assert.equal(await x.fetchAccountPhone(cred, fetcher), "138****8000")
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0][0], "https://iam.cn-north-4.myhuaweicloud.com/v3.0/OS-USER/users/uid-1")
+  assert.ok(String(seen[0][1]).startsWith("SDK-HMAC-SHA256 "), "signed, like every other call of the account")
+  // The number does not change: the second read is free.
+  assert.equal(await x.fetchAccountPhone(cred, fetcher), "138****8000")
+  assert.equal(seen.length, 1)
+})
+
+test('fetchAccountPhone is best effort — no claim, a refusal, or no number gives ""', async () => {
+  // No `principal_id` in the token: IAM is never called.
+  const unreadable = { access_key_id: "AK", secret_access_key: "SK", security_token: "ST", refresh_token: "R" }
+  assert.equal(await x.fetchAccountPhone(unreadable, async () => { throw new Error("must not be called") }), "")
+  const cred = credWithProfile({ principal_id: "uid-2" })
+  assert.equal(await x.fetchAccountPhone(cred, async () => new Response("{}", { status: 403 })), "")
+  assert.equal(
+    await x.fetchAccountPhone(cred, async () => new Response(JSON.stringify({ user: { name: "hw12323" } }), { status: 200 })),
+    "",
+  )
+})
+
+test("usage names an account by the phone its credential carries", async () => {
+  const cred = { ...(await makeCred()), user_phone: "138****8000" }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async () => new Response(JSON.stringify({ metrics: [
+      { name: "usageTotalPackageCredit", package_credit_amount: 500, package_credit_remain: 500 },
+    ] }), { status: 200 }),
+    ledgerPath: path.join(ledgerDir, "unused.json"),
+  })
+  const usage = await plugin.auth.usage(async () => makeAuth(cred))
+  assert.equal(usage.user, "138****8000")
+  assert.equal(usage.windows.length > 0, true, "the phone must not replace the windows")
+})
+
+test("a renewal keeps the account's name and its uid, with the phone in the credential", async () => {
+  const saved = []
+  const client = { auth: { set: async ({ body }) => { saved.push(body) } } }
+  const cred = {
+    ...(await makeCred()),
+    user_phone: "138****8000",
+    refresh_token: credWithProfile({ principal_urn: "iam::d:user:hw123" }).refresh_token,
+  }
+  const account = await x.persistCredential(client, { accountId: "iam::d:user:hw123", uid: "iam::d:user:hw123" }, cred)
+  assert.equal(saved.length, 1)
+  // accountId is the identity: it must not be renamed (magpie keys the user's
+  // own settings by it). The phone lives in the credential and is shown by usage.
+  assert.equal(saved[0].accountId, "iam::d:user:hw123")
+  assert.equal(saved[0].uid, "iam::d:user:hw123")
+  assert.equal(JSON.parse(saved[0].access).user_phone, "138****8000")
+  assert.equal(account.accountId, "iam::d:user:hw123")
+})
+
 test("accountSessionIds is stable per account and differs between accounts", async () => {
   const a = await x.accountSessionIds({ session_id: "s1", access_key_id: "AK1" })
   assert.deepEqual(await x.accountSessionIds({ session_id: "s1", access_key_id: "AK2" }), a)
@@ -404,8 +499,10 @@ const day = 86_400_000
 const iso = (ms) => new Date(ms).toISOString()
 function creditFetcher(now = Date.now()) {
   const planEnd = now + 31 * day
-  const signUp = now + 30 * day
-  const checkin = signUp + 52_000 // the same Beijing day, a minute later
+  // Noon in Beijing, so the check-in a minute later is the same Beijing day
+  // whatever the wall clock (#322).
+  const signUp = Math.floor((now + 30 * day + 8 * 3600_000) / day) * day + 4 * 3600_000
+  const checkin = signUp + 52_000
   const ok = (data) => new Response(JSON.stringify({ code: 0, message: "ok", data }), { status: 200 })
   const fetcher = async (url, init) => {
     const u = String(url)
@@ -433,6 +530,16 @@ function creditFetcher(now = Date.now()) {
   }
   return { fetcher, planEnd, signUp, checkin }
 }
+
+test("the credit fixture's check-in is its sign-up's Beijing day at any hour (#322)", () => {
+  const bj = (ms) => new Date(ms + 8 * 3600_000).toISOString().slice(0, 10)
+  const midnight = Date.parse("2026-10-24T16:00:00Z") // 00:00 in Beijing
+  for (const now of [midnight - 30_000, midnight - 1, midnight, midnight + 12 * 3600_000]) {
+    const { signUp, checkin, planEnd } = creditFetcher(now)
+    assert.equal(bj(checkin), bj(signUp))
+    assert.ok(signUp > now && checkin < planEnd)
+  }
+})
 
 test("fetchCreditBatches reads every batch with its own expiry, signed", async () => {
   const { fetcher, planEnd, signUp, checkin } = creditFetcher()
@@ -702,6 +809,133 @@ test("a folded answer keeps reasoning, tool calls and usage apart", async () => 
   assert.deepEqual(json.usage, { prompt_tokens: 5, completion_tokens: 7, total_tokens: 12 })
 })
 
+// ---- tool names over CodeArts' 64 characters (#432) -------------------------
+
+// The reporter's tool, word for word: ZCode's android emulator MCP, 71 long.
+const ANDROID_TOOL = "mcp__plugin_android-emulator_android-emulator__android_discover_project"
+const toolOf = (name) => ({ type: "function", function: { name, description: "d", parameters: { type: "object", properties: {} } } })
+const sentOf = (init) => JSON.parse(new TextDecoder().decode(init.body))
+
+test("a tool name over 64 goes cut to 64: its first 55, _ and 8 hex of its SHA-256", async () => {
+  assert.equal(ANDROID_TOOL.length, 71)
+  const body = {
+    model: "GLM-5.2",
+    tools: [toolOf(ANDROID_TOOL), toolOf("read")],
+    tool_choice: { type: "function", function: { name: ANDROID_TOOL } },
+    messages: [
+      { role: "user", content: "find the project" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: ANDROID_TOOL, arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", name: ANDROID_TOOL, content: "ok" },
+    ],
+  }
+  const { body: sent, names } = x.prepareChatBody(structuredClone(body))
+  const hex = (await x.sha256Hex(new TextEncoder().encode(ANDROID_TOOL))).slice(0, 8)
+  const cut = `${ANDROID_TOOL.slice(0, 55)}_${hex}`
+  assert.equal(cut.length, 64)
+  assert.equal(sent.tools[0].function.name, cut)
+  assert.equal(sent.tools[1].function.name, "read")
+  assert.equal(sent.tool_choice.function.name, cut)
+  assert.equal(sent.messages[1].tool_calls[0].function.name, cut)
+  assert.equal(sent.messages[2].name, cut)
+  assert.deepEqual([...names], [[cut, ANDROID_TOOL]])
+  // The same on the next request, so the history keeps matching its tool.
+  assert.equal(x.prepareChatBody(structuredClone(body)).body.tools[0].function.name, cut)
+  // Names that fit leave the body as it was, and nothing to put back.
+  const fits = { model: "GLM-5.2", tools: [toolOf("read"), toolOf("x".repeat(64))], messages: [] }
+  const plain = x.prepareChatBody(structuredClone(fits))
+  assert.equal(plain.names, null)
+  assert.deepEqual(plain.body.tools, fits.tools)
+})
+
+test("cut names never collide: alike for 55, or the cut of one being another tool's own name", () => {
+  const a = `${ANDROID_TOOL}_a_long_tail`
+  const b = `${ANDROID_TOOL}_b_long_tail`
+  const taken = x.cutToolName(a, 0) // a tool the agent itself calls by a's cut
+  const { body, names } = x.prepareChatBody({ model: "GLM-5.2", tools: [toolOf(a), toolOf(b), toolOf(taken)], messages: [] })
+  const sent = body.tools.map((t) => t.function.name)
+  assert.equal(new Set(sent).size, 3)
+  for (const n of sent) assert.ok(n.length <= x.TOOL_NAME_LIMIT, n)
+  // the agent's own short name goes as it is; a's is cut again, with a salt
+  assert.equal(sent[2], taken)
+  assert.notEqual(sent[0], taken)
+  assert.equal(sent[0].slice(0, 55), a.slice(0, 55))
+  assert.equal(names.get(sent[0]), a)
+  assert.equal(names.get(sent[1]), b)
+  assert.equal(names.has(taken), false)
+})
+
+test("a streamed tool call names the agent's tool again, whole or in pieces; other events pass byte for byte", async () => {
+  const cred = await makeCred()
+  const other = `${ANDROID_TOOL}_screenshot`
+  const cutA = x.cutToolName(ANDROID_TOOL, 0)
+  const cutB = x.cutToolName(other, 0)
+  const sentBodies = []
+  const head = sse({ id: "c3", model: "GLM-5.2", choices: [{ index: 0, delta: { role: "assistant", content: "" } }] })
+  const stream = head + sse(
+    // whole in one delta
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_a", type: "function", function: { name: cutA, arguments: "" } }] } }] },
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"p":1}' } }] } }] },
+    // in three pieces, one across the 55th character
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: "call_b", type: "function", function: { name: cutB.slice(0, 30) } }] } }] },
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { name: cutB.slice(30, 60) } }] } }] },
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { name: cutB.slice(60), arguments: "{}" } }] } }] },
+    // a tool whose name fits
+    { id: "c3", choices: [{ index: 0, delta: { tool_calls: [{ index: 2, id: "call_c", type: "function", function: { name: "read", arguments: "{}" } }] } }] },
+    { id: "c3", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    "[DONE]",
+  )
+  const fetcher = async (url, init) => {
+    sentBodies.push(sentOf(init))
+    return sseResponse(stream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, chatInit({
+    model: "GLM-5.2", stream: true, tools: [toolOf(ANDROID_TOOL), toolOf(other), toolOf("read")], messages: [{ role: "user", content: "hi" }],
+  }))
+  // CodeArts was sent names it takes
+  assert.deepEqual(sentBodies[0].tools.map((t) => t.function.name), [cutA, cutB, "read"])
+  for (const t of sentBodies[0].tools) assert.ok(t.function.name.length <= 64)
+  const text = await res.text()
+  // what the agent's stream folds to: its own names
+  const folded = x.completionFromChunks(x.parseSseEvents(text)).choices[0].message.tool_calls
+  assert.deepEqual(folded.map((c) => c.function.name), [ANDROID_TOOL, other, "read"])
+  assert.deepEqual(folded.map((c) => c.function.arguments), ['{"p":1}', "{}", "{}"])
+  // no cut name reaches the agent; events naming no cut tool are unchanged
+  assert.equal(text.includes(cutA) || text.includes(cutB), false)
+  assert.ok(text.startsWith(head))
+  assert.ok(text.endsWith('data: {"id":"c3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n'))
+})
+
+test("a gateway that repeats a cut name in each delta still gives the agent's name", async () => {
+  const cut = x.cutToolName(ANDROID_TOOL, 0)
+  const names = new Map([[cut, ANDROID_TOOL]])
+  const text = sse(
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c", function: { name: cut, arguments: "" } }] } }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: cut, arguments: "{}" } }] } }] },
+    "[DONE]",
+  )
+  const out = await new Response(x.restoreToolNamesInStream(new Response(text).body, names)).text()
+  const evs = x.parseSseEvents(out)
+  assert.deepEqual(evs.map((e) => e.choices[0].delta.tool_calls[0].function.name), [ANDROID_TOOL, ANDROID_TOOL])
+})
+
+test("a folded tool call names the agent's tool again", async () => {
+  const cred = await makeCred()
+  const cut = x.cutToolName(ANDROID_TOOL, 0)
+  const stream = sse(
+    { id: "c4", model: "GLM-5.2", choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: cut, arguments: "{}" } }] } }] },
+    { id: "c4", choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+    "[DONE]",
+  )
+  let sent
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async (url, init) => { sent = sentOf(init); return sseResponse(stream) } })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const json = await (await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", tools: [toolOf(ANDROID_TOOL)], messages: [] }))).json()
+  assert.equal(sent.tools[0].function.name, cut)
+  assert.deepEqual(json.choices[0].message.tool_calls, [{ id: "call_1", type: "function", function: { name: ANDROID_TOOL, arguments: "{}" } }])
+})
+
 const capBody = JSON.stringify({ error_code: "TM.00001041", error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。" })
 
 test("TM.00001041 as a 400 is retried, re-signed, until a session frees", async () => {
@@ -804,6 +1038,62 @@ test("the free model's TPM limit inside a 200 is a 429 magpie fails over on, not
   }
 })
 
+// star21321321124 (Discord, 10-28): an agent sent DeepSeek V4.1 Flash an
+// image, and the "502: you can retry" had it ask again and again.
+const notMultimodal = { error_code: "InferHub.001001020.406", error_msg: "The request model is not multimodal" }
+
+test("an image a text-only model turns away is a 400, not a 502 to retry, on every path", async () => {
+  const cred = await makeCred()
+  let answer = () => sseResponse(sse(notMultimodal))
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => answer() })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const ask = (stream) => loaded.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "看图" }], stream }))
+  const cases = [
+    ["inside a 200", () => sseResponse(sse(notMultimodal))],
+    ["as a 502", () => new Response(JSON.stringify(notMultimodal), { status: 502, headers: { "content-type": "application/json" } })],
+    ["as a 406", () => new Response(JSON.stringify(notMultimodal), { status: 406, headers: { "content-type": "application/json" } })],
+  ]
+  for (const [how, make] of cases) {
+    answer = make
+    for (const stream of [true, false]) {
+      const res = await ask(stream)
+      assert.equal(res.status, 400, `${how}, stream ${stream}`)
+      const body = await res.json()
+      assert.equal(body.error.code, "InferHub.001001020.406", how)
+      assert.match(body.error.message, /not multimodal/, how)
+    }
+  }
+})
+
+test("every model says it takes text alone, so an agent sends it no image", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
+  const config = {}
+  await plugin.config(config)
+  for (const [id, m] of Object.entries(config.provider.codearts.models)) {
+    assert.deepEqual(m.modalities, { input: ["text"], output: ["text"] }, id)
+    assert.equal(m.attachment, false, id)
+  }
+
+  const cred = await makeCred()
+  const listed = await CodeArtsAuthPlugin({ client: {} }, { fetch: modelsFetcher([], { agents: agentList, detail: agentDetail }) })
+  // the host's entry for a config model, and one the user said sees
+  const provider = {
+    models: {
+      "GLM-5.2": { capabilities: { input: { text: true, image: false } } },
+      "glm-5.3-flash": { capabilities: { input: { text: true, image: true } } },
+    },
+  }
+  const models = await listed.provider.models(provider, { auth: makeAuth(cred) })
+  // glm-5.3 only the agent lists, deepseek-v4-flash-0731 has no entry of its own
+  for (const id of ["GLM-5.2", "glm-5.3", "deepseek-v4-flash-0731"]) {
+    assert.equal(models[id].capabilities.input.image, false, id)
+    assert.equal(models[id].capabilities.input.text, true, id)
+    assert.equal(models[id].capabilities.attachment, false, id)
+  }
+  // what the user's own config says stands
+  assert.equal(models["glm-5.3-flash"].capabilities.input.image, true)
+})
+
 test("embeddedErrorStatus sorts the gateway's codes into what magpie acts on", () => {
   assert.equal(x.embeddedErrorStatus("InferHub.4291.200"), 429)
   assert.equal(x.embeddedErrorStatus("81114.429"), 429)
@@ -811,6 +1101,7 @@ test("embeddedErrorStatus sorts the gateway's codes into what magpie acts on", (
   assert.equal(x.embeddedErrorStatus("ModelArts.81009.404"), 400)
   assert.equal(x.embeddedErrorStatus("InferHub.001001005.400"), 400)
   assert.equal(x.embeddedErrorStatus("InferHub.5000.500"), 502)
+  assert.equal(x.embeddedErrorStatus("InferHub.001001020.406"), 400)
 })
 
 test("every chat carries the agent's session headers: one session, a fresh trace", async () => {
@@ -944,6 +1235,34 @@ test("a 429 that queues the request is waited out the agent's way, then sent aga
     ["POST", CHAT_URL],
   ])
   assert.ok(calls.every((c) => String(c[2]).startsWith("SDK-HMAC-SHA256 ")))
+})
+
+// With another candidate after it (magpie's X-Magpie-Fallback), a queued
+// request isn't waited out: it leaves the queue, and a 503 with the queue's
+// retry-after goes back at once for magpie to ask the next (axuhere on X: a
+// free model held in a queue while another provider could answer). The
+// header never goes on to CodeArts.
+test("told another candidate follows, a queued request leaves the queue and is answered at once", async () => {
+  const cred = await makeCred()
+  const calls = []
+  let deleted
+  const sawDelete = new Promise((r) => { deleted = r })
+  const fetcher = async (url, init) => {
+    calls.push([init.method, String(url), new Headers(init.headers).get("x-magpie-fallback")])
+    if (init.method === "DELETE") deleted()
+    if (String(url) === x.TRACE_QUEUE_URL("T9")) return new Response(JSON.stringify({ status: "queued", retry_after: 30 }), { status: 200 })
+    return new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "T9", "retry-after": "20" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const init = chatInit({ model: "GLM-5.2", messages: [] })
+  const res = await loaded.fetch(CHAT_URL, { ...init, headers: { ...Object.fromEntries(new Headers(init.headers)), "x-magpie-fallback": "1" } })
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get("retry-after"), "20")
+  assert.match((await res.json()).error.message, /CodeArts queued the request; try again in 20s/)
+  await sawDelete
+  assert.deepEqual(calls.map((c) => [c[0], c[1]]), [["POST", CHAT_URL], ["DELETE", x.TRACE_QUEUE_URL("T9")]])
+  assert.ok(calls.every((c) => c[2] === null))
 })
 
 test("giving up in the queue takes the request out of it", async () => {
@@ -2139,4 +2458,49 @@ test("a code STS turns down sends the browser to the portal's failure page", asy
     assert.equal(res.headers.get("location"), x.buildPortalLoginResultUrl(false))
     await assert.rejects(result, /token request failed: 400/)
   })
+})
+
+test("auth.refresh keeps a named account's identity and gives an unnamed one the URN (review #483)", async () => {
+  const urn = "iam::d:user:hw123"
+  const profiled = credWithProfile({ principal_urn: urn, principal_id: "pid-1" })
+  const cred = { ...(await makeCred()), refresh_token: profiled.refresh_token }
+  const fetcher = async (url) =>
+    String(url).includes("iam.cn-north-4")
+      ? new Response(JSON.stringify({ user: { phone: "0086-13800138000" } }), { status: 200 })
+      : new Response(JSON.stringify({
+      credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: "2031-01-01T00:00:00Z" },
+      refresh_token: profiled.refresh_token,
+    }), { status: 200 })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+
+  // an account that has an accountId: a renewal does not rename it
+  const named = await plugin.auth.refresh({ ...makeAuth(cred), accountId: urn })
+  assert.equal(named.accountId, undefined)
+  // the phone is read on the renewal and kept on the credential
+  assert.equal(JSON.parse(named.access).user_phone, "138****8000")
+
+  // an account without one: the renewal gives it the URN (else a re-sign-in
+  // would add a second row)
+  const unnamed = await plugin.auth.refresh(makeAuth(cred))
+  assert.match(String(unnamed.accountId ?? ""), /^iam::/)
+  assert.equal(JSON.parse(unnamed.access).user_phone, "138****8000")
+})
+
+test("a sign-in names the account by its URN while the card shows the phone (review #483)", async () => {
+  const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const urn = "iam::d1:user:hw123"
+  const rt = `h.${b64u({ user_profile: JSON.stringify({ principal_urn: urn, principal_id: "pid-1", account_name: "hw123" }) })}.s`
+  const fetcher = async (url) =>
+    String(url).includes("iam.cn-north-4")
+      ? new Response(JSON.stringify({ user: { phone: "0086-13800138000" } }), { status: 200 })
+      : new Response(stsBody("AK", rt), { status: 200 })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const a = await plugin.auth.methods[0].authorize()
+  const done = a.callback()
+  const port = new URL(a.url).searchParams.get("port")
+  await fetch(`http://127.0.0.1:${port}${x.REDIRECT_PATH}?code=C1`, { redirect: "manual" })
+  const out = await done
+  // accountId is the identity (the URN); the phone is on the credential
+  assert.equal(out.accountId, urn)
+  assert.equal(JSON.parse(out.access).user_phone, "138****8000")
 })

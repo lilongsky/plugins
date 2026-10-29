@@ -1,31 +1,31 @@
-// The LayerFS backend for the magpie tools plugin — one backend
-// behind a small surface (provision, checkpoint, fork, publish, exec,
-// history, resolve, status):
+// LayerFS backend for the magpie tools plugin.
 //
-// - sim: a local content-addressed store that implements the model
-//   LayerFS is built on — immutable blobs named by their SHA-256,
-//   branches as manifest pointers, checkpoints as deduplicated
-//   manifests — so the plugin runs and can be tested anywhere.
-//   Forking a branch copies no file bytes; a checkpoint stores only
-//   the blobs the store has not seen.
+// One backend sits behind the small surface (provision, checkpoint, fork,
+// history, resolve, status): sim, a local content-addressed store that
+// implements the same model LayerFS is built on — immutable blobs named
+// by their SHA-256, branches as manifest pointers, checkpoints as
+// deduplicated manifests — so the plugin runs and can be tested
+// anywhere. Forking a branch copies no file bytes; a checkpoint stores
+// only the blobs the store has not seen.
 //
-// This package is SIM-ONLY. The native backend (the real LayerFS,
-// through the `@layerfs/sdk` JavaScript SDK) was removed from the
-// magpie-community package in 0.7.1: shipping it needs a pinned,
-// integrity-checked npm dependency, and the SDK is not published to
-// npm. It is developed in the standalone repo
-// (Mola-maker/magpie-layerfs) and returns in a follow-up PR once the
-// SDK is published with a version to pin — see createBackend below.
+// The native backend — the real LayerFS through its JavaScript SDK —
+// is NOT shipped in this registry package: the SDK is still not
+// published to npm, so there is no pinned version to depend on, and
+// the registry package must not load unversioned code from a path the
+// user's environment names. It lives in the standalone repo
+// (Mola-maker/magpie-layerfs) and returns here once the SDK is
+// published and the plugin can depend on a pinned version.
 //
 // Environment:
 //   MAGPIE_LAYERFS_BACKEND  auto (default) | sim — "native" is an
 //                           explicit error in this package (above)
-//   MAGPIE_LAYERFS_HOME     state root (default ~/.magpie-layerfs)
+//   MAGPIE_LAYERFS_HOME     state root (default ~/.layerfs-tools; see
+//                           defaultRoot below)
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
-  chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync,
-  realpathSync, statSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
+  realpathSync, renameSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join, parse, resolve, sep } from "node:path"
@@ -224,7 +224,11 @@ function walkSourceFiles(dir) {
     }
   }
   walk(dir, "")
-  return { files, skipped }
+  // Sorted, not readdir order: readdirSync returns the file system's
+  // own order (ext4's hash order on Linux, sorted on APFS), and the
+  // caller reports this list — an unsorted one made the report differ
+  // by OS, dropping a different name on each (#477).
+  return { files, skipped: skipped.sort() }
 }
 
 // The sim backend's import scan: a manifest { rel: { sha, size, mode } }
@@ -321,16 +325,55 @@ function runShell(command, dir, timeoutMs) {
   })
 }
 
+// ---- the default state root ------------------------------------------------------
+// The state root when MAGPIE_LAYERFS_HOME is unset. provision, resolve
+// and exec answer workspace paths under it, and a tool result goes to
+// the vendor in the agent's next request, so the default names neither
+// the app nor the host (#360). A root made by 0.7.2 or earlier
+// (~/.magpie-layerfs) is moved once to the new name, and a link is left
+// at the old path so a session still holding an old workspace path keeps
+// working. A legacy root that is itself a link (the user pointed it
+// somewhere) is the user's own setup and is used where it is; so is a
+// legacy root the move fails on.
+export const DEFAULT_ROOT = ".layerfs-tools"
+export const LEGACY_ROOT = ".magpie-layerfs"
+export function defaultRoot(home = homedir()) {
+  const root = join(home, DEFAULT_ROOT)
+  const legacy = join(home, LEGACY_ROOT)
+  if (existsSync(root)) return root
+  let st
+  try { st = lstatSync(legacy) } catch { return root }
+  if (st.isSymbolicLink()) return legacy
+  if (!st.isDirectory()) return root
+  try {
+    renameSync(legacy, root)
+  } catch {
+    // another host moved it first, or the move is refused: use what is there
+    return existsSync(root) ? root : legacy
+  }
+  try { symlinkSync(root, legacy, process.platform === "win32" ? "junction" : "dir") } catch { /* the new paths still work */ }
+  return root
+}
+
 // ---- sim backend ---------------------------------------------------------------
+
+// The store's root: MAGPIE_LAYERFS_HOME moves it, otherwise defaultRoot's
+// move-once rule decides (~/.layerfs-tools). The one copy of this rule —
+// the backend and the page's startup check read it here.
+export const storeHome = () => process.env.MAGPIE_LAYERFS_HOME || defaultRoot()
 
 export class SimBackend {
   kind = "sim"
 
   constructor(root) {
-    this.root = root || process.env.MAGPIE_LAYERFS_HOME || join(homedir(), ".magpie-layerfs")
+    this.root = root || storeHome()
     this.objectsDir = join(this.root, "store", "objects")
     this.projectsDir = join(this.root, "projects")
     this.workspacesDir = join(this.root, "workspaces")
+    // Commit summaries for trajectory(): records never change once
+    // written, so a summary (everything but the manifest) is cached
+    // per project/id for the life of this backend
+    this._commitSummary = new Map()
     for (const d of [this.root, this.objectsDir, this.projectsDir, this.workspacesDir]) mkdirPrivate(d)
     // Seed the byte accounting before anything writes, so the bumps
     // below stay exact (a walk taken after a write would count it twice)
@@ -422,6 +465,26 @@ export class SimBackend {
   projectExists(project) { return existsSync(join(this.projectDir(project), "project.json")) }
   commitPath(project, id) { return join(this.projectDir(project), "commits", `${id}.json`) }
   readCommit(project, id) { return JSON.parse(readFileSync(this.commitPath(project, id), "utf8")) }
+  // A commit's summary: everything trajectory() shows, without the
+  // manifest — the big part, which trajectory never uses. The walk
+  // below reads each record once per backend lifetime; later rebuilds
+  // hit this map and touch no files, so a host-shared plugin host is
+  // stalled only by genuinely new commits, never by re-reading history.
+  readCommitSummary(project, id) {
+    const key = `${project}/${id}`
+    let s = this._commitSummary.get(key)
+    if (!s) {
+      const c = this.readCommit(project, id)
+      s = {
+        id: c.id, parent: c.parent, branch: c.branch, message: c.message, time: c.time,
+        files: c.files, logicalBytes: c.logicalBytes, newBytes: c.newBytes,
+        delta: c.delta ?? { added: 0, modified: 0, deleted: 0 },
+        ...(c.agent ? { agent: c.agent } : {}),
+      }
+      this._commitSummary.set(key, s)
+    }
+    return s
+  }
   writeCommit(project, commit) {
     mkdirPrivate(join(this.projectDir(project), "commits"))
     writeJson(this.commitPath(project, commit.id), commit, true)
@@ -443,13 +506,14 @@ export class SimBackend {
     return readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => decodeBranchName(f.slice(0, -5))).sort()
   }
 
-  makeCommit(project, branch, parent, manifest, message, newBytes, delta = { added: 0, modified: 0, deleted: 0 }) {
+  makeCommit(project, branch, parent, manifest, message, newBytes, delta = { added: 0, modified: 0, deleted: 0 }, agent = "") {
     const seed = JSON.stringify({ parent, branch, message, manifest }) + nowIso() + Math.random()
     const id = sha256(Buffer.from(seed)).slice(0, 12)
     const commit = {
       id, branch, parent, message, time: nowIso(),
       manifest, files: Object.keys(manifest).length,
       logicalBytes: manifestBytes(manifest), newBytes, delta,
+      ...(agent ? { agent } : {}),
     }
     const recordBytes = this.writeCommit(project, commit)
     this.bumpAccounting({ logicalDelta: commit.logicalBytes, storedDelta: recordBytes })
@@ -458,7 +522,10 @@ export class SimBackend {
   }
 
   // An append-only event log (provision / fork / checkpoint), the raw
-  // material for the trajectory the magpie page replays.
+  // material for the trajectory the magpie page replays. agent is the
+  // calling agent as the gateway knows it (the tool host's ctx.agent),
+  // when the caller passed one — the page attributes the work to the
+  // agent that actually made it, not to a branch name's token.
   recordEvent(event) {
     const path = join(this.root, "events.json")
     let events = []
@@ -471,7 +538,7 @@ export class SimBackend {
     try { return JSON.parse(readFileSync(join(this.root, "events.json"), "utf8")) } catch { return [] }
   }
 
-  async ensureProject(project, sourceDir) {
+  async ensureProject(project, sourceDir, agent = "") {
     if (this.projectExists(project)) return { created: false }
     mkdirPrivate(this.projectDir(project))
     writeJson(join(this.projectDir(project), "project.json"),
@@ -489,14 +556,14 @@ export class SimBackend {
     }
     const commit = this.makeCommit(project, "main", null, manifest,
       src ? `Import ${src}` : "Empty project", newBytes,
-      { added: Object.keys(manifest).length, modified: 0, deleted: 0 })
+      { added: Object.keys(manifest).length, modified: 0, deleted: 0 }, agent)
     return { created: true, commit: commit.id, skipped }
   }
 
   workspaceDir(project, branch) { return join(this.workspacesDir, project, encodeBranchName(branch)) }
 
-  async provision(project, branch = "main", sourceDir) {
-    const created = await this.ensureProject(project, sourceDir)
+  async provision(project, branch = "main", sourceDir, agent = "") {
+    const created = await this.ensureProject(project, sourceDir, agent)
     if (!this.branchExists(project, branch)) throw new Error(`no branch ${branch} in project ${project}`)
     const headId = this.head(project, branch)
     const dir = this.workspaceDir(project, branch)
@@ -517,19 +584,21 @@ export class SimBackend {
       chmodSync(out, f.mode ?? 0o644) // the manifest's mode, not the blob's or the umask's
     }
     writeJson(join(dir, BINDING), { project, branch, baseCommit: headId }, true)
-    this.recordEvent({ kind: "provision", project, branch, path: dir, commit: headId })
+    this.recordEvent({ kind: "provision", project, branch, path: dir, commit: headId, agent })
     return {
       path: dir, project, branch, backend: this.kind, commit: headId,
       reused: false, files: commit.files, logicalBytes: commit.logicalBytes,
       ...(created.created ? { projectCreated: true } : {}),
       ...(created.skipped?.length ? {
         importSkipped: created.skipped.length,
-        skippedSecrets: created.skipped.slice(0, 5),
+        // every skipped name, sorted (see walkSourceFiles): the old
+        // slice(0, 5) dropped a different sixth name on each OS.
+        skippedSecrets: created.skipped,
       } : {}),
     }
   }
 
-  async checkpoint(project, branch = "main", message = "") {
+  async checkpoint(project, branch = "main", message = "", agent = "") {
     const dir = this.workspaceDir(project, branch)
     if (!existsSync(join(dir, BINDING))) throw new Error(`no workspace for ${project}/${branch}; provision it first`)
     const parent = this.head(project, branch)
@@ -542,8 +611,8 @@ export class SimBackend {
       else if (prev.manifest[rel].sha !== f.sha) modified++
     }
     for (const rel of Object.keys(prev.manifest)) if (!manifest[rel]) deleted++
-    const commit = this.makeCommit(project, branch, parent, manifest, message || "Checkpoint", newBytes, { added, modified, deleted })
-    this.recordEvent({ kind: "checkpoint", project, branch, commit: commit.id, message: commit.message })
+    const commit = this.makeCommit(project, branch, parent, manifest, message || "Checkpoint", newBytes, { added, modified, deleted }, agent)
+    this.recordEvent({ kind: "checkpoint", project, branch, commit: commit.id, message: commit.message, agent })
     writeJson(join(dir, BINDING), { project, branch, baseCommit: commit.id }, true)
     const stored = this.storedBytes()
     return {
@@ -554,12 +623,12 @@ export class SimBackend {
     }
   }
 
-  async fork(project, branch, from = "main") {
+  async fork(project, branch, from = "main", agent = "") {
     if (!this.projectExists(project)) throw new Error(`no project ${project}`)
     if (this.branchExists(project, branch)) throw new Error(`branch ${branch} already exists in project ${project}`)
     const headId = this.head(project, from)
     this.setHead(project, branch, headId)
-    this.recordEvent({ kind: "fork", project, branch, from, commit: headId })
+    this.recordEvent({ kind: "fork", project, branch, from, commit: headId, agent })
     return { project, branch, from, commit: headId, copiedBytes: 0 }
   }
 
@@ -569,7 +638,7 @@ export class SimBackend {
   // an ancestor of the branch head, so publishing can only ever move
   // main forward. force says "I know main has commits this branch never
   // saw" — the result then reports what was overwritten.
-  async publish(project, branch, { force = false } = {}) {
+  async publish(project, branch, { force = false, agent = "" } = {}) {
     checkProject(project); checkBranch(branch)
     if (branch === "main") throw new Error("publish names a branch other than main; main is what gets published to")
     const branchHead = this.head(project, branch)
@@ -585,7 +654,7 @@ export class SimBackend {
       throw new Error(`main has moved since ${branch} forked: main is at ${mainHead}, which is not in ${branch}'s history. Publishing would drop main's newer checkpoints. Fork a fresh branch from main, or pass force: true to overwrite deliberately.`)
     this.setHead(project, "main", branchHead)
     const layer = layers + 1
-    this.recordEvent({ kind: "publish", project, branch, commit: branchHead, layer, overwrote: !fastForward })
+    this.recordEvent({ kind: "publish", project, branch, commit: branchHead, layer, overwrote: !fastForward, agent })
     return { project, branch, layer, commit: branchHead, previousMain: mainHead, overwrote: !fastForward }
   }
 
@@ -594,7 +663,7 @@ export class SimBackend {
   // mount, run, commit. A command that changes nothing commits nothing;
   // a failing command's changes are still checkpointed (they are
   // history, and history can be rewound), with its exit code reported.
-  async exec(project, branch = "main", command, message = "", timeoutMs = 50000) {
+  async exec(project, branch = "main", command, message = "", timeoutMs = 50000, agent = "") {
     checkProject(project); checkBranch(branch)
     if (typeof command !== "string" || !command.trim()) throw new Error("command is a non-empty string")
     const dir = this.workspaceDir(project, branch)
@@ -605,7 +674,7 @@ export class SimBackend {
     const changed = !sameManifest(prev.manifest, manifest)
     let commit = null
     if (changed) {
-      const c = await this.checkpoint(project, branch, message || `exec: ${command.trim().slice(0, 60)}`)
+      const c = await this.checkpoint(project, branch, message || `exec: ${command.trim().slice(0, 60)}`, agent)
       commit = c.commit
     }
     return {
@@ -629,7 +698,13 @@ export class SimBackend {
   }
 
   // One project's slice of the recorded trajectory, oldest first per
-  // branch. Commits carry their delta and byte accounting.
+  // branch. Commits carry their delta and byte accounting. The walk
+  // reads through readCommitSummary, so a forked branch does not
+  // re-read main's history: every record is parsed once per backend
+  // lifetime, and a rebuild after a new checkpoint reads only the new
+  // commits. Between branches the walk yields, so even a first build
+  // over a large store never holds the shared plugin host's event
+  // loop for its whole duration.
   async trajectoryProject(name) {
     if (!this.projectExists(name)) return null
     const branches = []
@@ -641,22 +716,28 @@ export class SimBackend {
       const commits = []
       let id = this.head(name, branch)
       while (id) {
-        const c = this.readCommit(name, id)
+        const c = this.readCommitSummary(name, id)
         if (c.branch === branch) {
           commits.push({
             id: c.id, parent: c.parent, message: c.message, time: c.time,
             files: c.files, logicalBytes: c.logicalBytes, newBytes: c.newBytes,
-            delta: c.delta ?? { added: 0, modified: 0, deleted: 0 },
+            delta: c.delta,
+            ...(c.agent ? { agent: c.agent } : {}),
           })
         }
         id = c.parent
       }
       branches.push({ name: branch, commits: commits.reverse() })
+      await new Promise((r) => setImmediate(r))
     }
     return { name, branches }
   }
 
   // The whole recorded trajectory: what the magpie page replays.
+  // The walk is cheap after the first build: readCommitSummary caches
+  // every record's summary, so a rebuild reads only commits it has
+  // never seen — a second rebuild with nothing new reads no records
+  // at all (a test pins that). The stamp itself is always fresh.
   async trajectory() {
     const projects = []
     if (existsSync(this.projectsDir)) {
@@ -683,8 +764,9 @@ export class SimBackend {
   // of every call grew with the history, for a file the page cannot
   // read (its bridge serves a fixed host list) and nothing else did
   // (round-2 review, item 3). Removed in 0.7.1: no tool call creates
-  // or updates a trajectory.json anymore. The page keeps its bundled
-  // sample until the host can serve plugin data to a page.
+  // or updates a trajectory.json anymore. The page is served by the
+  // host with its data embedded (page-service.mjs); the bundled
+  // sample it once shipped is gone.
 
   async resolve(project, branch = "main", inner = "") {
     const headId = this.head(project, branch)
@@ -727,18 +809,14 @@ export class SimBackend {
 
 // ---- selection ---------------------------------------------------------------------
 
-// This package is SIM-ONLY (0.7.1, round-2 review item 4). The native
-// backend — the real LayerFS through its JavaScript SDK — was removed
-// from the magpie-community package: the condition for shipping it is
-// a pinned, integrity-checked npm dependency, and @layerfs/sdk is not
-// published to npm, so no version exists to pin. It is developed in
-// the standalone repo (Mola-maker/magpie-layerfs) and returns here in
-// a follow-up PR once the SDK is published with a version to pin.
-// Asking for it — by MAGPIE_LAYERFS_BACKEND=native, by
-// MAGPIE_LAYERFS_NATIVE=1, or by the old "native" plugin option — is
-// an explicit, loud error, never a silent fall back to sim.
-const SIM_ONLY_NATIVE_ERROR =
-  "this package is sim-only: the native LayerFS backend is not part of it " +
+// The registry package ships the sim backend only. A native request
+// is refused loudly, never silently substituted: the SDK is still not
+// published to npm, so there is no pinned version to run, and running
+// unversioned code from an environment-named path is what the registry
+// review refused. The native backend returns here once the SDK is
+// published and the plugin pins it as a dependency.
+const NATIVE_NOT_SHIPPED =
+  "this package is sim-only: the native backend is not shipped in this package " +
   "(it returns in a follow-up PR once @layerfs/sdk is published to npm with a version to pin; " +
   "it is developed in its standalone repo). " +
   "Unset the native backend's environment switches and the \"native\" option to use the sim backend."
@@ -746,7 +824,8 @@ const SIM_ONLY_NATIVE_ERROR =
 export async function createBackend(env = process.env, options = {}) {
   const want = (env.MAGPIE_LAYERFS_BACKEND || "auto").toLowerCase()
   if (want === "native" || env.MAGPIE_LAYERFS_NATIVE === "1" || options?.native === true)
-    throw new Error(SIM_ONLY_NATIVE_ERROR)
-  if (want === "sim" || want === "auto") return new SimBackend(env.MAGPIE_LAYERFS_HOME)
-  throw new Error(`the LayerFS backend setting is auto or sim in this package; got ${JSON.stringify(want)}`)
+    throw new Error(NATIVE_NOT_SHIPPED)
+  if (want !== "auto" && want !== "sim")
+    throw new Error(`the LayerFS backend setting is auto or sim; got ${JSON.stringify(want)}`)
+  return new SimBackend(env.MAGPIE_LAYERFS_HOME)
 }

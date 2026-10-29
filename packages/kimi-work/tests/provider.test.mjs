@@ -82,8 +82,33 @@ test('models come from Work; usage reports only the shared membership allowance'
 
 test('an upstream usage refusal does not incorrectly invalidate the desktop sign-in',async()=>{
   const p=I.createPlugin({readSession:()=>session,fetchImpl:async()=>new Response('{}',{status:403})});
-  try{await p.auth.usage(async()=>account);throw Error('expected upstream refusal');}
-  catch(error){expect(error.signIn).toBeUndefined();expect(error.message).toContain('403');}
+  const u=await p.auth.usage(async()=>account);
+  expect(u.signIn).toBe('kept');expect(u.windows).toEqual([]);expect(u.error).toContain('403');
+});
+
+// www.kimi.com's literal answer to a web token it no longer takes (10-25,
+// curl, signed out and with a stale token alike).
+const sessionExpired={"code":"unauthenticated","details":[{"type":"common.error.v1.ErrorDetail","value":"CGQSLgoFZW4tVVMSJVNlc3Npb24gZXhwaXJlZC4gUGxlYXNlIGxvZyBpbiBhZ2Fpbi4","debug":{"reason":"REASON_INVALID_AUTH_TOKEN","localizedMessage":{"locale":"en-US","message":"Session expired. Please log in again."}}}]};
+
+test('a stale web sign-in is said on the card and keeps the Work sign-in',async()=>{
+  const p=I.createPlugin({readSession:()=>session,fetchImpl:async()=>Response.json(sessionExpired,{status:401})});
+  const u=await p.auth.usage(async()=>({source:account.source,uid:account.uid}));
+  expect(u.windows).toEqual([]);expect(u.signIn).toBe('kept');
+  expect(u.error).toContain('Kimi 网页登录已过期');
+  // magpie's signInGone would mark the account signed out on these words
+  expect(u.error).not.toMatch(/sign-in has (expired|lapsed)|sign in again/i);
+  expect(u.error).not.toContain(session.webToken);
+});
+
+test('a balance with nothing used, its zero left out, reads 0%; no balance is said',async()=>{
+  let reply={subscriptionBalance:{expireTime:'2030-01-01T00:00:00Z'}};
+  const p=I.createPlugin({readSession:()=>session,fetchImpl:async()=>Response.json(reply)});
+  expect((await p.auth.usage(async()=>account)).windows).toEqual([{name:'本月',used:0}]);
+  reply={subscription_balance:{amount_used_ratio:0.5}};
+  expect((await p.auth.usage(async()=>account)).windows).toEqual([{name:'本月',used:50}]);
+  reply={overdrawn:false};
+  const u=await p.auth.usage(async()=>account);
+  expect(u.windows).toEqual([]);expect(u.error).toContain('subscriptionBalance');
 });
 
 test('the real redacted catalog and additional advertised reasoning levels are preserved',()=>{

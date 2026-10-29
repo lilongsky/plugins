@@ -1,9 +1,11 @@
 // One user send is one request to WorkBuddy's backend, whatever it takes:
-// every step of it — a tool result sent back, a retry, another account
-// answering — carries the same X-Conversation-Request-ID, and the user's next
+// every step of it — a tool result sent back, a retry — carries the same
+// X-Conversation-Request-ID, and the user's next
 // message carries another. A conversation's turns share its
 // X-Conversation-ID, from the session magpie (or OpenCode) names, else from
 // the chat's first user message; each request has a message id of its own.
+// Both are one account's own: WorkBuddy's client is signed in as one, so a
+// conversation sent as two accounts is two conversations to WorkBuddy.
 import { afterEach, expect, test } from "bun:test"
 import { WorkBuddyAIAuthPlugin, WorkBuddyAuthPlugin, _internal } from "./index.mjs"
 
@@ -14,7 +16,7 @@ afterEach(() => (globalThis.fetch = real))
 // ask sends a chat as magpie's host does: the chat.headers hook is told the
 // session, then the loader's fetch is given what it added, and the request
 // WorkBuddy was sent is read back. Nothing leaves the machine.
-async function ask(body, { session = "", provider = "workbuddy", plugin = WorkBuddyAuthPlugin, headers = {} } = {}) {
+async function ask(body, { session = "", provider = "workbuddy", plugin = WorkBuddyAuthPlugin, headers = {}, uid = "u1", enterpriseId } = {}) {
   const sent = []
   globalThis.fetch = async (url, init) => {
     sent.push(new Headers(init?.headers))
@@ -23,7 +25,7 @@ async function ask(body, { session = "", provider = "workbuddy", plugin = WorkBu
   const hooks = await plugin({ client: {} })
   const out = { headers: { ...headers } }
   await hooks["chat.headers"]({ sessionID: session, model: { providerID: provider, id: "glm-5.3" }, provider: { info: { id: provider } } }, out)
-  const l = await hooks.auth.loader(async () => ({ type: "oauth", access: "tok", uid: "u1", expires: Date.now() + 3600_000 }))
+  const l = await hooks.auth.loader(async () => ({ type: "oauth", access: "tok", uid, ...(enterpriseId ? { enterpriseId } : {}), expires: Date.now() + 3600_000 }))
   const res = await l.fetch("https://copilot.tencent.com/v2/chat/completions", {
     method: "POST",
     headers: new Headers(out.headers),
@@ -116,7 +118,36 @@ test("WorkBuddy AI takes the ids too, with its client's headers", async () => {
   expect(turn(ai)).toMatch(HEX32)
   expect(conv(ai)).toMatch(HEX32)
   expect(ai.get("x-ide-name")).toBe("WorkBuddy")
-  expect(ai.get("user-agent")).toBe("WorkBuddy/5.5.6")
+  expect(ai.get("user-agent")).toBe("WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0")
+})
+
+// What WorkBuddy's desktop CLI sends with a chat, read from each build's
+// current app (5.9.3 with CLI 2.165.0 on both):
+// UserAgentHttpInterceptor's User-Agent, the app's version as the IDE's, X-Agent-Type on both builds, 5.9's X-Agent-Runtime, and the
+// OpenAI SDK's headers its fetch passes on.
+test("each build's chat carries its desktop client's headers", async () => {
+  const sdk = {
+    accept: "application/json",
+    "x-agent-type": "main",
+    "x-stainless-lang": "js",
+    "x-stainless-package-version": "6.25.0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v22.21.1",
+    "x-stainless-retry-count": "0",
+    "x-stainless-timeout": "1200",
+  }
+  const want = {
+    workbuddy: [WorkBuddyAuthPlugin, { ...sdk, "user-agent": "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0", "x-ide-version": "5.9.3", "x-agent-runtime": "local-agent" }],
+    "workbuddy-ai": [WorkBuddyAIAuthPlugin, { ...sdk, "user-agent": "WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0", "x-ide-version": "5.9.3", "x-agent-runtime": "local-agent" }],
+  }
+  for (const [provider, [plugin, heads]] of Object.entries(want)) {
+    const h = await ask(send("hi"), { provider, plugin, headers: { "x-agent-runtime": "cloud-agent" } })
+    for (const [name, v] of Object.entries(heads)) expect([provider, name, h.get(name)]).toEqual([provider, name, v])
+    expect(h.get("x-stainless-os")).toMatch(/^(MacOS|Windows|Linux|FreeBSD|OpenBSD|Android|Other:.+)$/)
+    expect(h.get("x-stainless-arch")).toMatch(/^(x64|arm64|arm|x32|other:.+)$/)
+    // nothing in what is sent names magpie or a tool other than WorkBuddy's
+    for (const [k, v] of h) expect([k, v.toLowerCase()].join(" ")).not.toMatch(/magpie|opencode/)
+  }
 })
 
 test("both builds carry what the usage list shows as the client (使用端)", async () => {
@@ -126,7 +157,6 @@ test("both builds carry what the usage list shows as the client (使用端)", as
     "x-agent-purpose": "conversation",
     "x-ide-name": "WorkBuddy",
     "x-ide-type": "WorkBuddy",
-    "x-ide-version": "5.5.6",
     "x-product": "SaaS",
     "x-agent-intent": "craft",
     "x-requested-with": "XMLHttpRequest",
@@ -194,4 +224,28 @@ test("the same words in another conversation are another turn", async () => {
   const a = await ask(later("fix it", "继续"))
   expect(turn(await ask(later("fix it", "继续")))).toBe(turn(a))
   expect(turn(await ask(later("other", "继续")))).not.toBe(turn(a))
+})
+
+test("a conversation's ids are one account's own: another account sends others", async () => {
+  // as magpie spreads one session over a group's accounts
+  const one = await ask(send("fix the bug"), { session: "ses_1", uid: "u1" })
+  const again = await ask(send("fix the bug"), { session: "ses_1", uid: "u1" })
+  const two = await ask(send("fix the bug"), { session: "ses_1", uid: "u2" })
+  expect(conv(two)).toMatch(HEX32)
+  expect(turn(two)).toMatch(HEX32)
+  // the same account keeps them
+  expect(conv(again)).toBe(conv(one))
+  expect(turn(again)).toBe(turn(one))
+  // another account has its own
+  expect(conv(two)).not.toBe(conv(one))
+  expect(turn(two)).not.toBe(turn(one))
+  // with no session too: the first user message names it for one account
+  const a = await ask(send("hi"), { uid: "u1" })
+  const b = await ask(send("hi"), { uid: "u2" })
+  expect(conv(a)).not.toBe(conv(b))
+  expect(turn(a)).not.toBe(turn(b))
+  // one user in two enterprises is two accounts as well
+  const team = await ask(send("fix the bug"), { session: "ses_1", uid: "u1", enterpriseId: "e1" })
+  expect(conv(team)).not.toBe(conv(one))
+  expect(turn(team)).not.toBe(turn(one))
 })

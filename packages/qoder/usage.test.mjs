@@ -60,9 +60,10 @@ test("a refused device token is rotated, saved, and the usage read with it", asy
   expect(await p.usage()).toEqual({
     plan: "pro",
     windows: [
-      { name: "Credits", used: 25, display: "25 / 100 credits" },
-      { name: "Add-on credits", used: 20, display: "10 / 50 credits" },
-      { name: "Shared credits", used: 50, display: "10 / 20 credits" },
+      { name: "Total credits", used: (100 * 45) / 170, display: "45 / 170 credits" },
+      { name: "Credits", used: 25, display: "25 / 100 credits", aside: true },
+      { name: "Add-on credits", used: 20, display: "10 / 50 credits", aside: true },
+      { name: "Shared credits", used: 50, display: "10 / 20 credits", aside: true },
       { name: "Team", used: 20, display: "2 / 10 credits" },
     ],
     signIn: "kept",
@@ -124,18 +125,75 @@ test("snake_case fields, an expiry, units, and pools too thin to show", () => {
   expect(_internal.when(0)).toBeUndefined()
 })
 
+// magpie-community/plugins#454 (chansee97): a Qoder CN trial whose plan's
+// 300 credits are spent, with 245 of 1,100 add-on credits used, read 0% left
+// in Routing. Qoder spends the add-on credits once the plan's are gone, so
+// the account has 855 of 1,400 left.
+test("a spent plan beside add-on credits left is no account used up (#454)", () => {
+  const u = _internal.parseUsage({
+    displayMode: "qoder",
+    qoderUsage: {
+      userType: "personal_professional_trial",
+      usageType: "credits",
+      isQuotaExceeded: false,
+      userQuota: { total: 300, used: 300, remaining: 0, percentage: 1, unit: "credits" },
+      addOnQuota: { total: 1100, used: 245, remaining: 855, percentage: 0.22, unit: "credits" },
+    },
+  })
+  expect(u.windows).toEqual([
+    { name: "Total credits", used: (100 * 545) / 1400, display: "545 / 1400 credits" },
+    { name: "Credits", used: 100, display: "300 / 300 credits", aside: true },
+    { name: "Add-on credits", used: (100 * 245) / 1100, display: "245 / 1100 credits", aside: true },
+  ])
+  // what routing counts: the windows not set aside
+  const counted = u.windows.filter((w) => !w.aside)
+  expect(counted.map((w) => Math.round(100 - w.used))).toEqual([61])
+})
+
+test("one pool alone is shown as before, with nothing set aside", () => {
+  // the owner's account (2026-10-28, read-only): a plan of 0 and add-on credits
+  const u = _internal.parseUsage({
+    displayMode: "qoder",
+    qoderUsage: {
+      userType: "personal_standard",
+      totalUsagePercentage: 0.02,
+      userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+      addOnQuota: { total: 600, used: 7, remaining: 593, percentage: 0.02, unit: "credits" },
+    },
+  })
+  expect(u.windows).toEqual([{ name: "Add-on credits", used: (100 * 7) / 600, display: "7 / 600 credits" }])
+})
+
+test("pools in different units are not added up", () => {
+  const u = _internal.parseUsage({
+    displayMode: "qoder",
+    qoderUsage: { userQuota: { total: 100, used: 100, unit: "tokens" }, addOnQuota: { total: 50, used: 0, unit: "credits" } },
+  })
+  expect(u.windows).toEqual([
+    { name: "Credits", used: 100, display: "100 / 100 tokens" },
+    { name: "Add-on credits", used: 0, display: "0 / 50 credits" },
+  ])
+})
+
 // the loader's fetch, as OpenCode's engine calls it, against a listing and
 // a chat reply
+// a refresh is answered with a new pair, counted in refreshes: a refused
+// job token is renewed once before the refusal is said (plugins#474)
 async function chat(listing, reply) {
   const auth = { ...account(), machineId: "m1", name: "One" }
-  globalThis.fetch = async (url) => {
+  const refreshes = []
+  globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url))
     if (u.pathname.endsWith("/model/list")) return json(listing)
+    if (u.pathname === "/api/v1/jobToken/refresh") {
+      refreshes.push(JSON.parse(init.body).refresh_token)
+      return json({ token: "jt-two", refresh_token: "rt-two", expires_in: 3_600_000 })
+    }
     return reply()
   }
   const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
   const l = await hooks.auth.loader(async () => auth)
-  return { fetch: l.fetch, hooks, auth }
+  return { fetch: l.fetch, hooks, auth, refreshes }
 }
 
 const LISTING = {
@@ -149,25 +207,29 @@ const LISTING = {
 
 const ASK = { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [{ role: "user", content: "hi" }] }) }
 
+// Refused again after the one renewal a refusal gets: the job token was
+// renewed (the account's mark comes off, as the built-in's renewal took it
+// off), and the refusal is said as the built-in's 401, never "expired".
 test("a refused chat, 401 or 403, is the built-in's 401 and leaves the account unmarked", async () => {
   for (const status of [401, 403]) {
-    const { fetch } = await chat(LISTING, () => new Response("", { status }))
+    const { fetch, refreshes } = await chat(LISTING, () => new Response("", { status }))
     const res = await fetch(API_CHAT, ASK)
     expect(res.status).toBe(401)
-    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
     expect((await res.json()).error.message).toBe("the sign-in lapsed — sign in again")
+    expect(refreshes).toEqual(["rt-one"])
   }
   // what Qoder says of the refusal is kept: a 401 just after signing in
   // has some other reason, and only Qoder's words tell it
   const said = await chat(LISTING, () => new Response(JSON.stringify({ message: "device not trusted" }), { status: 401 }))
   const r = await said.fetch(API_CHAT, ASK)
-  expect([r.status, r.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
+  expect([r.status, r.headers.get("X-Magpie-Sign-In")]).toEqual([401, "renewed"])
   expect((await r.json()).error.message).toBe("the sign-in lapsed — sign in again (Qoder said 401: device not trusted)")
   // refused in the stream, before any answer: the same
   const sse = (v) => new Response(`data: ${JSON.stringify(v)}\n\n`, { headers: { "Content-Type": "text/event-stream" } })
   const { fetch } = await chat(LISTING, () => sse({ statusCodeValue: 403, body: "" }))
   const res = await fetch(API_CHAT, ASK)
-  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "renewed"])
 })
 
 test("other refusals keep their status and say nothing of the sign-in", async () => {
@@ -475,4 +537,44 @@ test("a job token the models hook renewed is said renewed by the next answer", a
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
   const again = await l.fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "nomodel", messages: [] }) })
   expect(again.headers.get("X-Magpie-Sign-In")).toBe(null)
+})
+
+// Ariel on Discord: an international free account (personal_standard) signed
+// in but showed no credits. Its envelope is the owner's free account's
+// (2026-10-28, read-only) with no add-on credits: a plan of 0 beside add-on
+// credits of 0, or none at all. Qoder's client shows it 0/0, out of credits.
+test("a free account with no credits shows none left, not nothing", () => {
+  const free = (extra) => ({
+    displayMode: "qoder",
+    qoderUsage: {
+      userType: "personal_standard",
+      usageType: "credits",
+      totalUsagePercentage: 0,
+      isQuotaExceeded: true,
+      expiresAt: 253402214400000,
+      userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" },
+      ...extra,
+      isPlanQuotaProrated: false,
+    },
+  })
+  const none = [{ name: "Credits", used: 100, display: "0 credits left" }]
+  expect(_internal.parseUsage(free({})).windows).toEqual(none)
+  expect(_internal.parseUsage(free({ addOnQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "credits" } })).windows).toEqual(none)
+  // a pool that can't be read is no word that the account has none
+  expect(_internal.parseUsage({ displayMode: "qoder", qoderUsage: { userType: "personal_standard", userQuota: { total: "0" } } }).windows).toEqual([])
+  expect(_internal.parseUsage({ displayMode: "qoder", qoderUsage: { userType: "personal_standard" } }).windows).toEqual([])
+})
+
+test("usage's user is the card's name, and the accountId stays the identity (review #487, round 3)", async () => {
+  let auth = { ...account(), accountId: "one@x", cardName: "138****8000", phoneLabel: "138****8000" }
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url))
+    if (u.pathname === "/sash/api/v2/me/usage") return json(USAGE)
+    if (u.pathname === "/api/v1/deviceToken/refresh") return json({ token: "dt-new", refresh_token: "drt-new" })
+    return new Response("", { status: 404 })
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async ({ body }) => (auth = body) } } })
+  const u = await hooks.auth.usage(async () => auth)
+  expect(u.user).toBe("138****8000")
+  expect(auth.accountId).toBe("one@x")
 })

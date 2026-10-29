@@ -35,9 +35,21 @@ magpie's (or OpenCode's) own account store. `auth.refresh` renews it 30 minutes 
 expires, reusing the same verifier and DPoP key; a stale credential met on a request
 (`401`, `APIG.0602`) is renewed once and the request sent again. A refresh token is spent once
 per account, however many loaders ask; a renewal that only fails for now (STS unreachable)
-answers `503` and keeps the sign-in, and only one STS turns away for good marks it. The
-account id is the signer named in the refresh token, so signing in again replaces the account
-instead of adding one.
+answers `503` and keeps the sign-in, and only one STS turns away for good marks it.
+
+**The card's name:** the account is shown by its **phone number** (`138****8000`, masked the way
+the other magpie cards mask theirs), read once after signing in from Huawei Cloud IAM —
+`GET https://iam.cn-north-4.myhuaweicloud.com/v3.0/OS-USER/users/{principal_id}`, signed with
+the same temporary credentials — and kept on the credential as `user_phone`. The refresh token
+names the signer only by IAM's own ids (`hw12323`, and the URN
+`iam::<domain>:user:<name>`), which read as an ID nobody can tell apart from another account's;
+the account name is the fallback when the phone can't be read, and the URN never is.
+
+`accountId` is the account's identity — the URN, as before — and it never changes: magpie
+keys the user's own name for the account, its proxy, model picks and a gateway key's list by
+it, so a re-sign-in and a renewal give the same value back. The card's name is usage's `user`,
+which shows `user_phone` once a sign-in or renewal has read it. IAM is *not* one of the hosts the plugin signs forwarded requests for
+(`SIGNED_HOSTS`): the one phone read is made by the plugin itself, for that one URL.
 
 ## Models
 
@@ -58,7 +70,10 @@ signing in, a short built-in catalog stands in.
   `x-ot-session-id`; the plugin sends one stable session id per account (and a fresh trace per
   request) like the client, keeps at most 3 chats in flight per account, retries
   `TM.00001041` with backoff, and waits in the gateway's own queue (`429` +
-  `queue-status: queued`) the way the client does. Only then does magpie get a `429`.
+  `queue-status: queued`) the way the client does. Only then does magpie get a `429`. Since
+  0.2.3, when magpie has another candidate after this request (`x-magpie-fallback: 1`), a queued
+  request leaves the queue at once and answers `503` with the queue's `Retry-After`
+  ("CodeArts queued the request; try again in 20s"), and magpie asks the next.
 - Chats always go upstream as streams — CodeArts meters only streamed answers — and are folded
   back into one `chat.completion` when the caller asked for JSON.
 - `thinking: { type: "enabled" }` is sent unless the caller set it, so the reasoning lands in
@@ -66,6 +81,14 @@ signing in, a short built-in catalog stands in.
 - Errors the gateway puts inside a `200` stream (spent quota, unknown model) come back as
   `429` / `400` / `502` with the vendor's words. The `codearts/` prefix is stripped and output
   budgets are clamped to 65536.
+- CodeArts takes tool names of up to 64 characters. A longer one (an MCP tool such as
+  `mcp__plugin_android-emulator_android-emulator__android_discover_project`) goes as its first
+  55 characters, `_` and 8 hex of its SHA-256, and the tool calls in the answer, streamed or
+  not, carry the agent's own name again.
+- Every model is listed as text only (`modalities.input: ["text"]`, `image: false`): CodeArts
+  answers an image with `InferHub.001001020.406` "The request model is not multimodal". Since
+  0.2.4 magpie is told so, and describes an image for the model or leaves it out. That refusal,
+  inside a `200` or with any status, comes back as a `400`, not a `502` an agent would ask again.
 
 ## Usage and check-in
 
@@ -119,9 +142,12 @@ magpie 里使用其 GLM、DeepSeek、openPangu 等模型。provider id：`codear
   客户端一致；当天还没领取时遇到 `benefit not found` 也会先领取再重发）。每个模型的「消耗系数」作为 magpie 的倍率上报，来自账号主智能体（`build`）的模型列表。
 - **请求**：SDK-HMAC-SHA256 签名，只签给码道自己的两个主机（`snap-access.cn-north-4.myhuaweicloud.com`、
   `opengw.developer.huaweicloud.com`），发往其他地址（如改过的 `api`）的请求在凭据发出前就被拒绝，签名请求和令牌请求都不跟随重定向；像客户端一样发送 `x-ot-session-id` 会话头（每账号一个会话），账号内
-  在途请求不超过 3 个，`TM.00001041` 退避重试，网关排队时按客户端的方式等待；总是以流式请求上游（码道
+  在途请求不超过 3 个，`TM.00001041` 退避重试，网关排队时按客户端的方式等待（0.2.3 起，magpie 在这个请求之后还有别的账号、供应商或路由组成员时（`x-magpie-fallback: 1`），排队的请求立即退出队列并以 `503` 加队列的 `Retry-After` 回答，magpie 随即改问下一个）；总是以流式请求上游（码道
   只对流式回答计量积分），调用方要非流式时折叠回 JSON；默认注入 `thinking: { type: "enabled" }`，思考与
-  正文分开；200 里内嵌的错误换算为 `429` / `400` / `502` 并带厂商原话。
+  正文分开；200 里内嵌的错误换算为 `429` / `400` / `502` 并带厂商原话；码道只接受不超过 64 个字符的工具名，
+  更长的（如 MCP 工具名）发出时缩为前 55 个字符 + `_` + 8 位 SHA-256，回答（流式与非流式）里的工具调用再换回原名。
+  0.2.4 起所有模型都声明为只收文本（码道对图片回 `InferHub.001001020.406`「The request model is not multimodal」），
+  magpie 会替模型描述图片或把图片略去；这个拒绝不论放在 200 里还是带别的状态码，都换算为 `400`，而不是让智能体反复重试的 `502`。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
   （这部分仍在用更多账号验证，请以控制台为准）。`auth.checkin` 与客户端「限时福利 → 每日领取」一致

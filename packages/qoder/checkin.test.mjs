@@ -412,3 +412,36 @@ test("another page on the openapi host is still refused", async () => {
   expect(res.status).toBe(404)
   expect(p.seen).toEqual([])
 })
+
+// plugins#443: Qoder's client puts its native identity's machine token and
+// type on a chat too. A chat uses one the check-in already read, and never
+// runs the identity helper itself.
+test("a chat carries the device identity a check-in read, and runs no helper of its own", async () => {
+  const line = (body) => `data:${JSON.stringify({ headers: {}, body: JSON.stringify(body), statusCodeValue: 200 })}\n\n`
+  const chats = []
+  const p = await loader(QoderAuthPlugin, (u, init) => {
+    if (u.pathname.endsWith("/model/list")) return json({ chat: [{ key: "dfmodel", display_name: "DeepSeek Flash", enable: true }] })
+    if (u.pathname.includes("/agent_chat_generation")) {
+      chats.push(init.headers)
+      return new Response(line({ choices: [{ delta: { content: "ok" } }] }) + line({ choices: [{ delta: {}, finish_reason: "stop" }] }), { headers: { "Content-Type": "text/event-stream" } })
+    }
+    return json(LIST)
+  }, { machineId: "m1" })
+  const chat = async () => {
+    const res = await p.fetch("https://api3.qoder.sh/v1/chat/completions", { method: "POST", body: JSON.stringify({ model: "dfmodel", messages: [{ role: "user", content: "hi" }] }) })
+    expect(res.status).toBe(200)
+    await res.text()
+  }
+  await chat()
+  expect(reads).toHaveLength(0)
+  expect(chats[0]["Cosy-MachineToken"]).toBeUndefined()
+  expect(chats[0]["Cosy-ClientIp"]).toBeUndefined()
+  expect((await p.fetch(CAMPAIGN_URL)).status).toBe(200)
+  expect(reads).toHaveLength(1)
+  await chat()
+  expect(reads).toHaveLength(1)
+  expect(chats[1]["Cosy-MachineToken"]).toBe("sdk-token-u1")
+  expect(chats[1]["Cosy-MachineType"]).toBe(MACHINE_TYPE)
+  expect(chats[1]["Cosy-MachineId"]).toBe("m1")
+  expect(chats[1]["Cosy-ClientIp"]).toBeUndefined()
+})

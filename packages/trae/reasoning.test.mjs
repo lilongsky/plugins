@@ -50,6 +50,42 @@ test("an entry's levels are offered as the variants agents pick, named as OpenCo
   expect(m.capabilities.reasoning).toBe(true)
 })
 
+// Trae's client names five levels (its bundle's
+// reasoning_effort.{low,medium,high,extra_high,max}), handed out per model.
+// A list naming max beside light/high/extra_high lost it, so no agent could
+// pick it. (#434's "max" turned out to be the app's 1M-window Max switch,
+// deepseek-v4.1-flash-max; its levels are light/high/extra_high alone.)
+test("max and medium an entry names are offered and sent as Trae names them (#434)", async () => {
+  expect(levelsOf({ reasoning_effort_config: { options: ["light", "high", "extra_high", "max"] } })).toEqual(["low", "high", "xhigh", "max"])
+  expect(levelsOf({ reasoning_effort_config: { options: ["light", "medium", "high"] } })).toEqual(["low", "medium", "high"])
+  const ms = await live([entry("deepseek-v4.1-flash", ["light", "high", "extra_high", "max"], { default_level: "high" })])
+  expect(Object.keys(ms["deepseek-v4.1-flash"].variants)).toEqual(["low", "high", "xhigh", "max"])
+  expect(ms["deepseek-v4.1-flash"].variants.max).toEqual({ reasoningEffort: "max" })
+  const req = (effort) => ({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], reasoning_effort: effort })
+  const levels = ["low", "medium", "high", "xhigh", "max"]
+  expect(chatBody(req("max"), "chat_v3", "", 0, null, "s", false, levels).reasoning_effort).toBe("max")
+  expect(chatBody(req("medium"), "chat_v3", "", 0, null, "s", false, levels).reasoning_effort).toBe("medium")
+  // a model that names no max still sends nothing for it
+  expect(chatBody(req("max"), "chat_v3", "", 0, null, "s", false, ["low", "high", "xhigh"]).reasoning_effort).toBeUndefined()
+})
+
+test("max reaches Trae's request for a model whose entry names it (#434)", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json({ function_configs: [
+    { function: "chat_v3", config_info_list: [entry("deepseek-v4.1-flash", ["light", "high", "extra_high", "max"], { default_level: "high" })] },
+  ] }))
+  f.route("POST /api/agent/v3/llm_utils_chat", () => sse([["output", { content: "ok" }], ["finish", { finish_reason: "stop" }]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const opts = await hooks.auth.loader(async () => signedIn())
+  await opts.fetch(opts.baseURL + "/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" }),
+  })
+  const sent = f.seen.find((r) => r.path === "/api/agent/v3/llm_utils_chat")
+  expect(sent.json.reasoning_effort).toBe("max")
+})
+
 test("an entry with no levels carries no variants: Trae serves it at its own default", async () => {
   const ms = await live([entry("glm-5.3", undefined)])
   expect(ms["glm-5.3"].variants).toEqual({})

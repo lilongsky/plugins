@@ -330,7 +330,10 @@ test("an HTTP error with no Connect error of its own keeps its status: 401 from 
   expect((await ask(fresh(), base)).status).toBe(429)
 })
 
-test("appends go up one at a time, numbered in order, a slow one holding the rest", async () => {
+test("appends go up numbered in order, up to H1.atOnce at a time, as cursor-agent sends them", async () => {
+  // one at a time, a new Run's history took a round trip to Cursor a
+  // message before the model could start (ysm119 on Discord)
+  const sent = []
   const got = []
   let inFlight = 0
   let most = 0
@@ -340,9 +343,10 @@ test("appends go up one at a time, numbered in order, a slow one holding the res
     if (u.endsWith("/aiserver.v1.BidiService/BidiAppend")) {
       const f = fields(Buffer.from(init.body))
       const seqno = f.find((x) => x.num === 3)?.n ?? 0
+      sent.push(seqno)
       inFlight++
       most = Math.max(most, inFlight)
-      if (seqno === 0) await new Promise((r) => setTimeout(r, 150)) // the first one slow
+      await new Promise((r) => setTimeout(r, seqno === 0 ? 150 : 20)) // a round trip each, the first one slow
       got.push({ seqno, data: Buffer.from(f.find((x) => x.num === 1).data.toString(), "hex").toString() })
       inFlight--
       return new Response(new Uint8Array(0), { headers: { "content-type": "application/proto" } })
@@ -350,16 +354,17 @@ test("appends go up one at a time, numbered in order, a slow one holding the res
     throw new Error("the test asked " + u)
   }
   const o = await openH1({ "x-request-id": "r-1", authorization: "Bearer t" })
-  for (const m of ["first", "blob 1", "blob 2", "blob 3"]) o.req.write(frame(Buffer.from(m)))
-  for (let i = 0; i < 100 && got.length < 4; i++) await new Promise((r) => setTimeout(r, 10))
+  const msgs = ["first", ...Array.from({ length: 39 }, (_, i) => "blob " + (i + 1))]
+  for (const m of msgs) o.req.write(frame(Buffer.from(m)))
+  for (let i = 0; i < 500 && got.length < msgs.length; i++) await new Promise((r) => setTimeout(r, 10))
   o.session.close()
-  expect(got).toEqual([
-    { seqno: 0, data: "first" },
-    { seqno: 1, data: "blob 1" },
-    { seqno: 2, data: "blob 2" },
-    { seqno: 3, data: "blob 3" },
-  ])
-  expect(most).toBe(1)
+  // each message once, numbered as written, asked in that order
+  expect(sent).toEqual(msgs.map((_, i) => i))
+  expect(got.sort((a, b) => a.seqno - b.seqno)).toEqual(msgs.map((data, seqno) => ({ seqno, data })))
+  // more than one on its way at once, never more than cursor-agent's 16
+  expect(most).toBeGreaterThan(1)
+  expect(most).toBeLessThanOrEqual(H1.atOnce)
+  expect(H1.atOnce).toBe(16)
 })
 
 test("a Run cancelled while HTTP/2 opens is not counted as HTTP/2 failing", async () => {

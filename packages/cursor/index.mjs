@@ -117,6 +117,68 @@ function authFile() {
   return join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "cursor", "auth.json")
 }
 
+// cliConfigFile is cursor-agent's cli-config.json, where it keeps the team
+// it signed in to (authInfo.activeTeamId); its directory found as the CLI
+// finds it, on every OS.
+function cliConfigFile() {
+  const dir = process.env.CURSOR_CONFIG_DIR?.trim()
+    || (process.env.XDG_CONFIG_HOME?.trim() ? join(process.env.XDG_CONFIG_HOME, "cursor") : join(homedir(), ".cursor"))
+  return join(dir, "cli-config.json")
+}
+
+// tokenSub is a JWT's subject (the auth id, "auth0|user_…"); "" when it
+// doesn't say.
+function tokenSub(tok) {
+  const parts = String(tok ?? "").split(".")
+  if (parts.length !== 3) return ""
+  try {
+    const sub = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"))?.sub
+    return typeof sub === "string" ? sub : ""
+  } catch {
+    return ""
+  }
+}
+
+const teamOf = (v) => (Number.isSafeInteger(v) && v > 0 ? v : undefined)
+
+// activeTeamId is the team a request is billed to, as cursor-agent sends it
+// (x-cursor-team-id): cli-config.json's authInfo.activeTeamId. Without it
+// Cursor takes the token's default team, which in an organization may be one
+// with on-demand spend turned off ("Team budget limit reached"). The config's
+// team is only taken for the account cursor-agent signed in to: a token
+// whose subject isn't its authInfo.authId, or a config with none, gets none.
+// Read again after 10 s; cursor-agent rewrites the file in place, so a read
+// that fails to parse keeps the last one, and only a missing file clears it.
+const TEAM_TTL = 10_000
+const teamRead = { at: 0, info: null }
+async function activeTeamId(tok) {
+  if (Date.now() - teamRead.at >= TEAM_TTL) {
+    try {
+      teamRead.info = JSON.parse(await readFile(cliConfigFile(), "utf8"))?.authInfo ?? null
+    } catch (e) {
+      if (e?.code === "ENOENT") teamRead.info = null
+    }
+    teamRead.at = Date.now()
+  }
+  const info = teamRead.info
+  if (!info) return undefined
+  if (!info.authId || info.authId !== tokenSub(tok)) return undefined
+  return teamOf(info.activeTeamId)
+}
+
+// teamHeader names that team in a request's headers, and teamBody in
+// GetFilteredUsageEvents' body; neither says anything when there is none.
+// GetHardLimit and GetCurrentPeriodUsage go out with "{}", as cursor-agent
+// sends them: the team rides in the header only.
+async function teamHeader(tok) {
+  const id = await activeTeamId(tok)
+  return id ? { "x-cursor-team-id": String(id) } : {}
+}
+async function teamBody(tok) {
+  const id = await activeTeamId(tok)
+  return id ? { teamId: id } : {}
+}
+
 // TOKEN_TTL is how long a token read from the Keychain is taken as it: a
 // sign-in reads it afresh, one made in cursor-agent is seen within it.
 // KEYCHAIN_DENIED is how long a read the user may have been asked about,
@@ -218,6 +280,7 @@ async function headersFor(tok) {
     "x-cursor-client-version": await clientVersion(),
     "x-cursor-client-type": "cli",
     "x-ghost-mode": "true",
+    ...await teamHeader(tok),
   }
 }
 
@@ -253,18 +316,27 @@ async function whoIs(tok) {
 
 // plans are the plan each token's account is on, as `cursor-agent about`
 // names it (GetPlanInfo's planName, magpie's card title), asked again after
-// an hour.
+// an hour. merged is GetPlanInfo's isMerged: a plan of Cursor's merged
+// (xAI) billing, whose included usage is one allowance for every model,
+// most of them a week long (includedUsagePeriod), and has no Other Models
+// pool (majiang_ai on X). The dashboard's usage page shows such a plan one
+// meter, the period's totalPercentUsed. period is "weekly", "monthly" or
+// "" (not said). A reply that couldn't be read keeps the last one, else
+// says nothing: undefined merged, which the pools are kept for.
 const plans = new Map()
 const PLAN_TTL = 3600_000
+const PERIODS = { INCLUDED_USAGE_PERIOD_WEEKLY: "weekly", INCLUDED_USAGE_PERIOD_MONTHLY: "monthly", 1: "monthly", 2: "weekly" }
 async function planOf(tok) {
   const had = plans.get(tok)
-  if (had && Date.now() - had.at < PLAN_TTL) return had.plan
+  if (had && Date.now() - had.at < PLAN_TTL) return had
   try {
-    const plan = String((await unary(API, "aiserver.v1.DashboardService/GetPlanInfo", tok))?.planInfo?.planName ?? "").trim()
-    if (plan) plans.set(tok, { plan, at: Date.now() })
-    return plan || had?.plan || ""
+    const info = await unary(API, "aiserver.v1.DashboardService/GetPlanInfo", tok)
+    const plan = String(info?.planInfo?.planName ?? "").trim()
+    const got = { plan: plan || had?.plan || "", merged: info?.isMerged === true, period: PERIODS[info?.planInfo?.includedUsagePeriod] ?? "", at: Date.now() }
+    if (plan || got.merged) plans.set(tok, got)
+    return got
   } catch {
-    return had?.plan ?? ""
+    return had ?? { plan: "" }
   }
 }
 
@@ -456,7 +528,7 @@ async function hardLimit(tok) {
   try {
     const res = await fetch(API + "/aiserver.v1.DashboardService/GetHardLimit", {
       method: "POST",
-      headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+      headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1", ...await teamHeader(tok) },
       body: "{}",
       signal: AbortSignal.timeout(15_000),
     })
@@ -469,19 +541,98 @@ async function hardLimit(tok) {
 // dollars, thousands grouped: a team's pool runs to six figures ($451,200.00)
 const dollars = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
-// usage is the account's windows this billing period; an enterprise plan
-// reports spend instead, and gets none. ids are the models it can be
-// asked for, each counted by the pool Cursor bills it to. An account that
-// may spend on-demand once its included usage is gone (fottencity on
+// INCLUDED_ONLY is the switch (magpie's plugin options, off by default)
+// that keeps an account in routing only while its included usage lasts
+// (magpie-community/plugins#485): on, the included pools (Cursor Models and
+// Other Models; an Enterprise account's allowance) are what stops it, and
+// On-demand and Total are shown only, a budget with room or none at all
+// keeping nothing in routing. Off, on-demand that can still pay keeps it.
+const INCLUDED_ONLY = "included_only"
+
+// enterpriseUsage is the allowance GetCurrentPeriodUsage leaves out on an
+// Enterprise account. That call answers with only the billing cycle there;
+// the website's usage-summary has individualUsage.overall, in cents, and
+// the account's membership. The CLI JWT is also the website's dashboard
+// session, as botUsage builds it. undefined when the summary says nothing
+// this can show, so a failed read stays an empty card, as before.
+async function enterpriseUsage(tok, includedOnly = false) {
+  try {
+    const subject = JSON.parse(Buffer.from(tok.split(".")[1], "base64url").toString()).sub
+    if (typeof subject !== "string") return undefined
+    const user = subject.split("|").filter(Boolean).at(-1)
+    if (!user || !/^[a-zA-Z0-9._-]+$/.test(user)) return undefined
+    const res = await fetch(WEBSITE + "/api/usage-summary", {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Origin: WEBSITE,
+        Cookie: "WorkosCursorSessionToken=" + encodeURIComponent(user + "::" + tok),
+      },
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!res.ok) return undefined
+    const data = await res.json()
+    if (String(data?.membershipType).toLowerCase() !== "enterprise") return undefined
+    const overall = data?.individualUsage?.overall
+    if (overall?.enabled !== true) return undefined
+    const { used, limit } = overall
+    if (typeof used !== "number" || !Number.isFinite(used) || used < 0) return undefined
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) return undefined
+    const end = Date.parse(data.billingCycleEnd ?? "")
+    const resets = Number.isFinite(end) ? { resetsAt: new Date(end).toISOString() } : {}
+    const od = data.teamUsage?.onDemand
+    const spent = typeof od?.used === "number" && Number.isFinite(od.used) && od.used >= 0
+    const unlimited = od?.enabled === true && od.limit === null
+    const fixed = od?.enabled === true && typeof od.limit === "number" && Number.isFinite(od.limit) && od.limit > 0 && spent
+    // Only an explicitly unlimited budget or a measured budget with room
+    // lets a spent included allowance stay available to magpie's routing,
+    // and neither does with INCLUDED_ONLY on.
+    const aside = !includedOnly && (unlimited || (fixed && od.used < od.limit))
+    const windows = [{
+      name: "Enterprise",
+      used: Math.max(0, Math.min(100, (100 * used) / limit)),
+      display: `${dollars(used / 100)} / ${dollars(limit / 100)}`,
+      amount: used / 100,
+      limit: limit / 100,
+      unit: "USD",
+      ...resets,
+      ...(aside ? { aside: true } : {}),
+    }]
+    if (fixed) windows.push({
+      name: "On-demand",
+      used: Math.min(100, (100 * od.used) / od.limit),
+      display: `${dollars(od.used / 100)} / ${dollars(od.limit / 100)}`,
+      amount: od.used / 100,
+      limit: od.limit / 100,
+      unit: "USD",
+      ...resets,
+      ...(includedOnly ? { aside: true } : {}),
+    })
+    else if (unlimited && spent) windows.push({ name: "On-demand", used: 0, display: dollars(od.used / 100), ...resets, aside: true })
+    return windows
+  } catch {
+    return undefined
+  }
+}
+
+// usage is the account's windows this billing period. ids are the models it
+// can be asked for, each counted by the pool Cursor bills it to. An account
+// that may spend on-demand once its included usage is gone (fottencity on
 // Discord: a team that pays for more) is still served when the pools are
 // spent, so they are shown aside, and its On-demand spend is what can run
 // out: at its limit (a team member with none of their own: the team's
-// pool), or never when it has none.
-async function usage(tok, ids) {
+// pool), or never when it has none. With includedOnly (INCLUDED_ONLY on)
+// the pools are the allowance whatever on-demand allows, and On-demand is
+// shown only. An Enterprise account's period has no planUsage; its
+// allowance comes from usage-summary instead.
+// plan is planOf's answer, asked alongside (a promise): a merged plan's
+// included usage is one window, Weekly on a weekly plan, for every model.
+async function usage(tok, ids, includedOnly = false, plan = undefined) {
   const [res, hard] = await Promise.all([
     fetch(API + "/aiserver.v1.DashboardService/GetCurrentPeriodUsage", {
       method: "POST",
-      headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+      headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1", ...await teamHeader(tok) },
       body: "{}",
       signal: AbortSignal.timeout(15_000),
     }),
@@ -490,7 +641,11 @@ async function usage(tok, ids) {
   if (!res.ok) return { error: statusText(res.status), windows: [] }
   const data = await res.json()
   const u = data?.planUsage
-  if (!u) return { windows: [] }
+  if (!u) {
+    // Prefer measured Enterprise usage before any reset-date-only fallback.
+    const windows = await enterpriseUsage(tok, includedOnly)
+    return windows ? { windows } : { windows: [] }
+  }
   const ms = /^[+-]?\d+$/.test(data.billingCycleEnd ?? "") ? Number(data.billingCycleEnd) : 0
   const resets = ms > 0 ? { resetsAt: new Date(ms).toISOString() } : {}
   const bucket = new Set((data.autoBucketModels ?? []).map(poolBase))
@@ -510,13 +665,26 @@ async function usage(tok, ids) {
   const pool = [...new Set(["auto", ...asked, ...(data.autoBucketModels ?? [])])].filter(inPool)
   const num = (v) => (typeof v === "number" ? v : 0)
   const od = onDemandOf(data, hard)
-  const pooled = od.kind === "fixed" || od.kind === "unlimited" ? { aside: true } : {}
+  const pooled = !includedOnly && (od.kind === "fixed" || od.kind === "unlimited") ? { aside: true } : {}
   const onDemand =
     od.kind === "fixed"
-      ? [{ name: "On-demand", used: Math.max(0, Math.min(100, (100 * od.usedDollars) / od.limitDollars)), display: `${dollars(od.usedDollars)} / ${dollars(od.limitDollars)}` + (od.mineDollars === undefined ? "" : ` (you: ${dollars(od.mineDollars)})`), ...resets }]
+      ? [{ name: "On-demand", used: Math.max(0, Math.min(100, (100 * od.usedDollars) / od.limitDollars)), display: `${dollars(od.usedDollars)} / ${dollars(od.limitDollars)}` + (od.mineDollars === undefined ? "" : ` (you: ${dollars(od.mineDollars)})`), ...resets, ...(includedOnly ? { aside: true } : {}) }]
       : od.kind === "unlimited"
         ? [{ name: "On-demand", used: 0, display: dollars(od.usedDollars), ...resets, aside: true }]
         : []
+  // A merged plan has no pools: its included usage is one allowance every
+  // model draws on, which the dashboard shows as the period's
+  // totalPercentUsed, autoPercentUsed the same and apiPercentUsed 0 always.
+  const info = await plan
+  if (info?.merged === true) {
+    const weekly = info.period === "weekly"
+    return {
+      windows: [
+        { name: weekly ? "Weekly" : info.period === "monthly" ? "Monthly" : "Included", used: num(u.totalPercentUsed), ...resets, ...(weekly ? { span: 604800 } : {}), ...pooled },
+        ...onDemand,
+      ],
+    }
+  }
   // the two pools fit the line; the total goes in its tooltip
   return {
     windows: [
@@ -672,12 +840,89 @@ function served(m, ids) {
   return got.some((v) => v.legacySlug) ? got : vs
 }
 
+// familyOf is the family one of Cursor's own ids is of, fast or not:
+// claude-opus-5-5-low-fast is of claude-opus-5-5, at low, fast.
+function familyOf(id) {
+  let [family, effort] = splitID(id)
+  const fast = family.endsWith("-fast") && family.length > "-fast".length
+  if (fast) family = family.slice(0, -"-fast".length)
+  return { family, effort, fast }
+}
+
+// familiesOf is the usable list (GetUsableModels, what cursor-agent models
+// shows: claude-opus-5-5-low, claude-opus-5-5-low-fast, …) by family: each
+// id with its effort, whether it is fast, whether Cursor runs it in Max
+// Mode, and its name.
+function familiesOf(listed) {
+  const fams = new Map()
+  for (const u of listed ?? []) {
+    const id = String(u?.modelId ?? "")
+    if (!id) continue
+    const { family, effort, fast } = familyOf(id)
+    if (!fams.has(family)) fams.set(family, [])
+    fams.get(family).push({ id, effort, fast, maxMode: u.maxMode === true, name: clean(u.displayName || id) })
+  }
+  return fams
+}
+
+// fromUsable is the id of a family of the usable list's that a request
+// runs as: fast as asked (when the family has both), at the effort asked or
+// the nearest it has; with none asked, the one without an effort in its
+// id, else medium, as Cursor's default is (claude-opus-5-5-medium), else
+// the first.
+function fromUsable(fam, effort, fast) {
+  let vs = fam.filter((u) => u.fast === !!fast)
+  if (!vs.length) vs = fam
+  if (effort === "off") effort = "none"
+  const at = effort ? fitEffort(effort, vs.map((u) => u.effort).filter(Boolean)) : ""
+  return (at && vs.find((u) => u.effort === at)) || vs.find((u) => u.effort === "") || vs.find((u) => u.effort === "medium") || vs[0]
+}
+
+// usableTitle is a usable id's name without what the id says apart: its
+// effort, fast, and the 1M Cursor names every Max-capable Claude with
+// ("Claude Opus 5.5 1M Low" is Claude Opus 5.5), wherever Cursor puts
+// them: "Claude Opus 5 1M Medium Thinking" is Claude Opus 5 Thinking, as
+// its efforts are magpie's reasoning levels and not models of their own
+// (ysm119 on Discord read "Medium" in the name as the only tier). A word
+// of the model's own name stays: GPT-5.1 Codex Max at high is "GPT-5.1
+// Codex Max".
+const EFFORT_WORDS = { none: ["None"], minimal: ["Minimal"], low: ["Low"], medium: ["Medium"], high: ["High"], xhigh: ["Extra High", "XHigh"], max: ["Max"] }
+function usableTitle(u) {
+  const ws = u.name.split(" ")
+  // the last time a phrase is said, past the name's first word
+  const cutLast = (phrase) => {
+    const p = phrase.toLowerCase().split(" ")
+    for (let i = ws.length - p.length; i >= 1; i--) {
+      if (p.every((w, k) => ws[i + k].toLowerCase() === w)) {
+        ws.splice(i, p.length)
+        return true
+      }
+    }
+    return false
+  }
+  for (const p of EFFORT_WORDS[u.effort] ?? []) if (cutLast(p)) break
+  if (u.fast) cutLast("fast")
+  return ws.filter((w, i) => i === 0 || !/^\(?1m\)?$/i.test(w)).join(" ") || u.name
+}
+
 // modelsOf is the picker's models as offered: one entry for each context
 // size a model has, or one with Cursor's limit when it has none. A model
 // served in part is offered at the sizes and efforts it is served at.
-function modelsOf(picker, ids) {
+// listed is the usable list: a family of its ids the picker has nothing of
+// (a Team's picker can leave out what cursor-agent models lists, magpie
+// #3150 ysm119 on Discord) is offered too, once, with its efforts, and each
+// entry keeps its family's usable ids, so a request goes as one of those
+// and never as a name Cursor would answer "AI Model Not Found".
+function modelsOf(picker, ids, listed = []) {
   const out = []
   const used = new Set()
+  const fams = familiesOf(listed)
+  // every id the picker names at all, shown or left out
+  const named = new Set()
+  for (const m of picker) {
+    if (!m?.name) continue
+    for (const x of [m.name, ...(m.legacySlugs ?? []), ...(m.idAliases ?? []), ...(m.variants ?? []).map((v) => v.legacySlug)]) if (x) named.add(x)
+  }
   for (const m of picker) {
     if (!m?.name || m.isHidden || m.isChatOnly || m.onlySupportsCmdK || m.supportsAgent === false || PICKER_SKIP.has(m.name)) continue
     const defs = paramDefs(m)
@@ -687,7 +932,15 @@ function modelsOf(picker, ids) {
     const def = defaultVariant({ variants })
     const { pid, levels: all } = effortsOf(defs)
     const levels = Object.fromEntries(Object.entries(all).filter(([, value]) => has(pid, value)))
-    const base = { run: m.name, title: clean(m.clientDisplayName || m.name), pid, levels, fast: !!defs.fast?.length, variants, def, partial, model: m }
+    // the usable ids of its default's family, else of the same model with
+    // thinking or without it: a Team's picker can default Claude Haiku 5.5
+    // to thinking while cursor-agent lists it as claude-haiku-5-5 alone
+    // (ysm119 on Discord, after 0.2.25), and a variant id it lacks is then
+    // asked as that one, as named() takes such an id
+    const own = familyOf(def?.legacySlug || m.name).family
+    const bare = own.replace(/-thinking$/, "")
+    const fam = fams.get(own) ?? fams.get(bare) ?? fams.get(bare + "-thinking") ?? []
+    const base = { run: m.name, title: clean(m.clientDisplayName || m.name), pid, levels, fast: !!defs.fast?.length, variants, def, partial, model: m, fam, ids }
     const contexts = (defs.context ?? []).filter((c) => has("context", c))
     if (contexts.length) {
       for (const c of contexts) {
@@ -701,6 +954,15 @@ function modelsOf(picker, ids) {
       const limit = needsMax(m, def) ? m.contextTokenLimitForMaxMode || m.contextTokenLimit : m.contextTokenLimit
       out.push({ ...base, id: m.name === "default" ? "auto" : m.name, name: base.title, context: limit > 0 ? limit : DEFAULT_CONTEXT, size: "", offersFast: fastAt(variants, "") })
     }
+  }
+  for (const [family, fam] of fams) {
+    if (fam.some((u) => named.has(u.id)) || named.has(family) || used.has(family)) continue
+    used.add(family)
+    const levels = Object.fromEntries(fam.filter((u) => LEVEL_RANK.includes(u.effort)).map((u) => [u.effort, u.effort]))
+    const def = fromUsable(fam, "", false)
+    // Cursor's context for it isn't known: its default's, as for a model
+    // the picker gives no limit for
+    out.push({ id: family, run: family, name: usableTitle(def), title: usableTitle(def), pid: "", levels, fast: false, variants: [], def: undefined, partial: false, model: { name: family }, fam, ids, usableOnly: true, context: DEFAULT_CONTEXT, size: "", offersFast: fam.some((u) => u.fast) })
   }
   return out
 }
@@ -734,6 +996,11 @@ function nearest(vs, want) {
 // variant the account has. seed is the variant an id of Cursor's own named
 // (request), in the default's place.
 function pick(entry, effort, fast, seed) {
+  // a family the usable list has and the picker doesn't: its own id
+  if (entry.usableOnly) {
+    const u = fromUsable(entry.fam, effort, fast)
+    return { id: u.id, params: [], maxMode: u.maxMode }
+  }
   const def = entry.def
   const want = { ...valuesOf(seed ?? def) }
   if (entry.size) want.context = entry.size
@@ -761,6 +1028,14 @@ function pick(entry, effort, fast, seed) {
   // cursor-agent models lists it: claude-opus-5-5-high), not the picker's
   // model name; the default's when no variant matched
   const id = v?.legacySlug || def?.legacySlug || entry.run
+  // an id the usable list doesn't have, when it has the family's (a
+  // picker model without variants goes by its name, claude-opus-5-5,
+  // which Cursor doesn't serve): the family's usable id at the effort
+  if (entry.ids && !entry.ids.has(id) && entry.fam?.length) {
+    const level = entry.pid && entry.pid !== "thinking" ? String(want[entry.pid] ?? "").replace("extra-high", "xhigh") : ""
+    const u = fromUsable(entry.fam, effort || level, fast)
+    return { id: u.id, params: [], maxMode: maxMode || u.maxMode }
+  }
   return { id, params, maxMode }
 }
 
@@ -811,24 +1086,66 @@ function fitEffort(want, levels) {
 // can't give is a failure: magpie keeps the list it had. A usable list it
 // can't give leaves the picker as it is.
 const lists = new Map()
+// listings are the lists being asked for now, by token: callers at once
+// share one ask; listFailed when a token's last ask failed
+const listings = new Map()
+const listFailed = new Map()
 async function usable(tok) {
   const h = createHash("sha256").update(tok).digest("hex")
   const had = lists.get(h)
   if (had && Date.now() - had.at < MODELS_KEEP) return had.raw
-  const [j, ids] = await Promise.all([
-    unary(API, "aiserver.v1.AiService/AvailableModels", tok, { useModelParameters: true, doNotUseMarkdown: true }, 30_000),
-    unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 8_000).then(
-      (u) => {
-        const ids = new Set((u?.models ?? []).flatMap((m) => [m.modelId, m.displayModelId]).filter(Boolean))
-        return ids.size ? ids : null
-      },
-      () => null,
-    ),
-  ])
-  const raw = modelsOf(Array.isArray(j?.models) ? j.models : [], ids)
-  if (!raw.length) throw new Error("Cursor listed no models")
-  lists.set(h, { at: Date.now(), raw })
-  return raw
+  return listing(tok, h)
+}
+function listing(tok, h) {
+  let p = listings.get(h)
+  if (p) return p
+  p = (async () => {
+    const [j, listed] = await Promise.all([
+      unary(API, "aiserver.v1.AiService/AvailableModels", tok, { useModelParameters: true, doNotUseMarkdown: true }, 30_000),
+      unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 8_000).then(
+        (u) => (Array.isArray(u?.models) ? u.models : []),
+        () => [],
+      ),
+    ])
+    const ids = new Set(listed.flatMap((m) => [m?.modelId, m?.displayModelId]).filter(Boolean))
+    const raw = modelsOf(Array.isArray(j?.models) ? j.models : [], ids.size ? ids : null, listed)
+    if (!raw.length) throw new Error("Cursor listed no models")
+    lists.set(h, { at: Date.now(), raw })
+    listFailed.delete(h)
+    return raw
+  })()
+    .catch((e) => {
+      listFailed.set(h, Date.now())
+      throw e
+    })
+    .finally(() => listings.delete(h))
+  listings.set(h, p)
+  return p
+}
+
+// LIST_RETRY is how long a request goes on without the list after Cursor
+// couldn't give it, before it waits for an ask again.
+const LIST_RETRY = 5 * 60_000
+
+// listFor is the list a chat request picks its variant from. It is asked
+// before the Run, so a request never waits on it when it needn't: a list
+// past MODELS_KEEP is used as it is while a new one is asked for, and
+// after a failed ask the requests go without one for LIST_RETRY, as the
+// failed ask left them, instead of each waiting up to AvailableModels'
+// 30 s again before its Run (ysm119 on Discord: 33–36 s to the first
+// token on every Opus request). Only a token with no list at all, and no
+// failure lately, waits for it.
+async function listFor(tok) {
+  const h = createHash("sha256").update(tok).digest("hex")
+  const had = lists.get(h)
+  if (had && Date.now() - had.at < MODELS_KEEP) return had.raw
+  if (had) {
+    listing(tok, h).catch(() => {})
+    return had.raw
+  }
+  const failed = listFailed.get(h)
+  if (failed && Date.now() - failed < LIST_RETRY) return []
+  return listing(tok, h).catch(() => [])
 }
 
 // named is the model and variant an id the list doesn't have stands for,
@@ -858,7 +1175,47 @@ function named(raw, id) {
   }
   for (const e of models) {
     const m = e.model
+    if (e.usableOnly) continue
     if ([m.name, ...(m.legacySlugs ?? []), ...(m.idAliases ?? [])].includes(id)) return { entry: at(e, e.def), seed: undefined, effort: "", fast: false }
+  }
+  // one of the usable list's own ids, or a family of them, that the picker
+  // has nothing of: that family at the id's effort, fast when it is
+  const of = familyOf(id)
+  for (const e of models) {
+    if (!e.usableOnly) continue
+    const u = e.fam.find((x) => x.id === id)
+    if (u) return { entry: e, seed: undefined, effort: u.effort, fast: u.fast }
+    if (e.id === of.family) return { entry: e, seed: undefined, effort: of.effort, fast: of.fast }
+  }
+  // a family neither has, where the account has the same model with
+  // thinking or without it (claude-haiku-5-5-thinking, which 0.1.x listed,
+  // on a Team account whose list has Claude Haiku 5.5 without a thinking
+  // id; ysm119 on Discord): that one, at the id's effort, never the id as
+  // it is, which Cursor answers "AI Model Not Found"
+  const loose = (f) => f.replace(/-thinking$/, "")
+  const key = loose(of.family)
+  for (const e of models) {
+    if (e.usableOnly) {
+      if (loose(e.id) === key) return { entry: e, seed: undefined, effort: of.effort, fast: of.fast }
+      continue
+    }
+    const vs = e.variants.filter((v) => v.legacySlug && loose(familyOf(v.legacySlug).family) === key)
+    if (vs.length) return as(e, vs, of.effort)
+  }
+  // an id at a context size the list no longer has (claude-opus-5-5@1m,
+  // picked from an earlier list, or from another account's): the model at
+  // the nearest size it has; a model listed without sizes, in Max Mode for
+  // a size over its window
+  const sized = /^(.+)@([^@]+)$/.exec(id)
+  if (sized) {
+    const want = tokensOf(sized[2])
+    const same = raw.filter((e) => e.run === sized[1] && e.size)
+    if (same.length) {
+      const near = same.reduce((a, b) => (Math.abs(tokensOf(b.size) - want) < Math.abs(tokensOf(a.size) - want) ? b : a))
+      return { entry: near, seed: undefined, effort: "", fast: false }
+    }
+    const old = named(raw, sized[1])
+    if (old) return { ...old, max: !old.entry.size && want > old.entry.context }
   }
   return null
 }
@@ -870,8 +1227,17 @@ function named(raw, id) {
 function request(raw, model, effort, fast) {
   const entry = raw.find((m) => m.id === model)
   if (entry) return pick(entry, effort, fast)
+  const bare = raw.find((m) => m.id === model.replace(/@[^@]*$/, ""))
+  if (bare && model !== bare.id && !bare.size) {
+    // a model now listed without sizes, asked at one
+    const r = pick(bare, effort, fast)
+    return tokensOf(model.split("@").at(-1)) > bare.context ? { ...r, maxMode: true } : r
+  }
   const old = named(raw, model)
-  if (old) return pick(old.entry, effort || old.effort, fast || old.fast, old.seed)
+  if (old) {
+    const r = pick(old.entry, effort || old.effort, fast || old.fast, old.seed)
+    return old.max ? { ...r, maxMode: true } : r
+  }
   return { id: model === "auto" ? "default" : model, params: [], maxMode: false }
 }
 
@@ -1515,7 +1881,7 @@ async function usageEvents(tok, conv, since, want, { poll = false, first = STEP_
       const res = await fetch(API + "/aiserver.v1.DashboardService/GetFilteredUsageEvents", {
         method: "POST",
         headers: await headersFor(tok),
-        body: JSON.stringify({ teamId: 0, startDate: String(since - 60_000), endDate: String(Date.now() + 60_000), page: 1, pageSize: 50 }),
+        body: JSON.stringify({ ...await teamBody(tok), startDate: String(since - 60_000), endDate: String(Date.now() + 60_000), page: 1, pageSize: 50 }),
         signal: abortFetch && signal ? AbortSignal.any([signal, AbortSignal.timeout(STEP_WAIT.ask)]) : AbortSignal.timeout(STEP_WAIT.ask),
       })
       if (res.status >= 400 && res.status < 500 && res.status !== 429) {
@@ -1776,10 +2142,12 @@ async function agentURL(tok, fresh) {
 // had here (h2Blocked), the Runs after it go straight to HTTP/1.1 for
 // H2.retryAfter, or until a region error sends one back (answerOf); a
 // connection that failed (refused, no network) or a stream the server
-// refused leaves the next Run to try HTTP/2 again.
+// refused leaves the next Run to try HTTP/2 again. atOnce is how many
+// BidiAppends openH1 may have on their way at once, overlaps which messages
+// may be among them (openH1).
 let h1Until = 0
 const cancelledOpen = () => ({ error: { status: 410, message: "the request was cancelled" }, h2Failed: false })
-async function open(base, headers, signal) {
+async function open(base, headers, signal, atOnce = H1.atOnce, overlaps) {
   if (signal?.aborted) return cancelledOpen()
   if (Date.now() >= h1Until) {
     const o = await openH2(base, headers, signal)
@@ -1793,7 +2161,7 @@ async function open(base, headers, signal) {
     if (o.blocked) h1Until = Date.now() + H2.retryAfter
   }
   if (signal?.aborted) return cancelledOpen()
-  return openH1(headers, signal)
+  return openH1(headers, signal, atOnce, overlaps)
 }
 
 const H2 = {
@@ -1860,7 +2228,24 @@ function openH2(base, headers, signal) {
   })
 }
 
-const H1 = { appendWait: 60_000 } // ms a BidiAppend may take before the Run fails, as cursor-agent's appendTimeoutMs
+const H1 = {
+  appendWait: 60_000, // ms a BidiAppend may take before the Run fails, as cursor-agent's appendTimeoutMs
+  // BidiAppends on their way at once, numbered in order, as cursor-agent
+  // keeps them: one at a time, a new Run's history (a blob a message,
+  // hundreds for a long conversation, all asked for at once) took a round
+  // trip to Cursor each before the model could start. A native session's
+  // Run sends only its KV replies that way (kvReply); each of its other
+  // messages waits for every append before it, and goes alone (runNative).
+  atOnce: 16,
+}
+
+// kvReply is whether a client message (an AgentClientMessage, unframed) is
+// a KV reply, kv_client_message: a blob Cursor asked for, which nothing
+// else waits on. Cursor asks for a new Run's whole history at once.
+function kvReply(msg) {
+  const b = Buffer.isBuffer(msg) ? msg : Buffer.from(msg ?? EMPTY)
+  return b.length > 0 && b[0] === 0x1a // field 3, length-delimited
+}
 
 // connectCode is Connect's code for an HTTP status that came with no
 // Connect error of its own
@@ -1874,8 +2259,11 @@ function connectCode(status) {
 // the stream it reads, Connect's frames as the HTTP/2 Run's. Its response
 // is a 200 at once; an error Cursor says later, or a call that fails,
 // ends the stream with Connect's end frame, which runOnce reads as the
-// Run's own.
-function openH1(headers, signal) {
+// Run's own. overlaps says of a message whether it may go up while appends
+// before it are on their way (up to atOnce of them); one that may not waits
+// for all of them, goes alone, and its write's callback is its own append
+// answered.
+function openH1(headers, signal, atOnce = H1.atOnce, overlaps = () => true) {
   if (signal?.aborted) return Promise.resolve(cancelledOpen())
   const ac = new AbortController()
   const id = headers["x-request-id"]
@@ -1883,15 +2271,32 @@ function openH1(headers, signal) {
   let ended = false
   let seq = 0
   let reader
+  const going = new Set()
   const req = new Duplex({
     read() {},
     write(chunk, _enc, cb) {
       // runOnce writes one whole frame each time
       const msg = Buffer.from(chunk).subarray(5)
-      const n = seq++
-      // Keep the write buffered until its append finishes, so callbacks and
-      // drain reflect the pending upload rather than an unbounded promise chain.
-      append(msg, n).then(() => cb(), (e) => cb(e))
+      const go = () => {
+        const p = append(msg, seq++)
+        going.add(p)
+        const gone = () => going.delete(p)
+        p.then(gone, gone)
+        return p
+      }
+      if (!overlaps(msg)) {
+        // alone: after every append before it is answered, and answered
+        // itself before the next write
+        Promise.allSettled([...going]).then(go).then(() => cb(), (e) => cb(e))
+        return
+      }
+      go()
+      // Up to atOnce appends go at once; past that the write stays
+      // buffered until one finishes, so callbacks and drain reflect the
+      // pending upload rather than an unbounded promise chain. At one,
+      // a write's callback is its own append answered.
+      if (going.size < atOnce) return cb()
+      Promise.race(going).then(() => cb(), (e) => cb(e))
     },
   })
   const cleanup = () => {
@@ -1918,7 +2323,7 @@ function openH1(headers, signal) {
   }
   // append sends one message up. One that gets no answer by its deadline
   // (more time for a large one) ends the Run, as cursor-agent's
-  // bidi_append_deadline_exceeded does: the messages after it wait on it.
+  // bidi_append_deadline_exceeded does; so does one that fails.
   const append = async (msg, n) => {
     if (ended || ac.signal.aborted) return
     const body = pb().str(1, msg.toString("hex")).bytes(2, pb().str(1, id).done()).varint(3, n).done()
@@ -2149,10 +2554,20 @@ async function runNative({ tok, base, id, tools, conv, convID, signal, maxMode, 
       "x-cursor-client-type": "cli", // else Cursor adds a prompt of its own
       "x-ghost-mode": "true", // privacy mode: nothing kept for training
       "x-request-id": randomUUID(),
+      ...await teamHeader(tok),
       // none of Cursor's own tools, only the caller's
       "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
     },
     native.ac.signal,
+    // Over HTTP/1.1 the history's blobs go up H1.atOnce at a time, as
+    // cursor-agent sends them; one at a time, a Run with a long history
+    // waited a round trip to api2 a blob before its first token (ysm119 on
+    // Discord: 135 blobs, 37 s against 3 s over HTTP/2). Everything else
+    // goes alone, after the appends before it were answered, and counts as
+    // written only once Cursor answered it, so a tool result is never
+    // uncertain.
+    H1.atOnce,
+    kvReply,
   )
   if (o.error) {
     native.fail(o.error)
@@ -2237,6 +2652,7 @@ async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, pa
       "x-cursor-client-type": "cli", // else Cursor adds a prompt of its own
       "x-ghost-mode": "true", // privacy mode: nothing kept for training
       "x-request-id": randomUUID(),
+      ...await teamHeader(tok),
       // none of Cursor's own tools, only the caller's
       "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
     },
@@ -2653,10 +3069,7 @@ async function answerOf(auth, chat, signal, session = "") {
   if (prepared.owner) r = prepared.owner.resume({ ...prepared, estimate: conversation(chat, tools).estimate }, signal)
   const model = String(chat.model ?? "")
   if (!r) {
-    let raw = []
-    try {
-      raw = await usable(tok)
-    } catch {}
+    const raw = await listFor(tok)
     // fast only when asked: a service_tier of priority or fast is on; any
     // other tier, or none, is off, unless the id is a fast one of Cursor's own
     const tier = chat.service_tier
@@ -2795,7 +3208,16 @@ async function answerOf(auth, chat, signal, session = "") {
 
 // ---- the plugin ---------------------------------------------------------------------------
 
-export async function CursorAuthPlugin() {
+export async function CursorAuthPlugin(input) {
+  // includedOnly is the user's INCLUDED_ONLY as magpie has it now, read at
+  // each usage reading so a change needs no restart; false outside magpie
+  const includedOnly = () => {
+    try {
+      return input?.magpie?.option?.(ID, INCLUDED_ONLY) === true
+    } catch {
+      return false
+    }
+  }
   return {
     auth: {
       provider: ID,
@@ -2828,6 +3250,16 @@ export async function CursorAuthPlugin() {
         { type: "oauth", label: "cursor-agent's sign-in", authorize: cliSignIn },
         { type: "api", label: "Cursor API key (cursor.com/dashboard → Integrations)" },
       ],
+      // magpie's own switches (input.magpie.option), read at each usage
+      // reading
+      options: [
+        {
+          key: INCLUDED_ONLY,
+          label: "Included usage only",
+          description:
+            "Keeps an account in routing only while its included usage lasts: once an included pool (Cursor Models, Other Models, a newer plan's Weekly) is used up, magpie moves its models to the next account until it resets, even if on-demand could pay. On-demand and Total never keep an account in routing.",
+        },
+      ],
       // magpie's: how much of the plan's included usage is gone (the plan
       // is the one the sign-in read). The built-in's read, clean or not,
       // neither marked the account nor cleared it.
@@ -2838,7 +3270,8 @@ export async function CursorAuthPlugin() {
         } catch (e) {
           return { error: e.message, windows: [], signIn: "kept" }
         }
-        const [u, plan, bot] = await Promise.all([usage(tok, Object.keys(provider?.models ?? {})), planOf(tok), botUsage(tok)])
+        const info = planOf(tok)
+        const [u, { plan }, bot] = await Promise.all([usage(tok, Object.keys(provider?.models ?? {}), includedOnly(), info), info, botUsage(tok)])
         // Bot goes among magpie's three menu-bar rings: before Total, and
         // before an On-demand with no limit, which is only a dollar figure on
         // a ring that never fills (magpie #2213, Morganwan90). An On-demand
@@ -2887,4 +3320,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { keychain, keychainToken, nativeTransport, onDemandOf,resetH1: () => (h1Until = 0), onH1: () => Date.now() < h1Until, H2, H1, h2Blocked, open, openH1, openH2, STEP_WAIT, stepUsage, usageKey, ledger, owed, flights, misses, unreadable, catalog, usable, request, modelsOf, tokensOf, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { kvReply, listFor, lists, keychain, keychainToken, nativeTransport, onDemandOf,resetH1: () => (h1Until = 0), onH1: () => Date.now() < h1Until, resetTeam: () => { teamRead.at = 0; teamRead.info = null }, expireTeam: () => (teamRead.at = 0),H2, H1, h2Blocked, open, openH1, openH2, STEP_WAIT, stepUsage, usageKey, ledger, owed, flights, misses, unreadable, catalog, usable, request, modelsOf, tokensOf, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

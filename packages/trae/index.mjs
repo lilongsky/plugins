@@ -826,9 +826,16 @@ const ownClient = {
   paths: () => clientStoragePaths(process.platform, homedir(), process.env),
 }
 
+// CLIENT_PROFILES are the folder names a Trae CN client profile is kept
+// under: the IDE's own, and TRAE SOLO CN's, which is a client of the same
+// realm and signs in its own account. A profile started with its own
+// --user-data-dir is found only if it is one of these; there is no list of
+// them to read, and nothing is guessed from a folder's contents.
+const CLIENT_PROFILES = ["Trae CN", "TRAE SOLO CN", "trae-cn"]
+
 function clientStoragePaths(platform, home, env) {
   const file = (root, name) => join(root, name, "User", "globalStorage", "storage.json")
-  if (platform === "darwin") return [file(join(home, "Library", "Application Support"), "Trae CN")]
+  if (platform === "darwin") return CLIENT_PROFILES.filter((n) => n !== "trae-cn").map((n) => file(join(home, "Library", "Application Support"), n))
   if (platform === "win32") {
     // the two roots are often the same folder: APPDATA and the home's own
     // AppData\Roaming. They are compared as one system spells them, so a
@@ -840,21 +847,39 @@ function clientStoragePaths(platform, home, env) {
       if (roots.some((was) => spell(was) === spell(r))) continue
       roots.push(r)
     }
-    return roots.flatMap((r) => ["Trae CN", "trae-cn"].map((n) => file(r, n)))
+    return roots.flatMap((r) => CLIENT_PROFILES.map((n) => file(r, n)))
   }
-  if (platform === "linux") return ["trae-cn", "Trae CN"].map((n) => file(env.XDG_CONFIG_HOME || join(home, ".config"), n))
+  if (platform === "linux") return CLIENT_PROFILES.map((n) => file(env.XDG_CONFIG_HOME || join(home, ".config"), n))
   return []
 }
 
-// clientDevice is the device id of this machine's Trae CN client when the
-// client is signed in as uid, else undefined. It only reads: nothing of
-// the client's is written, kept or sent but that id, and the client's own
-// token is read past, never used. A file it can't read or make out, or one
-// with no single device, names no device, and the account keeps its own.
-// Never an id made up or changed: an account the client isn't signed in
-// as never gets the client's id.
+// clientDevice is the device id of a Trae CN client profile on this machine
+// that is signed in as uid, else undefined. It only reads: nothing of the
+// client's is written, kept or sent but that id, and the client's own token
+// is read past, never used. Never an id made up or changed: an account no
+// profile is signed in as never gets a client's id.
+//
+// A machine can hold more than one profile — Trae CN and TRAE SOLO CN each
+// write one, and a client started with its own --user-data-dir writes
+// another — and each profile's storage.json names the account it is signed
+// in as, with that account's device. So every profile is read and the one
+// signed in as uid answers with its device, which is what lets two accounts
+// each check in on a real client's device. A profile that isn't signed in
+// as uid, that can't be read or made out, or that names no single device
+// is passed over rather than ending the search: before, the first profile
+// read decided for all of them, so a second account's own profile was never
+// seen (and one unreadable file hid every profile after it).
 async function clientDevice(uid) {
   if (!uid) return undefined
+  return (await clientProfiles()).find((p) => String(p.uid) === String(uid))?.device
+}
+
+// clientProfiles are this machine's Trae CN client profiles that can be
+// made out, in ownClient.paths' order: the account each is signed in as
+// and its one device. A file that isn't there, can't be read or parsed,
+// names no single device or has a sign-in that doesn't decode is left out.
+async function clientProfiles() {
+  const out = []
   for (const p of ownClient.paths()) {
     let text
     try {
@@ -862,17 +887,44 @@ async function clientDevice(uid) {
     } catch {
       continue // not installed here
     }
+    let doc
     try {
-      const doc = JSON.parse(text)
-      const ids = Object.keys(doc ?? {}).filter((k) => k.startsWith(DC_KEY)).map((k) => k.slice(DC_KEY.length))
-      if (ids.length !== 1 || !/^\d{8,20}$/.test(ids[0])) return undefined
-      const who = clientAuth(doc[AUTH_KEY])?.userId
-      return who != null && String(who) === String(uid) ? ids[0] : undefined
+      doc = JSON.parse(text)
     } catch {
-      return undefined
+      continue // not a file we can make out: the next profile may be
+    }
+    try {
+      const ids = Object.keys(doc ?? {}).filter((k) => k.startsWith(DC_KEY)).map((k) => k.slice(DC_KEY.length))
+      if (ids.length !== 1 || !/^\d{8,20}$/.test(ids[0])) continue
+      const who = clientAuth(doc[AUTH_KEY])?.userId
+      if (who != null && String(who) !== "") out.push({ uid: String(who), device: ids[0] })
+    } catch {
+      continue // a sign-in that doesn't decode: the next profile may be
     }
   }
-  return undefined
+  return out
+}
+
+// deviceNote says which device a Trae CN check-in went on, for the message
+// of a claim Trae refused (9074) or found already in (9095): the device of
+// a client on this machine signed in as uid, or magpie's own for the
+// account and why — how many client profiles were found, and that none is
+// signed in as it. It names no uid and no device id. A client's device
+// that another profile, signed in as another account, also has is said:
+// both accounts check in on one device, and Trae takes one a day
+// (plugins#436). It only states what was read; it promises no fix.
+async function deviceNote(uid) {
+  const all = await clientProfiles()
+  const mine = all.find((p) => String(p.uid) === String(uid ?? ""))
+  if (mine) {
+    const shared = all.some((p) => p.device === mine.device && String(p.uid) !== String(uid))
+    return shared
+      ? "sent on this machine's Trae CN client's device, signed in as this account — another profile here, signed in as another account, has the same device"
+      : "sent on this machine's Trae CN client's device, signed in as this account"
+  }
+  if (!all.length) return "sent on magpie's own device for this account: no Trae CN client profile was found on this machine"
+  const n = all.length
+  return `sent on magpie's own device for this account: ${n} Trae CN client profile${n === 1 ? " is" : "s are"} on this machine, none signed in as this account`
 }
 
 // clientAuth is the client's sign-in envelope, as stored or decoded
@@ -1105,11 +1157,157 @@ function traeMessages(req, sees = false) {
   })
 }
 
-// nativeTools are the tools as Trae names them: parameters a JSON string
-const nativeTools = (tools) =>
+// Moonshot (Kimi) validates tools against its own "moonshot flavored json
+// schema" and refuses the whole request (Trae answers code 4027, "tool call
+// failed: Invalid request: tools.function.parameters is not a valid moonshot
+// flavored json schema, details: <At path 'properties.ops.items.properties.op':
+// type is not defined>") for shapes a JSON Schema allows and agents send: an
+// enum or const with no type (Claude Code's tools carry them), a $ref beside a
+// type, a type beside an anyOf. Trae passes the tools to Kimi as they are, so
+// they are rewritten here for the rules Kimi has been seen to hold, for a
+// Kimi/Moonshot model only (moonshotModel). This is kimi-work's moonshotSchema,
+// which carries the reasons for each rule, ported. The tools sent are
+// a copy: the request's own stay as they were, and a schema Kimi takes as it is
+// goes byte for byte.
+const jsIsObj=x=>x!==null&&typeof x==='object'&&!Array.isArray(x);
+const msMAP_KEYS=['properties','$defs','definitions','dependentSchemas','patternProperties'];
+const msSUB_KEYS=['items','additionalProperties','contains','propertyNames','not','if','then','else','allOf','anyOf','oneOf','prefixItems','unevaluatedProperties','unevaluatedItems','contentSchema'];
+const msALL_TYPES=['string','number','integer','boolean','object','array','null'];
+
+function msEachSchema(node,f) {
+  if(Array.isArray(node)) {for(const v of node)msEachSchema(v,f);return;}
+  if(!jsIsObj(node))return;
+  f(node);
+  for(const k of msMAP_KEYS) if(jsIsObj(node[k])) for(const v of Object.values(node[k])) msEachSchema(v,f);
+  for(const k of msSUB_KEYS) if(k in node) msEachSchema(node[k],f);
+}
+
+function msRefTarget(root,ref) {
+  if(typeof ref!=='string'||(ref!=='#'&&!ref.startsWith('#/')))return undefined;
+  let cur=root;
+  for(let tok of ref.split('/').slice(1)) {
+    tok=tok.replace(/~1/g,'/').replace(/~0/g,'~');
+    try{tok=decodeURIComponent(tok);}catch{}
+    if(!jsIsObj(cur)&&!Array.isArray(cur))return undefined;
+    if(!Object.hasOwn(cur,tok))return undefined;
+    cur=cur[tok];
+  }
+  return cur;
+}
+
+const msHasRefInside=s=>JSON.stringify(s).includes('"$ref"');
+
+function msValueType(v) {
+  if(v===null)return 'null';
+  switch(typeof v){
+    case 'string':return 'string';
+    case 'boolean':return 'boolean';
+    case 'number':return Number.isInteger(v)?'integer':'number';
+  }
+  return Array.isArray(v)?'array':'object';
+}
+
+// the type an enum of vals is given: the one all non-null values have, with
+// "null" when a null is among them; undefined when there are none or they
+// are of more than one kind
+function msEnumType(vals) {
+  let t,nul=false;
+  for(const v of vals) {
+    const vt=msValueType(v);
+    if(vt==='null'){nul=true;continue;}
+    if(vt==='array'||vt==='object')return undefined;
+    if(t===undefined||t===vt)t=vt;
+    else if((t==='integer'&&vt==='number')||(t==='number'&&vt==='integer'))t='number';
+    else return undefined;
+  }
+  if(t===undefined)return undefined;
+  return nul?[t,'null']:t;
+}
+
+// the types s can have, as its type, keywords, values or branches say;
+// undefined when they don't say
+function msSchemaTypes(root,s,depth=0) {
+  if(depth>16||!jsIsObj(s))return undefined;
+  if('type' in s)return new Set([].concat(s.type).map(String));
+  if('$ref' in s){const t=msRefTarget(root,s.$ref);return t===undefined?undefined:msSchemaTypes(root,t,depth+1);}
+  if(Array.isArray(s.enum)||'const' in s)return new Set(('const' in s?[s.const]:s.enum).map(msValueType));
+  for(const k of ['oneOf','anyOf','allOf']) {
+    if(!Array.isArray(s[k]))continue;
+    const ts=new Set();
+    for(const b of s[k]) {
+      const bt=msSchemaTypes(root,b,depth+1);
+      if(!bt){if(k!=='allOf')return undefined;continue;}
+      for(const t of bt)ts.add(t);
+    }
+    if(ts.size)return ts;
+  }
+  const has=(...ks)=>ks.some(k=>k in s);
+  if(has('properties','required','additionalProperties','patternProperties','minProperties','maxProperties','propertyNames','dependentRequired','dependentSchemas','unevaluatedProperties'))return new Set(['object']);
+  if(has('items','prefixItems','minItems','maxItems','uniqueItems','contains','unevaluatedItems'))return new Set(['array']);
+  if(has('minLength','maxLength','pattern','format','contentEncoding','contentMediaType'))return new Set(['string']);
+  if(has('minimum','maximum','exclusiveMinimum','exclusiveMaximum','multipleOf'))return new Set(['number']);
+  return undefined;
+}
+
+function msTypeFor(root,s) {
+  if(Array.isArray(s.enum))return msEnumType(s.enum);
+  if('const' in s)return msEnumType([s.const]);
+  const ts=msSchemaTypes(root,s);
+  if(!ts||!ts.size)return [...msALL_TYPES];
+  if(ts.has('integer')&&ts.has('number'))ts.delete('integer');
+  const names=msALL_TYPES.filter(t=>ts.has(t));
+  return names.length===1?names[0]:names;
+}
+
+// the same object with type written first, as an agent would have
+const msWithType=(s,type)=>{const rest={...s};delete rest.type;for(const k of Object.keys(s))delete s[k];Object.assign(s,{type},rest);};
+
+function moonshotSchema(root) {
+  let changed=false;
+  // a $ref beside a type, and a type beside an anyOf
+  msEachSchema(root,s=>{
+    if('$ref' in s&&'type' in s) {
+      const t=msRefTarget(root,s.$ref);
+      if(jsIsObj(t)&&!msHasRefInside(t)) {
+        const own={...s};delete own.$ref;
+        for(const k of Object.keys(s))delete s[k];
+        Object.assign(s,structuredClone(t),own);
+      } else delete s.type;
+      changed=true;
+    }
+    if(Array.isArray(s.anyOf)&&'type' in s){delete s.type;changed=true;}
+  });
+  // an enum or const with no type
+  msEachSchema(root,s=>{
+    if('type' in s||!(Array.isArray(s.enum)||'const' in s))return;
+    const t=msEnumType(Array.isArray(s.enum)?s.enum:[s.const]);
+    if(t!==undefined){msWithType(s,t);changed=true;}
+  });
+  // a $ref's target with no type
+  msEachSchema(root,s=>{
+    if(typeof s.$ref!=='string')return;
+    const t=msRefTarget(root,s.$ref);
+    if(!jsIsObj(t)||'type' in t||'anyOf' in t||'$ref' in t||!Object.keys(t).length)return;
+    const typ=msTypeFor(root,t);
+    if(typ!==undefined){msWithType(t,typ);changed=true;}
+  });
+  return changed;
+}
+
+
+const moonshotModel = (...names) => names.some((n) => /kimi|moonshot/i.test(String(n ?? "")))
+
+// nativeTools are the tools as Trae names them: parameters a JSON string.
+// moonshot is whether a Kimi model takes them (moonshotSchema)
+const nativeTools = (tools, moonshot = false) =>
   tools.map((t) => {
     const f = t.function ?? t
-    return { type: "function", function: { name: f.name, description: f.description ?? "", parameters: typeof f.parameters === "string" ? f.parameters : JSON.stringify(f.parameters ?? {}) } }
+    let p = f.parameters
+    if (moonshot && jsIsObj(p)) {
+      p = structuredClone(p)
+      moonshotSchema(p)
+    }
+    return { type: "function", function: { name: f.name, description: f.description ?? "", parameters: typeof p === "string" ? p : JSON.stringify(p ?? {}) } }
   })
 
 // SESSION carries the conversation magpie (or OpenCode) names a request by,
@@ -1204,7 +1402,7 @@ function chatBody(req, fn, modelName, most = 0, max = null, session = "", sees =
   }
   if (typeof req.temperature === "number") body.temperature = req.temperature
   if (Array.isArray(req.tools) && req.tools.length && req.tool_choice !== "none") {
-    body.tools = nativeTools(req.tools)
+    body.tools = nativeTools(req.tools, moonshotModel(config, modelName, req.model))
     const c = req.tool_choice
     if (c && typeof c === "object") body.tool_choice = c.function?.name || c.name || "auto"
     else if (typeof c === "string") body.tool_choice = c
@@ -2572,13 +2770,19 @@ const MAX = "-max"
 // (light, high, extra_high) and the one it defaults to. The request takes the
 // same names, as reasoning_effort, so a level an agent picks is sent as Trae
 // spells it. OpenCode knows the three as low/high/xhigh, so the map goes both
-// ways.
+// ways. Trae's client names two more, medium and max (its bundle's
+// reasoning_effort.{low,medium,high,extra_high,max}), handed out per model,
+// so they are spelled here too, and offered only for a model whose entry
+// names them. No list seen yet names either: TRAE CN's app offers DeepSeek
+// V4.1 Flash 轻/高/极高 (light/high/extra_high) alone, and its "Max" is the
+// 更大上下文 (Max) 1M-window switch, which is the model id + MAX below, not a
+// level (#434's screenshot).
 //
 // An entry without the config takes no level: Trae serves it at its own
 // default and nothing is sent. The plugin used to send none for every model,
 // which read as "Trae takes no level" — it takes them, per model, and an
 // entry that names none is the exception rather than the rule.
-const LEVELS = { light: "low", high: "high", extra_high: "xhigh" }
+const LEVELS = { light: "low", medium: "medium", high: "high", extra_high: "xhigh", max: "max" }
 
 // levelsOf is an entry's levels in OpenCode's names, in Trae's order: [] when
 // the entry names none, null when it names ones this map can't spell (so a
@@ -2874,41 +3078,95 @@ const makePlugin = (site) => async ({ client }) => {
     return new Response(text, { status: res.status, headers })
   }
 
-  // checkin asks Trae CN's own pages as magpie's check-in host does, with
-  // the same account, device and renewal as any own page. Trae Global has
-  // no such page.
+  // checkinStatus reads the check-in's status page: its body, or an outcome
+  // to give back as it is (a turned-away sign-in, Trae's own error, a reply
+  // that isn't one). checkin reads it before the claim, and again after it.
+  const checkinStatus = async (getAuth, a0) => {
+    const res = await ownRequest(getAuth, a0, site.hosts.auth + site.checkin.status.path, "POST", "{}")
+    const text = await res.text()
+    let body
+    try { body = JSON.parse(text) } catch {}
+    if (!body || typeof body !== "object" || Array.isArray(body)) return { outcome: { outcome: "failed", message: `check-in status: unreadable reply ${text.trim().slice(0, 120) || "(empty)"}` } }
+    const e = errorOf(body)
+    if (res.status === 401 || lapsedCode(e.code, site)) return { outcome: { outcome: "failed", message: e.message || `${a0.name || a0.uid}: Trae's sign-in has expired` } }
+    if (res.status !== 200 || (e.code && String(e.code) !== "0")) return { outcome: { outcome: "failed", message: e.message || statusLine(res.status) } }
+    return { body }
+  }
+
   const checkin = async (getAuth) => {
     if (!site.checkin) return { outcome: "inactive", message: `${site.realm} has no daily check-in` }
     const a0 = fromAuth(await getAuth(), site)
     if (!a0) return { outcome: "failed", message: "not signed in" }
-    const base = site.hosts.auth + site.checkin.status.path
-    const status = await ownRequest(getAuth, a0, base, "POST", "{}")
-    const statusText = await status.text()
-    let body
-    try { body = JSON.parse(statusText) } catch {}
-    if (!body || typeof body !== "object" || Array.isArray(body)) return { outcome: "failed", message: `check-in status: unreadable reply ${statusText.trim().slice(0, 120) || "(empty)"}` }
-    const e = errorOf(body)
-    if (status.status === 401 || lapsedCode(e.code, site)) return { outcome: "failed", message: e.message || `${a0.name || a0.uid}: Trae's sign-in has expired` }
-    if (status.status !== 200 || (e.code && String(e.code) !== "0")) return { outcome: "failed", message: e.message || statusLine(status.status) }
-    if (body?.checked_in) return { outcome: "done", ...(Number(body.credits) > 0 ? { credit: Number(body.credits) } : {}) }
-    if (!body?.enable) return { outcome: "inactive" }
+    const first = await checkinStatus(getAuth, a0)
+    if (first.outcome) return first.outcome
+    const body = first.body
+    if (body.checked_in) return { outcome: "done", ...(Number(body.credits) > 0 ? { credit: Number(body.credits) } : {}) }
+    if (!body.enable) return { outcome: "inactive" }
     const claim = await ownRequest(getAuth, a0, site.hosts.auth + site.checkin.claim.path, "POST", "{}")
     const claimText = await claim.text()
     let answer
     try { answer = JSON.parse(claimText) } catch {}
     const ce = errorOf(answer)
     if (claim.status === 401 || lapsedCode(ce.code, site)) return { outcome: "failed", message: ce.message || `${a0.name || a0.uid}: Trae's sign-in has expired` }
-    if (String(ce.code) === "9095") return { outcome: "ineligible", message: ce.message || "this device has checked in today" }
-    if (String(ce.code) === "9074") return { outcome: "ineligible", message: `${ce.message} — check in in the Trae CN app` }
+    // 9095: this device is in for today, whoever took it — the day's answer
+    if (String(ce.code) === "9095") return { outcome: "ineligible", message: `${ce.message || "this device has checked in today"} (${await deviceNote(a0.uid)})` }
+    // 9074: Trae did not take this claim for this account's device. Its own
+    // words say the pool is busy, which measurements do not bear out: the
+    // same account, token and headers were taken on a 16-digit id where a
+    // 19-digit one got 9074 (plugins#194), and on 2026-10-23 the same
+    // account and headers were taken on a device id Trae had never seen
+    // while this account's own id answered 9074. So the message says what
+    // Trae said and that the device is what it refused, rather than
+    // sending people to check in in Trae CN's app, which is not where the
+    // problem is. No device id is made up or rotated to get round this:
+    // the account keeps its own until a client of its own is here to sign
+    // it in. Nothing is said of signing one in: it is the one thing seen
+    // to change a 9074, but it hasn't been tried on a real account, and
+    // on a claim that already rode a client's device it is what the user
+    // did — the advice would only send them back to do it again. What it
+    // does say, after both 9074 and 9095, is which device the claim went
+    // on and why (deviceNote): moxuanchen (plugins#436) had to run
+    // clientDevice by hand to learn that the account Trae CN took (A, 100
+    // credits) rode the client's device and the one it refused 9074 (B)
+    // rode magpie's own, since both of that machine's profiles were A's.
+    if (String(ce.code) === "9074") return { outcome: "ineligible", message: `${ce.message} (9074) — Trae CN did not take this check-in for this account's device (${await deviceNote(a0.uid)})` }
     if (claim.status !== 200 || (ce.code && String(ce.code) !== "0")) return { outcome: "failed", message: ce.message || statusLine(claim.status) }
     if (!answer || typeof answer !== "object" || Array.isArray(answer)) return { outcome: "failed", message: `check-in claim: unreadable reply ${claimText.trim().slice(0, 120) || "(empty)"}` }
-    // a claim may answer extra_credits with no credits beside it, and either
-    // may be absent: Number(undefined) is NaN, and NaN + n is NaN, which
-    // reads as no credit at all
+    // a claim's own code 0 is not proof the day is in: Trae answers it for
+    // a claim that registered nothing, which cli2api works around by asking
+    // the status again (internal/providers/trae/checkin.go). So success is
+    // what the status page says after the claim, and one that didn't land
+    // is never reported as claimed.
+    //
+    // Nor is it a `failed`. magpie retries a failed check-in with backoff
+    // for the rest of the day, up to every 30 minutes, and each retry is
+    // another claim: a claim answered code 0 while the status still says
+    // the day is out is the very case that would multiply, since code 0
+    // for a claim that registered nothing is this plugin's own premise —
+    // an account that claimed once a day would claim many times. A status
+    // that lags a claim that did land reads as not in once, which is a
+    // false failure and a second claim. So once a claim has been sent,
+    // what the read-back says is the day's answer and nothing is claimed
+    // again: `ineligible`, as a 9095 is. A read-back that itself comes to
+    // nothing — the network, an answer that isn't one — is the same: the
+    // claim was made, and whether the day is in is not known, so it is
+    // read again on the next press rather than claimed again.
+    const noMore = (o) => (o.outcome === "failed" ? { outcome: "ineligible", message: `${o.message} — nothing is claimed again today` } : o)
+    const back = await checkinStatus(getAuth, a0)
+    if (back.outcome) return noMore(back.outcome)
+    if (!back.body.checked_in) return { outcome: "ineligible", message: `${site.realm}: the claim answered success, but the day's check-in is not in — nothing is claimed again today` }
+    // The credit is the day's credits, never credits plus extra_credits.
+    // Trae CN's real claim answers {"code":0,"message":"success"}, with no
+    // credit at all (plugins#194), so the status's credits stand in. Its
+    // status carries extra_credits beside credits, at the same 100 on a
+    // real account (yetone/magpie#808: credits 100, extra_credits 100),
+    // while the account gets 100: adding the two showed 200 (zhujiu on
+    // magpie's Discord, 10-25). A claim that names its own credit is
+    // taken first; one naming extra_credits alone is that (#260). Either
+    // may be absent, and Number(undefined) is NaN, which reads as none.
     const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
-    const credit = n(answer.credits) + n(answer.extra_credits)
-    const fallback = n(body.credits) + n(body.extra_credits)
-    return { outcome: "claimed", ...(credit > 0 ? { credit } : fallback > 0 ? { credit: fallback } : {}) }
+    const credit = n(answer.credits) || n(answer.extra_credits) || n(back.body.credits)
+    return { outcome: "claimed", ...(credit > 0 ? { credit } : {}) }
   }
 
   const usage = async (getAuth) => {
@@ -3323,4 +3581,4 @@ const makePlugin = (site) => async ({ client }) => {
 export const TraeCNAuthPlugin = makePlugin(SITES["trae-cn"])
 export const TraeGlobalAuthPlugin = makePlugin(SITES["trae-global"])
 
-export const _internal = { ownClient, clientStoragePaths, clientDevice, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, credits, dollarUsageOf, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf }
+export const _internal = { ownClient, clientStoragePaths, clientDevice, clientProfiles, deviceNote, clientDecode, thisMachine, traeHost, accountOf, HOSTS: SITES["trae-cn"].hosts, MODELS: SITES["trae-cn"].models, TextTools, NativeCalls, looseJSON, glmCall, nameCall, toolNamed, unwrapped, traeMessages, chatBody, nativeTools, moonshotSchema, credits, dollarUsageOf, whenOf, newDevice, ugDevice, proofOf, SITES, SESSION, conversationID, LEVELS, levelsOf, variantsOf, effortOf }

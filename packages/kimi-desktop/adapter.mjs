@@ -51,10 +51,25 @@ function authenticated(actual, key) {
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-export function defaultKimiDirectory(home = os.homedir()) {
-  const support = process.platform === 'win32' ? process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
-    : process.platform === 'darwin' ? path.join(home, 'Library', 'Application Support') : path.join(home, '.config');
-  return path.join(support, 'kimi-desktop', 'daimon-share', 'daimon');
+// Kimi's daimon folder, as Kimi 3.2.21 finds it: under the shareDir its
+// <userData>/daimon-storage.json names ({"version":1,"shareDir":<absolute>}),
+// else under <userData>/daimon-share. On Windows Kimi writes that pointer
+// for a new user who installed it on another drive than %APPDATA%'s
+// (D:\KimiData\daimon-share), and on any system when the user moves its
+// storage. A pointer Kimi wouldn't take leaves the default, as in Kimi
+// (magpie-community/plugins#425).
+export function defaultKimiDirectory(home = os.homedir(), { platform = process.platform, appdata = process.env.APPDATA,
+  read = file => { if (fs.statSync(file).size > 64 * 1024) throw Error('too large'); return fs.readFileSync(file, 'utf8'); } } = {}) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const support = platform === 'win32' ? appdata || P.join(home, 'AppData', 'Roaming')
+    : platform === 'darwin' ? P.join(home, 'Library', 'Application Support') : P.join(home, '.config');
+  const data = P.join(support, 'kimi-desktop');
+  let share = P.join(data, 'daimon-share');
+  try {
+    const dir = JSON.parse(read(P.join(data, 'daimon-storage.json')).replace(/^\uFEFF/, ''))?.shareDir;
+    if (typeof dir === 'string' && dir.trim() && P.isAbsolute(dir)) share = P.resolve(dir);
+  } catch {}
+  return P.join(share, 'daimon');
 }
 
 export class KimiAdapter {
@@ -99,20 +114,35 @@ export class KimiAdapter {
     if (this.locked) {
       try { return readJSON(this.lockFile).ownerID === this.ownerID; } catch { this.locked = false; }
     }
-    try {
-      const before = fs.readFileSync(this.lockFile, 'utf8'), owner = JSON.parse(before);
+    let before;
+    try { before = fs.readFileSync(this.lockFile, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw Error('adapter_lock_unavailable'); }
+    if (before !== undefined) {
+      let owner;
+      try { owner = JSON.parse(before); } catch { throw Error('adapter_lock_invalid'); }
+      if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0 || owner.pid > 2147483647
+          || typeof owner.ownerID !== 'string' || !owner.ownerID) throw Error('adapter_lock_invalid');
       let alive = true;
       try { process.kill(owner.pid, 0); } catch (error) { alive = error.code !== 'ESRCH'; }
       if (alive) return false;
-      if (fs.readFileSync(this.lockFile, 'utf8') !== before) return false;
-      fs.unlinkSync(this.lockFile);
-    } catch (error) { if (error.code !== 'ENOENT') return false; }
+      try {
+        if (fs.readFileSync(this.lockFile, 'utf8') !== before) return false;
+        fs.unlinkSync(this.lockFile);
+      } catch (error) { if (error.code !== 'ENOENT') throw Error('adapter_lock_unavailable'); }
+    }
+    // Publish a complete record exclusively. A crash during the staging write
+    // cannot leave a truncated owner record that blocks every future host.
+    const staged = this.lockFile + '.' + process.pid + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
     try {
-      fs.writeFileSync(this.lockFile, JSON.stringify({ pid: process.pid, ownerID: this.ownerID }), { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(staged, JSON.stringify({ pid: process.pid, ownerID: this.ownerID }), { flag: 'wx', mode: 0o600 });
+      fs.linkSync(staged, this.lockFile);
       this.locked = true;
       try { this.state = readJSON(this.stateFile); } catch { this.state = { active: false }; }
       return true;
-    } catch { return false; }
+    } catch (error) {
+      if (error.code === 'EEXIST') return false;
+      throw Error('adapter_lock_unavailable');
+    } finally { try { fs.unlinkSync(staged); } catch { /* Never published, or already unlinked. */ } }
   }
 
   releaseLock() {
@@ -125,7 +155,7 @@ export class KimiAdapter {
     if (JSON.stringify(next) === JSON.stringify(this.status)) return;
     this.status = next;
     if (fs.existsSync(this.stateDir)) atomicJSON(this.statusFile, { ...next, at: new Date().toISOString() });
-    if (code.endsWith('_failed') || code === 'kimi_config_changed') this.log(code);
+    if (code.endsWith('_failed') || code.startsWith('adapter_lock_') || code === 'kimi_config_changed') this.log(code);
   }
 
   saveState() { atomicJSON(this.stateFile, this.state); }
@@ -225,8 +255,11 @@ export class KimiAdapter {
         : officialURL(active.originalBase) + req.url.slice('/v1'.length);
       const upstream = await this.fetchImpl(url, { method: 'POST', headers,
         body: JSON.stringify(payload), signal: controller.signal, redirect: 'error' });
-      res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json',
-        'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+      const responseHeaders = { 'Content-Type': upstream.headers.get('content-type') || 'application/json',
+        'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' };
+      const retryAfter = upstream.headers.get('retry-after');
+      if (retryAfter !== null) responseHeaders['Retry-After'] = retryAfter;
+      res.writeHead(upstream.status, responseHeaders);
       res.flushHeaders();
       if (upstream.body) for await (const chunk of upstream.body) {
         if (!res.write(chunk)) await once(res, 'drain', { signal: controller.signal });
@@ -396,7 +429,7 @@ export class KimiAdapter {
       this.report('connected', { model: desired.model });
     } catch (error) {
       const codes = new Set(['invalid_gateway', 'invalid_connection', 'unsupported_kimi_config',
-        'library_path_conflict',
+        'library_path_conflict', 'adapter_lock_invalid', 'adapter_lock_unavailable',
         'kimi_config_changed', 'kimi_control_unavailable', 'kimi_control_timeout', 'kimi_control_closed', 'kimi_control_rejected']);
       const code = codes.has(error.message) ? error.message : 'adapter_failed';
       this.report(code);

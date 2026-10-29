@@ -219,7 +219,8 @@ const EXPIRED_CLI = EXPIRED + " with `kiro-cli login` or the Kiro IDE"
 
 // gone is an error saying the sign-in itself is gone — refused, or never
 // there. The built-in marked no Kiro account lapsed, not even then, nor
-// cleared one: every answer and usage read says the account is kept.
+// cleared one: every answer says the account is kept. The usage read says
+// expired for it, and renewed for a clean read (auth.usage).
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is refreshed before a request
 const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
@@ -414,7 +415,10 @@ function goG(x) {
 
 // usageOf is the allowance Get-Usage-Limits tells, as magpie's built-in
 // said it: the account's email, the credits of each allowance, the month's and a free trial's
-// while it runs.
+// while it runs. Each window carries its count (amount, limit, unit), so
+// magpie can say what is left of it when the user shows what is left
+// (#408): display alone is the vendor's text, which magpie can't turn
+// round.
 function usageOf(l) {
   const at = (secs) => (secs > 0 ? new Date(Math.trunc(secs) * 1000).toISOString() : undefined)
   const count = (used, limit) => used.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") + " / " + goG(limit)
@@ -424,13 +428,14 @@ function usageOf(l) {
     const t = u?.freeTrialInfo
     if (t && String(t.freeTrialStatus ?? "").toUpperCase() === "ACTIVE" && num(t.usageLimitWithPrecision) > 0) {
       const used = num(t.currentUsageWithPrecision), limit = num(t.usageLimitWithPrecision)
-      windows.push({ name: "Free trial", used: (100 * used) / limit, resetsAt: at(num(t.freeTrialExpiry)), display: count(used, limit) })
+      windows.push({ name: "Free trial", used: (100 * used) / limit, resetsAt: at(num(t.freeTrialExpiry)), display: count(used, limit),
+        amount: used, limit, unit: "credits" })
     }
     const used = num(u?.currentUsageWithPrecision), limit = num(u?.usageLimitWithPrecision)
     if (limit <= 0) continue
     const reset = num(u?.nextDateReset) || num(l?.nextDateReset)
     windows.push({ name: u?.displayNamePlural || u?.displayName || "Credits", used: (100 * used) / limit, resetsAt: at(reset),
-      display: count(used, limit), span: 30 * 24 * 3600 })
+      display: count(used, limit), amount: used, limit, unit: "credits", span: 30 * 24 * 3600 })
   }
   const email = l?.userInfo?.email
   return { plan: planName(l?.subscriptionInfo?.subscriptionTitle), ...(typeof email === "string" && email ? { user: email } : {}), windows }
@@ -706,6 +711,106 @@ function addImage(images, p) {
   if (p.source?.type === "base64" && p.source.data) images.push({ format: imageFormat(p.source.media_type), source: { bytes: p.source.data } })
 }
 
+// ---- images over Kiro's size limit ---------------------------------------------------
+//
+// Kiro turns away an image whose Base64 is over 5 MiB, counted on the
+// encoded string, not the file (magpie-community/plugins#428):
+//   messages.130.content.2.image.source.base64: image exceeds 5 MB maximum:
+//   5561904 bytes > 5242880 bytes (IMAGE_SIZE_EXCEEDED)
+// 5561904 is that image's Base64 length (4,171,428 bytes decoded), so the
+// largest file that fits is 3,932,160 bytes. kiro-cli's own gate is 10 MB of
+// raw file (MAX_IMAGE_SIZE, aws/amazon-q-developer-cli chat/consts.rs), which
+// lets such an image in and then every later turn fails on it
+// (kirodotdev/Kiro#11497). The image stays in history, so each turn would
+// fail the same way: an image over the limit is made smaller on the request
+// being sent, and one that can't be is replaced by a note.
+const IMAGE_LIMIT = 5 * 1024 * 1024 // Base64 characters
+const IMAGE_EDGE = 2000 // a shrunk image's long edge: Kiro's web app's limit (kirodotdev/Kiro#8884), above what Claude looks at
+const IMAGE_MIN_EDGE = 256
+const IMAGE_MAX_PIXELS = 50_000_000 // a decoded image is ~4 bytes a pixel: a 200MB ceiling, and a header claiming more is refused unread
+const IMAGE_MAX_INPUT = 64 * 1024 * 1024 // Base64 characters looked at all
+const IMAGE_DEADLINE = 30_000 // ms one image may take
+const fitted = new Map() // sha256 of the Base64 → Promise of { format, bytes } or { note }, newest last
+const FITTED_KEEP = 4
+
+const mib = (n) => (n / (1024 * 1024)).toFixed(1) + " MB"
+
+// shrink tries, in order, the image's own kind at Claude's size, then a
+// lossy kind (WebP keeps transparency, JPEG stays JPEG) smaller each time,
+// until the Base64 fits.
+async function shrink(b64) {
+  const I = globalThis.Bun?.Image
+  if (typeof I !== "function") return { note: "this plugin host can't resize images" }
+  const started = Date.now()
+  const raw = Buffer.from(b64, "base64")
+  let meta
+  try {
+    meta = await new I(raw, { maxPixels: IMAGE_MAX_PIXELS }).metadata()
+  } catch (e) {
+    return { note: e?.code === "ERR_IMAGE_TOO_MANY_PIXELS" ? "it has too many pixels to resize" : "it couldn't be read as an image" }
+  }
+  const long = Math.max(meta.width, meta.height)
+  const jpeg = meta.format === "jpeg"
+  const own = jpeg ? { format: "jpeg", opts: { quality: 85 } } : meta.format === "webp" ? { format: "webp", opts: { quality: 85 } } : { format: "png", opts: { compressionLevel: 9 } }
+  const lossy = (quality) => (jpeg ? { format: "jpeg", opts: { quality } } : { format: "webp", opts: { quality } })
+  const tries = [{ edge: Math.min(long, IMAGE_EDGE), ...own }, { edge: Math.min(long, IMAGE_EDGE), ...lossy(80) }]
+  for (let edge = Math.min(long, IMAGE_EDGE) * 0.7; edge >= IMAGE_MIN_EDGE; edge *= 0.7) tries.push({ edge: Math.round(edge), ...lossy(75) })
+  for (const t of tries) {
+    if (Date.now() - started > IMAGE_DEADLINE) return { note: "resizing it took too long" }
+    let out
+    try {
+      let img = new I(raw, { maxPixels: IMAGE_MAX_PIXELS })
+      if (t.edge < long) img = img.resize(t.edge, t.edge, { fit: "inside", withoutEnlargement: true })
+      out = await img[t.format](t.opts).toBase64()
+    } catch (e) {
+      if (e?.code === "ERR_IMAGE_FORMAT_UNSUPPORTED") continue
+      return { note: "it couldn't be resized" }
+    }
+    if (out.length <= IMAGE_LIMIT) return { format: t.format, bytes: out }
+  }
+  return { note: "it couldn't be made small enough" }
+}
+
+function fitOne(b64) {
+  const key = createHash("sha256").update(b64).digest("hex")
+  let p = fitted.get(key)
+  if (p) fitted.delete(key) // kept as the newest below
+  else p = b64.length > IMAGE_MAX_INPUT ? Promise.resolve({ note: "it is too large to resize" }) : shrink(b64).catch(() => ({ note: "it couldn't be resized" }))
+  fitted.set(key, p)
+  while (fitted.size > FITTED_KEEP) fitted.delete(fitted.keys().next().value)
+  return p
+}
+
+// fitImages brings every image left in a built request under Kiro's limit,
+// in place: the request is the plugin's own copy, never the caller's. An
+// image already under it is sent as it is.
+async function fitImages(out) {
+  const s = out.conversationState
+  const users = [...(s.history ?? []).map((e) => e.userInputMessage), s.currentMessage.userInputMessage].filter(Boolean)
+  for (const u of users) {
+    if (!u.images?.length) continue
+    const kept = []
+    const notes = []
+    for (const img of u.images) {
+      const b64 = img.source?.bytes
+      if (typeof b64 !== "string" || b64.length <= IMAGE_LIMIT) {
+        kept.push(img)
+        continue
+      }
+      const r = await fitOne(b64)
+      if (r.bytes) kept.push({ ...img, format: r.format, source: { ...img.source, bytes: r.bytes } })
+      else
+        notes.push(
+          `[An image (${img.format}, ${mib(b64.length)} as Base64) was left out of this message: Kiro takes at most ${mib(IMAGE_LIMIT)} per image, and ${r.note}.]`,
+        )
+    }
+    if (kept.length) u.images = kept
+    else delete u.images
+    if (notes.length) u.content = joinNonEmpty(u.content, notes.join("\n"))
+  }
+  return out
+}
+
 const textOf = (c) =>
   typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("\n\n") : ""
 const joinNonEmpty = (a, b) => (a && b ? a + "\n\n" + b : a + b)
@@ -740,8 +845,19 @@ function formatText(req) {
   return "Respond with a single JSON value and nothing else, matching this JSON schema:\n" + JSON.stringify(f.schema) + "."
 }
 
-// buildKiro is the body of a generateAssistantResponse call.
+// buildKiro is the body of a generateAssistantResponse call, as it is
+// before its images are fitted (kiroBody).
 function buildKiro(req, model, profile, budget) {
+  return JSON.stringify(kiroRequest(req, model, profile, budget))
+}
+
+// kiroBody is the body sent: buildKiro's, with every image it keeps under
+// Kiro's size limit.
+async function kiroBody(req, model, profile, budget) {
+  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget)))
+}
+
+function kiroRequest(req, model, profile, budget) {
   const entries = []
   // the messages the caller marked for its prompt cache (cache_control),
   // which go to Kiro as a cachePoint on the message they end up in (#110)
@@ -897,7 +1013,7 @@ function buildKiro(req, model, profile, budget) {
   if (entries.length > 1) state.history = entries.slice(0, -1)
   const out = { conversationState: state, agentMode: "vibe" }
   if (profile) out.profileArn = profile
-  return JSON.stringify(out)
+  return out
 }
 
 function sendKiro(a, body, signal) {
@@ -1338,7 +1454,7 @@ async function generate(creds, auth, req, signal) {
   }
   let res
   try {
-    res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
+    res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
   } catch (e) {
     if (e?.name === "AbortError") throw e
     return errorResponse(502, e.message)
@@ -1351,7 +1467,7 @@ async function generate(creds, auth, req, signal) {
       return errorResponse(502, e.message)
     }
     try {
-      res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
+      res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
     } catch (e) {
       if (e?.name === "AbortError") throw e
       return errorResponse(502, e.message)
@@ -1582,8 +1698,10 @@ export async function KiroAuthPlugin({ client } = {}) {
           },
         }
       },
-      // the account's credits, as magpie's built-in showed them; a read,
-      // clean or failed, marked the built-in's account nothing
+      // the account's credits, as magpie's built-in showed them. A sign-in
+      // Kiro refused (gone) marks the account signed out, so magpie passes
+      // over it and its row offers Sign in again; a clean read takes the
+      // mark off, as after `kiro-cli login`. Any other failure keeps it.
       async usage(getAuth) {
         const auth = await getAuth()
         if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return { error: "not signed in", signIn: "kept" }
@@ -1591,9 +1709,9 @@ export async function KiroAuthPlugin({ client } = {}) {
           const u = usageOf(await usageLimits(await creds(auth), true))
           // named as the account is
           if (u.user && auth.type === "oauth" && !auth.source) u.user = nameOf(u.user, auth.loginProvider)
-          return { ...u, signIn: "kept" }
+          return { ...u, signIn: "renewed" }
         } catch (e) {
-          return { error: e.message, signIn: "kept" }
+          return { error: e.message, signIn: e.gone ? "expired" : "kept" }
         }
       },
       methods: [
@@ -1630,4 +1748,4 @@ export async function KiroAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { generate, refresh, usageOf, buildKiro, events, reply, failure, toolID, toolName, toolNames, thinking, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { generate, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }

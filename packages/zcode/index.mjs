@@ -50,6 +50,15 @@ const siteOf = (s) => (s === "bigmodel" ? "bigmodel" : "zai")
 const platform = () => `${process.platform}-${process.arch}` // darwin-arm64, win32-x64, linux-x64, as ZCode names them
 const uuid = () => crypto.randomUUID()
 const anyDevice = uuid() // X-Device-Mid for calls made signed out (the model list)
+// uuidOf is a version 4 shaped UUID made from a seed: the same seed gives
+// the same UUID every time
+const uuidOf = (seed) => {
+  const h = createHash("sha256").update(seed).digest("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${((parseInt(h[16], 16) & 3) | 8).toString(16)}${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
+// keyDevice is a device id for an account known only by its key: the same
+// key gives the same id on every start, as a sign-in's saved device does
+const keyDevice = (key) => uuidOf("zcode-device\0" + key)
 const first = (...ss) => ss.map((s) => (typeof s === "string" ? s.trim() : "")).find((s) => s) ?? ""
 
 // STATUS_TEXT is Go's http.StatusText, which magpie's built-in said a
@@ -173,7 +182,7 @@ async function startPlan(jwt, device) {
   for (const p of plans) {
     const st = String(p?.status ?? "").trim().toLowerCase()
     const end = num(p?.ends_at)
-    if (st !== "active" || (end > 0 && end <= now)) continue
+    if (st !== "active" || (end > 0 && end <= now) || notStarted(p, now)) continue
     any = true
     if (end > 0) ttl = Math.min(ttl, (end - now) * 1000)
     if (!name) name = String(p?.name ?? "").trim()
@@ -194,8 +203,8 @@ async function startPlan(jwt, device) {
 
 // plansOf says where an account's requests go and what more it can spend:
 // {start, gift}. start is what onStart said: an account with no coding plan
-// sends every request to the gift and reads no balance to do it; a team's
-// seat, a sign-in with no ZCode token and a key whose plan-list read found
+// sends every request to the gift and reads no balance to do it; a
+// sign-in with no ZCode token and a key whose plan-list read found
 // no gift stay on the coding plan. gift is what a coding account also holds:
 // the gift plans ({models}), and its requests spend the gift for a model it
 // serves, until it says it is spent (see blocked). Asked again after 10
@@ -204,8 +213,8 @@ async function startPlan(jwt, device) {
 // ask).
 const routes = new Map()
 async function plansOf(s) {
-  if (isTeam(s) || !s.jwt) return { start: false, gift: null }
-  if (!s.key) return { start: true, gift: null }
+  if (!s.jwt) return { start: false, gift: null }
+  if (!s.key && !isTeam(s)) return { start: true, gift: null }
   const id = s.key + "\0" + s.jwt
   const r = routes.get(id)
   if (r && Date.now() - r.at < r.ttl) return r
@@ -213,7 +222,9 @@ async function plansOf(s) {
   let gift = null
   let sure = false
   try {
-    if (!(await plan(s))) start = true
+    // A team seat stays on its team even when its personal plan list is
+    // empty. Its ZCode session still holds the person's gift plans.
+    if (!isTeam(s) && !(await plan(s))) start = true
     else {
       // a gift read that failed is unknown, not "no gift": asked again in
       // a minute, so its trial entries come back with the next list (an
@@ -222,7 +233,12 @@ async function plansOf(s) {
       gift = await startPlan(s.jwt, s.device).catch(() => ((failed = !jwtExpired(s.jwt)), null))
       sure = !failed
     }
-    if (start) sure = true
+    // a key whose plan list read no plan, where the last read found one,
+    // is asked again in a minute rather than sent to the Start Plan for
+    // ten: one list without the plan (a renewal's boundary, a hiccup)
+    // turned a GLM Coding Plan account's every request into the Start
+    // Plan's 405 until the route was read again (#369)
+    if (start) sure = !(s.key && r && !r.start)
   } catch {
     // the plan list could not be read: a key account takes the dual route
     // (start stays false, the gift is kept, a minute's ttl), so a gift
@@ -249,9 +265,11 @@ const giftUsable = (s, gift, m) => !jwtExpired(s.jwt) && giftServes(gift, m) &&
 
 // spentUp is the gift saying it has nothing left to spend: its own no-
 // resource-package code 1113, its "exceed quota limit" 1005 — a spent gift
-// can answer a 200 with a JSON body carrying one of those codes. Every 429
-// counts as spent, Z.ai's 1302/1303 rate limits among them.
+// can answer a 200 with a JSON body carrying one of those codes. Every other
+// 429 counts as spent, Z.ai's 1302/1303 rate limits among them; the plan's
+// own in-flight cap (3008/3009) does not, since it is a turn not yet come.
 function spentUp(text, status) {
+  if (busy(status, text)) return false
   if (status === 429) return true
   let b
   try { b = JSON.parse(text) } catch { return false }
@@ -502,6 +520,28 @@ function startNum(v) {
   return undefined
 }
 
+// notStarted is a plan whose starts_at is still to come (a Start Plan
+// that takes effect at 23:00 today, windy on Discord): it serves nothing
+// yet, so no request is routed to it and its buckets don't count, but the
+// card names it with its start. ZCode's balance gives every plan a
+// starts_at in Unix seconds; which status a plan not started yet carries
+// is not known, so any but "expired" is taken.
+function notStarted(p, now) {
+  const at = startNum(p?.starts_at)
+  return at > now && String(p?.status ?? "").trim().toLowerCase() !== "expired"
+}
+
+// PENDING is the card's line for a gift plan that has not started yet: a
+// fixed sentence, so magpie translates it; the plan's name and its start,
+// in this computer's time, are the display. Set aside: it stops nothing.
+const PENDING = "ZCode gift plan not started yet"
+const two = (n) => String(n).padStart(2, "0")
+const localTime = (sec) => {
+  const d = new Date(Math.trunc(sec) * 1000)
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+}
+const pendingLines = (g) => (g?.pending ?? []).map((p) => ({ name: PENDING, used: 0, aside: true, display: `${p.name} · ${localTime(p.start)}` }))
+
 // giftOf reads the balance and returns the gift's card fields: its plans and
 // windows. Several plans can be active at once, so every live plan's buckets
 // show, each keeping its own models and end; the plan and end put on the
@@ -533,21 +573,28 @@ async function giftOf(s) {
       return keep
     })
 
+  // a plan not started yet is named with its start, soonest first; its
+  // buckets, if the balance lists any, wait for it
+  const pending = plans.filter((p) => notStarted(p, now))
+    .map((p) => ({ name: first(str(p.name), "Start Plan"), start: startNum(p.starts_at) }))
+    .sort((a, b) => a.start - b.start)
+
   // every live plan counts as the gift: no plan-name filter decides it,
   // the balance says what the session can spend
   let active = null
   for (const p of plans) {
-    if (p.status.trim().toLowerCase() !== "active") continue
+    if (p.status.trim().toLowerCase() !== "active" || notStarted(p, now)) continue
     const end = startNum(p.ends_at)
     if (end > 0 && end <= now) continue
     if (active && !(end > 0 && (!startNum(active.end) || end < startNum(active.end)))) continue
     active = { name: first(str(p.name), "Start Plan"), end, until: end > 0 ? new Date(Math.trunc(end) * 1000).toISOString() : "" }
   }
-  if (!active) return null
-  const out = { plan: active.name, windows: [] }
-  if (active.until) Object.assign(out, { until: active.until, renew: "off" })
+  if (!active && !pending.length) return null
+  // with no live plan, the one starting soonest names the card
+  const out = { plan: active?.name ?? pending[0].name, windows: [], live: !!active, pending }
+  if (active?.until) Object.assign(out, { until: active.until, renew: "off" })
   const live = plans.filter((p) => {
-    if (p.status.trim().toLowerCase() !== "active") return false
+    if (p.status.trim().toLowerCase() !== "active" || notStarted(p, now)) return false
     const end = startNum(p.ends_at)
     return !(end > 0 && end <= now)
   })
@@ -632,7 +679,6 @@ async function claimHint(s) {
 // translate it; why goes in the display. Set aside: it stops nothing.
 const GIFT_SIGN_IN = "ZCode gift plans (-Trial models) need ZCode's sign-in"
 function giftSignIn(s, key) {
-  if (isTeam(s)) return null
   if (!s.jwt) return { name: GIFT_SIGN_IN, used: 0, aside: true, display: key ? "not read with an API key: add the account with a ZCode sign-in" : "this sign-in has no ZCode session: sign in again" }
   if (jwtExpired(s.jwt)) return { name: GIFT_SIGN_IN, used: 0, aside: true, display: "ZCode's sign-in has expired: sign in again" }
   return null
@@ -661,6 +707,9 @@ async function startUsage(s) {
     }
     return { ...w, models: [...models, ...models.map(giftID)] }
   }))
+  g.windows.push(...pendingLines(g))
+  delete g.live
+  delete g.pending
   return g
 }
 
@@ -698,40 +747,49 @@ function bestBuckets(windows) {
   return best
 }
 
+// giftReadable: ZCode's session can read the gift beside a coding plan,
+// so the card asks for it even when no gift is live for requests: a plan
+// that starts later is named on the card (windy, Discord), not left out
+// because nothing could be spent yet.
+const giftReadable = (s) => !!s.jwt && !jwtExpired(s.jwt)
+
 // dualUsage shows both pools but only the pool a request can use counts
 // for its model. Live gift models don't spend the Coding windows; spent
 // or blocked gift buckets stay visible without holding up the Coding Plan.
 // Fresh usage also updates the request cache, so a replenished or spent
 // gift takes effect before its ten-minute route cache expires. A failed
 // gift read leaves the working Coding Plan's card and route alone.
-async function dualUsage(s) {
-  const out = await codingUsage(s)
+async function dualUsage(s, out) {
+  out ??= await codingUsage(s)
   const cached = routes.get(s.key + "\0" + s.jwt)
   try {
     const g = await giftOf(s)
-    const gift = g ? { name: g.plan, models: [...new Set(g.windows.filter((w) => !w._spent)
+    const gift = g?.live ? { name: g.plan, models: [...new Set(g.windows.filter((w) => !w._spent)
       .flatMap((w) => w.models ?? []).map((m) => m.toLowerCase()))],
       allModels: uniqueModels(g.windows.flatMap((w) => w.models ?? [])) } : null
     if (cached) {
       cached.gift = gift
-      const ends = g ? [g.until, ...g.windows.map((w) => w.resetsAt)].map((t) => Date.parse(t)).filter(Number.isFinite) : []
+      // a plan that starts later is read again when it starts
+      const ends = g ? [g.until, ...g.windows.map((w) => w.resetsAt)].map((t) => Date.parse(t))
+        .concat(g.pending.map((p) => p.start * 1000)).filter(Number.isFinite) : []
       if (ends.length) cached.ttl = Math.min(cached.ttl, Math.max(0, Math.min(...ends) - cached.at))
     }
-    if (g) {
+    if (g?.live) {
       // the gift's models are its trial entries alone: a plain model stays
       // on the coding plan, and the user picks the gift by its entry
       const notModels = gift.allModels.map((m) => giftID(m).toLowerCase())
       if (notModels.length) out.windows = out.windows.map((w) => w.aside ? w : { ...w, notModels })
       // Several buckets may serve one model: one spent sibling cannot block it.
       const best = bestBuckets(g.windows)
-      const label = byPlan(g.windows)
+      // beside the Coding Plan's windows every gift bucket is named after
+      // its plan, one plan or several: "Start Plan · GLM-5.1-Trial" can't
+      // be read as the Coding Plan's own (windy, Discord)
+      const label = (name, plan) => first(plan, "Start Plan") + " · " + name
       out.windows.push(...countedFirst(g.windows.map(({ _plan: p, _spent, ...w }, i) => {
         const selected = gift.allModels.filter((m) => best.get(m.toLowerCase()) === i)
         const models = selected.map(giftID)
         const scoped = models.length ? { ...w, models } : { ...w, aside: true }
-        // the card names a bucket's model as the picker does (GLM-5.3-Flash-Trial);
-        // no plan prefix while one plan gives them all — the card's section
-        // header already says the account; with several, byPlan names each
+        // the card names a bucket's model as the picker does (GLM-5.3-Flash-Trial)
         let name = w.name
         for (const m of selected) {
           const at = name.toLowerCase().indexOf(m.toLowerCase())
@@ -740,6 +798,7 @@ async function dualUsage(s) {
         return { ...scoped, name: label(name, p) }
       })))
     }
+    if (g) out.windows.push(...pendingLines(g))
   } catch {
     if (cached) {
       cached.gift = null
@@ -995,6 +1054,10 @@ async function signedIn(site, token, jwt, device, onTeam = false) {
 // TEAM marks a team seat's account name beside the account's own.
 const TEAM = "team"
 const who = (u) => first(String(u?.email ?? "").replace(/@phone\.local$/, ""), u?.name, u?.user_id, "ZCode")
+// uidOf is the account's user id, kept beside its name: magpie tells two
+// accounts of one name apart by it, a name being no one's own (wakkana on
+// Discord, WorkBuddy's)
+const uidOf = (u) => (u?.user_id === undefined || u?.user_id === null ? "" : String(u.user_id).trim())
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // authorize opens ZCode's sign-in flow on site; its callback polls it.
@@ -1053,6 +1116,7 @@ async function authorize(site, log, onTeam = false) {
           // the key doesn't run out; ZCode's token, when it is all there is, does
           expires: s.key || isTeam(s) ? 0 : jwtExpiry(s.jwt),
           accountId: onTeam ? `${who(got.user)} (${TEAM})` : who(got.user),
+          ...(uidOf(got.user) ? { uid: uidOf(got.user) } : {}),
         }
       }
     },
@@ -1180,6 +1244,86 @@ function configKey(key) {
   return null
 }
 
+// ownLocation is where ZCode 3.16 finds the account's own coding plan key
+// when it keeps none: credentials.json's
+// project-key-location:v1:<[origin, family, accountId, team, 1, selection]>,
+// URI-encoded JSON, holds { organizationId, projectId, apiKeyId } (its
+// ProjectAccessTokenClient). ZCode trades that key for a short-lived
+// project token each time; here its secret is read (located), as a sign-in
+// here reads its own key's. The account's own (team null), of the family
+// ZCode is on first, else Z.ai's, as ZCode lists them; one of another
+// account the profile names is left alone (meraki7304, #410).
+const LOCATION = "project-key-location:v1:"
+function ownLocation(store, key) {
+  const set = readJSON(join(settingDir(), "setting.json"))
+  const fams = set?.providerFamilyDomain === "bigmodel" ? ["bigmodel", "zai"] : ["zai", "bigmodel"]
+  const found = []
+  for (const [name, v] of Object.entries(store)) {
+    if (!name.startsWith(LOCATION)) continue
+    let at
+    try {
+      at = JSON.parse(decodeURIComponent(name.slice(LOCATION.length)))
+    } catch {
+      continue
+    }
+    if (!Array.isArray(at) || at[3] !== null || String(at[4]) !== "1" || !fams.includes(at[1])) continue
+    let loc
+    try {
+      loc = JSON.parse(decrypt(key, v) ?? "")
+    } catch {}
+    const org = first(loc?.organizationId), project = first(loc?.projectId), apiKeyId = first(loc?.apiKeyId)
+    if (!org || !project || !apiKeyId) continue
+    found.push({ site: at[1], origin: typeof at[0] === "string" ? at[0] : "", account: String(at[2] ?? ""), org, project, apiKeyId })
+  }
+  for (const site of fams) {
+    const token = first(decrypt(key, store[`oauth:${site}:access_token`]))
+    if (!token) continue
+    let me = ""
+    try {
+      me = String(JSON.parse(decrypt(key, store[`oauth:${site}:user_info`]) ?? "{}")?.id ?? "")
+    } catch {}
+    const mine = found.filter((l) => l.site === site && (!me || l.account === me))
+    if (!mine.length) continue
+    const l = mine[0]
+    // the origin ZCode asked, when it is the site's own; else the site's API
+    let origin = SITES[site].api
+    try {
+      const u = new URL(l.origin)
+      const h = u.host.toLowerCase()
+      if (u.protocol === "https:" && (site === "zai" ? h === "z.ai" || h.endsWith(".z.ai") : h === "bigmodel.cn" || h.endsWith(".bigmodel.cn"))) origin = u.origin
+    } catch {}
+    return { site, base: SITES[site].base, token, loc: { origin, org: l.org, project: l.project, apiKeyId: l.apiKeyId } }
+  }
+  return null
+}
+
+// located gives a sign-in that has only ZCode's key location (ownLocation)
+// its key: the secret of the key it names, read as ZCode lists the
+// project's keys (BigModel's token bare, Z.ai's as a Bearer). Nothing is
+// made: a location whose key is gone (404) leaves the sign-in keyless, as
+// before; any other failure is said. A key read is kept for the token.
+const locatedKeys = new Map()
+async function located(s) {
+  if (!s || s.key || !s.loc || !s.token) return s
+  const l = s.loc
+  const id = [s.token, l.origin, l.org, l.project, l.apiKeyId].join("\0")
+  let got = locatedKeys.get(id)
+  if (!got || (got.err && Date.now() - got.at >= 60_000)) {
+    const auth = s.site === "zai" ? "Bearer " + s.token : s.token
+    try {
+      const secret = first((await call("GET", `${keysURL(l.origin, l.org, l.project)}/copy/${encodeURIComponent(l.apiKeyId)}`, { auth }))?.secretKey)
+      got = secret ? { key: `${l.apiKeyId}.${secret}` } : { err: new Error("no secret for the key") }
+    } catch (e) {
+      got = e?.status === 404 ? { key: "" } : { err: e }
+    }
+    got.at = Date.now()
+    locatedKeys.set(id, got)
+  }
+  if (got.err) throw new Error(`ZCode's ${SITES[s.site].name} coding plan key: ${got.err.message} — sign in to ZCode again`)
+  if (got.key) s.key = got.key
+  return s
+}
+
 // ownSignIn is what ZCode is signed in to now: the account, its coding
 // plan key, ZCode's session token (the Start Plan's key) and the team plan
 // it is switched to; null when it has none of them.
@@ -1200,6 +1344,8 @@ function ownSignIn() {
   // ZCode 3.15 keeps no plan key in its credentials; the one it uses sits
   // in config.json, the provider's options.apiKey (yetone/magpie#2130)
   if (!s.key) s = configKey(key) || s
+  // ZCode 3.16 keeps neither: only where the key is (#410)
+  if (!s.key) s = ownLocation(store, key) || s
   const jwt = first(first(decrypt(key, store.zcodejwttoken)).replace(/^Bearer /, ""))
   const team = ownTeam(store, key)
   if (team) s = { ...team, jwt }
@@ -1214,7 +1360,7 @@ function ownSignIn() {
       } catch {}
     }
   }
-  return { ...s, user: who(info) }
+  return { ...s, user: who(info), uid: uidOf(info) }
 }
 
 // asZCode is the sign-in "as ZCode": what it reads is ZCode's own.
@@ -1226,9 +1372,9 @@ function asZCode() {
     async callback() {
       const own = ownSignIn()
       if (!own) return { type: "failed", error: "ZCode isn't signed in on this computer; sign in to ZCode, or sign in to Z.ai or BigModel here" }
-      const { user, ...s } = own
+      const { user, uid, ...s } = own
       const state = { source: "zcode", device: anyDevice, ...s }
-      return { type: "success", refresh: JSON.stringify(state), access: s.key || s.jwt || "", expires: 0, accountId: user }
+      return { type: "success", refresh: JSON.stringify(state), access: s.key || s.jwt || "", expires: 0, accountId: user, ...(uid ? { uid } : {}) }
     },
   }
 }
@@ -1247,17 +1393,20 @@ function stateOf(auth) {
       // send this account's requests as that one, and an expired session
       // says sign in again (EXPIRED) rather than borrowing another's.
       const own = ownSignIn()
-      if (own && own.user === String(auth.accountId ?? "")) {
-        const { user, ...now } = own
+      // (by user id where both have one: another account may share the name)
+      if (own && own.user === String(auth.accountId ?? "") && (!own.uid || !auth.uid || own.uid === String(auth.uid))) {
+        const { user, uid: _uid, ...now } = own
         s = { source: "zcode", device: s.device, plan: s.plan, ...now }
       }
     }
     const site = siteOf(s.site)
-    return { ...s, site, base: s.base || SITES[site].base, key: s.key ?? (s.jwt ? "" : auth.access), device: s.device || anyDevice }
+    const key = s.key ?? (s.jwt ? "" : auth.access)
+    return { ...s, site, base: s.base || SITES[site].base, key, device: s.device || (key ? keyDevice(key) : anyDevice) }
   }
   if (auth?.type === "api") {
     const site = siteOf(auth.metadata?.site)
-    return { site, base: SITES[site].base, key: String(auth.key ?? "").trim(), device: anyDevice }
+    const key = String(auth.key ?? "").trim()
+    return { site, base: SITES[site].base, key, device: key ? keyDevice(key) : anyDevice }
   }
   return null
 }
@@ -1409,6 +1558,71 @@ function kept(res, text) {
   h.delete("content-encoding")
   h.set("X-Magpie-Sign-In", "kept")
   return new Response(text !== undefined ? text : res.body, { status: res.status, statusText: res.statusText, headers: h })
+}
+
+// ---- the plan's concurrency ------------------------------------------------------
+// ZCode serves one account a few requests at a time. Past that it answers 429
+// with code 3008, "user concurrency limit exceeded", or 3009, "model
+// concurrency limit exceeded": the request's turn has not come — not a plan
+// spent (1113/1005) and not a rate limit (1302/1303). magpie sends every
+// agent's and every session's requests of this computer through this one
+// process, and its own queue spaces an account's requests by the number
+// declared below (DEFAULT_CONCURRENCY, on the auth hook and in package.json);
+// a request the vendor refuses anyway waits a moment and asks again, the same
+// bytes. A refusal is immediate while a turn's answer is not, so a redundant
+// ask costs a round trip and no tokens.
+//
+// The plugin keeps no gate of its own: a plan's cap depends on its tier (Z.ai
+// serves Max more at once than Pro, and Lite fewer) and is higher off-peak
+// (https://docs.z.ai/devpack/usage-policy), so a number written here would
+// hold a Max account to a Lite one's, with no way for the user to raise it.
+const DEFAULT_CONCURRENCY = 3
+const BUSY_CODES = new Set(["3008", "3009"])
+// BUSY_WAITS are the waits between asks, longest last: about ten seconds of
+// them. Past that the account is saturated rather than busy, and magpie's
+// routing takes the request (or rests the account, as its 429 says).
+const BUSY_WAITS = [250, 500, 900, 1600, 2800, 4000]
+const BUSY_HINT =
+  "ZCode serves one account a few requests at a time, and every agent and session of this computer asks through magpie; this request came behind the others, and the same request a moment later is served"
+
+// busy says a 429 is that in-flight cap: its own code (3008, 3009), or its
+// own words when the envelope carries no code.
+function busy(status, text) {
+  if (status !== 429) return false
+  let b
+  try {
+    b = JSON.parse(text)
+  } catch {
+    return false
+  }
+  if (!b || typeof b !== "object") return false
+  const say = (v) => (v == null || typeof v === "object" ? "" : String(v))
+  if (BUSY_CODES.has(say(b.code) || say(b.error?.code))) return true
+  return /concurrency limit exceeded/i.test(say(b.msg) + " " + say(b.message) + " " + say(b.error?.message) + " " + say(b.error))
+}
+
+// busyAnswer is the vendor's cap refusal as the agent reads it: its words,
+// then what they are and what to do, as noPlanKey says why a key has no plan.
+function busyAnswer(res, text) {
+  const h = new Headers(res.headers)
+  h.set("content-type", "application/json")
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {}
+  if (v && typeof v === "object") {
+    const said = first(v.msg, v.message, v.error?.message, typeof v.error === "string" ? v.error : "", `${res.status}`)
+    const code = v.code ?? v.error?.code
+    const head = code != null && !said.includes(String(code)) ? `${said} (${res.status}, code ${code})` : said
+    const message = `${head} — ${BUSY_HINT}`
+    const out = v.error && typeof v.error === "object" ? { ...v, error: { ...v.error, message } } : { ...v, msg: message }
+    return new Response(JSON.stringify(out), { status: res.status, statusText: res.statusText, headers: h })
+  }
+  return new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `${res.status} ${STATUS_TEXT[res.status] ?? res.statusText} — ${BUSY_HINT}`.trim() } }), {
+    status: res.status,
+    statusText: res.statusText,
+    headers: h,
+  })
 }
 
 function model(m, url) {
@@ -1712,7 +1926,7 @@ function contextPrefix() {
 // sign-in's device. site names the powered-by line's provider, place where
 // the agent works (workPlace). A body that isn't a Messages request goes as
 // it is.
-function dress(text, site, device, place) {
+function dress(text, site, device, place, session) {
   if (typeof text !== "string" || !text.includes("messages")) return text
   let b
   try {
@@ -1752,8 +1966,49 @@ function dress(text, site, device, place) {
   }
   if (Array.isArray(b.tools)) for (const t of b.tools) if (t && typeof t === "object") delete t.cache_control
   const meta = b.metadata && typeof b.metadata === "object" ? b.metadata : {}
-  b.metadata = { ...meta, user_id: JSON.stringify({ device_id: device, account_uuid: "", session_id: "" }) }
+  b.metadata = { ...meta, user_id: userIdOf(device, session) }
   return JSON.stringify(b)
+}
+
+// userIdOf is metadata.user_id as ZCode's client (3.14.3, glm/zcode.cjs
+// MLs and vWr) puts it on every Anthropic-format request, a coding plan's
+// too: the machine's device id, no account uuid. The plan's endpoint keeps
+// a prompt cache on the machine it picks by it, so a request without it
+// lands anywhere and its cache is mostly missed (#387). Its session_id is
+// the request's x-session-id (sessionOf), as ZCode's is.
+const userIdOf = (device, session = "") => JSON.stringify({ device_id: device, account_uuid: "", session_id: session })
+
+// marked is a coding plan's Messages request body with metadata.user_id
+// as ZCode sends it, when the agent sent none of its own. Anything else,
+// a body that isn't a Messages request among them, goes as it is.
+function marked(text, device, session) {
+  if (typeof text !== "string" || !device || !text.includes("messages")) return text
+  let b
+  try {
+    b = JSON.parse(text)
+  } catch {
+    return text
+  }
+  if (!b || typeof b !== "object" || Array.isArray(b) || !Array.isArray(b.messages)) return text
+  const meta = b.metadata && typeof b.metadata === "object" && !Array.isArray(b.metadata) ? b.metadata : {}
+  if (typeof meta.user_id === "string" && meta.user_id.trim()) return text
+  b.metadata = { ...meta, user_id: userIdOf(device, session) }
+  return JSON.stringify(b)
+}
+
+// sessionOf is the x-session-id a request goes with, as ZCode's client
+// (3.14.3, glm/zcode.cjs xst and Tst) sends it: a bare UUID, the same on
+// every turn of a conversation. BigModel keeps a prompt's cache for the
+// requests that name the same session and seldom for those that name none
+// (#387). The agent's session (chat.headers below) goes as it is when it is
+// a UUID, else as a UUID made from it, so the vendor sees only ZCode's
+// format, never magpie's or another agent's; with none, a UUID made from
+// the device.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+function sessionOf(id, device) {
+  const own = typeof id === "string" ? id.trim() : ""
+  if (UUID.test(own)) return own.toLowerCase()
+  return uuidOf(own ? "zcode-session\0" + own : "zcode-session-device\0" + (device ?? ""))
 }
 
 // ---- the plugin ------------------------------------------------------------------
@@ -1770,6 +2025,14 @@ export async function ZCodeAuthPlugin({ client }) {
     authorize: () => authorize(site, log),
   })
   return {
+    // the agent's session, which magpie tells the plugins here and not
+    // in the request, goes on as x-session-id (sessionOf)
+    "chat.headers": async (input, output) => {
+      const provider = input?.model?.providerID ?? input?.provider?.info?.id
+      if (provider !== PROVIDER) return
+      const id = input?.sessionID
+      if (typeof id === "string" && id.trim()) output.headers["x-session-id"] = sessionOf(id)
+    },
     config: async (cfg) => {
       cfg.provider ??= {}
       const was = cfg.provider[PROVIDER] ?? {}
@@ -1785,7 +2048,11 @@ export async function ZCodeAuthPlugin({ client }) {
       id: PROVIDER,
       // the account's plan's models, as ZCode's config lists them now
       async models(provider, { auth } = {}) {
-        const s = stateOf(auth)
+        // a ZCode 3.16 sign-in holds only where its key is: read the key
+        // first, as a request does, or plansOf takes the keyless sign-in
+        // for a Start Plan one and lists that plan's models (#439). A key
+        // that can't be read throws, and magpie keeps the list it had.
+        const s = await located(stateOf(auth))
         if (!s) return provider.models
         const { start, gift: known } = await plansOf(s).catch(() => ({ start: false, gift: null }))
         const gift = start ? await startPlan(s.jwt, s.device).catch(() => null) : known
@@ -1825,6 +2092,12 @@ export async function ZCodeAuthPlugin({ client }) {
     },
     auth: {
       provider: PROVIDER,
+      // a plan serves one account a few requests at a time: magpie's own
+      // field, so its queue spaces what the agents ask for before the vendor
+      // sees it. This is a default, not a cap the plugin enforces — a plan's
+      // own cap follows its tier (Max > Pro > Lite) and the time of day, and
+      // a user who knows theirs can raise this on the account
+      maxConcurrency: DEFAULT_CONCURRENCY,
       async loader(getAuth, provider) {
         const s0 = stateOf(await getAuth())
         if (!s0) return {}
@@ -1834,7 +2107,7 @@ export async function ZCodeAuthPlugin({ client }) {
           apiKey: s0.key || "zcode", // the fetch below puts the real one on
           async fetch(input, init) {
             const auth = await getAuth()
-            const s = stateOf(auth)
+            const s = await located(stateOf(auth))
             if (!s) throw new Error("not signed in to ZCode")
             let url = input instanceof Request ? input.url : String(input)
             const opts = input instanceof Request ? { method: input.method, headers: input.headers, body: input.body, signal: input.signal, duplex: "half", ...init } : { ...init }
@@ -1889,6 +2162,7 @@ export async function ZCodeAuthPlugin({ client }) {
             }
             let h = new Headers(opts.headers)
             const place = workPlace(h)
+            const sid = sessionOf(h.get("x-session-id"), s.device)
             if (start) {
               if (jwtExpired(s.jwt)) throw new Error(EXPIRED)
               if (!s.jwt) throw new Error("ZCode's sign-in has no key; sign in again")
@@ -1896,26 +2170,62 @@ export async function ZCodeAuthPlugin({ client }) {
               // the Start Plan is served only to what looks like ZCode's own request
               url = startURL(url)
               h = startHeaders(h, s.jwt)
+              h.set("x-session-id", sid)
               if (opts.body != null) {
                 const text = orig ?? (typeof opts.body === "string" ? opts.body : await new Response(opts.body).text())
-                opts.body = dress(text, s.site, s.device, place)
+                opts.body = dress(text, s.site, s.device, place, sid)
                 delete opts.duplex
                 h.delete("content-length")
               }
             } else {
               if (!key) throw new Error("ZCode's sign-in has no key; sign in again")
               swap(s.base)
+              // a Messages request names the device, as ZCode's does (#387);
+              // count_tokens and other paths ZCode never sends go as they are
+              if (opts.body != null && /\/v1\/messages$/.test(new URL(url).pathname)) {
+                const text = typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
+                const next = marked(text, s.device, sid)
+                if (next !== text) h.delete("content-length")
+                opts.body = next
+                delete opts.duplex
+              }
               if (renamed) h.delete("content-length")
+              h.set("x-session-id", sid)
               h.delete("authorization")
               h.set("x-api-key", key)
               h.set("Authorization", "Bearer " + key)
             }
-            let res = await fetch(url, { ...opts, headers: h })
+            // a refusal that is the account's or the model's own in-flight
+            // cap is asked again a moment later (see the plan's concurrency):
+            // magpie sends every agent's and every session's requests of this
+            // computer through this one process, and its queue spaces them by
+            // the number declared above
+            const ask = () => fetch(url, { ...opts, headers: h })
+            let res = await ask()
+            for (let i = 0; res.status === 429; i++) {
+              const text = await res.text()
+              const cap = busy(429, text)
+              if (!cap || i >= BUSY_WAITS.length) {
+                res = cap
+                  ? busyAnswer(res, text)
+                  : new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
+                break
+              }
+              const w = BUSY_WAITS[i]
+              await sleep(Math.round(w * (0.75 + Math.random() * 0.5)))
+              res = await ask()
+            }
             // the Start Plan turning the request away says what to do about
             // it: the account blocked, or the network
             if (start && res.status >= 400) {
               const text = await res.text()
-              if (startRefused(res.status, text)) return kept(startBlocked(res, text))
+              if (startRefused(res.status, text)) {
+                // a key account sent to the Start Plan (its plan list read
+                // none) reads its plans again on the next request, so a
+                // coding plan that is there after all is used (#369)
+                if (s.key && !forcedGift) routes.delete(s.key + "\0" + s.jwt)
+                return kept(startBlocked(res, text))
+              }
               res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
             }
             // a key with no plan behind it: what Z.ai said, and why a
@@ -1958,6 +2268,11 @@ export async function ZCodeAuthPlugin({ client }) {
         const auth = await getAuth()
         const s = stateOf(auth)
         if (!s) return { error: "not signed in", signIn: "kept" }
+        try {
+          await located(s)
+        } catch (e) {
+          return { error: e.message, signIn: "kept" }
+        }
         // every card starts from the plan the sign-in saved, as magpie's
         // built-in did: a reply without a level, a team detail that
         // failed or an error keeps it
@@ -1971,6 +2286,12 @@ export async function ZCodeAuthPlugin({ client }) {
           return out
         }
         try {
+          // a card read is a fresh read: the route is read again with it,
+          // so a plan bought, a gift claimed or a plan lapsed reaches the
+          // requests when the card shows it, not ten minutes later (#379)
+          routes.delete(s.key + "\0" + s.jwt)
+          const { start, gift } = await plansOf(s)
+          let card
           if (isTeam(s)) {
             let key = s.key
             if (!key) {
@@ -1980,10 +2301,9 @@ export async function ZCodeAuthPlugin({ client }) {
                 await client?.auth?.set?.({ path: { id: provider?.id ?? PROVIDER }, body: next }).catch?.(() => {})
               }
             }
-            return saved(await teamUsage(s, key))
-          }
-          const { start, gift } = await plansOf(s)
-          const card = saved(start ? await startUsage(s) : gift ? await dualUsage(s) : await codingUsage(s))
+            const team = await teamUsage(s, key)
+            card = saved(gift || giftReadable(s) ? await dualUsage(s, team) : team)
+          } else card = saved(start ? await startUsage(s) : gift || giftReadable(s) ? await dualUsage(s) : await codingUsage(s))
           // a gift plan ZCode holds for the account but has not put on it:
           // named on the card, claimed in the ZCode app (its claim needs
           // the app's captcha attestation, see claimHint). A card that is
@@ -2047,4 +2367,4 @@ export async function ZCodeAuthPlugin({ client }) {
 // config sets what zcodeConfig has read, for tests: null is ZCode's config
 // out of reach, undefined forgets it
 const config = (cfg) => (cfgCache = cfg === undefined ? null : { cfg, at: Date.now() })
-export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { config, entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, located, dress, PROMPT, marked, keyDevice, sessionOf, busy, BUSY_WAITS, DEFAULT_CONCURRENCY }

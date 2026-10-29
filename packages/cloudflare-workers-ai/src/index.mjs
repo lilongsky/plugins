@@ -21,6 +21,12 @@ const PAID_ONLY_MODELS = new Set([
 ]);
 const FREE_ALLOCATION_NEURONS = 10000; // per day, both plans
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DAY_S = 86400; // magpie's UsageWindow.span unit is seconds, not ms
+const SPENT_ALLOCATION_CODE = 3036; // "you have used up your daily free allocation"
+
+function nextUtcMidnight(now = Date.now()) {
+  return new Date((Math.floor(now / DAY_MS) + 1) * DAY_MS);
+}
 
 function checkedURL(value) {
   const url = new URL(value);
@@ -327,20 +333,46 @@ export async function CloudflareWorkersAIPlugin(_input, options = {}) {
               }
             }
 
-            return fetchImpl(targetURL, {
+            const resp = await fetchImpl(targetURL, {
               method: req.method,
               headers,
               body,
               signal: init?.signal ?? req.signal,
               redirect: "error",
             });
+            if (resp.status !== 429) return resp;
+            // A spent daily free allocation is refused until 00:00 UTC, but
+            // Cloudflare's 429 says nothing of when (no Retry-After, no
+            // timestamp), so magpie would retry every 15 minutes until
+            // midnight. A 3036 is exactly that refusal — answer it with the
+            // real rest. Any other 429 is transient and keeps its own words:
+            // a day-long Retry-After on a plain rate limit would bench a
+            // working account for hours.
+            const text = await resp.text().catch(() => "");
+            let spentAllocation = false;
+            try {
+              spentAllocation = (JSON.parse(text)?.errors ?? []).some(
+                (e) => e?.code === SPENT_ALLOCATION_CODE,
+              );
+            } catch {
+              /* non-JSON body: pass through */
+            }
+            if (!spentAllocation) {
+              return new Response(text, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+            }
+            const headersOut = new Headers(resp.headers);
+            headersOut.set("Retry-After", String(Math.max(1, Math.ceil((nextUtcMidnight() - Date.now()) / 1000))));
+            return new Response(text, { status: resp.status, statusText: resp.statusText, headers: headersOut });
           },
         };
       },
       async usage(getAuth, _provider) {
-        // Cloudflare publishes no REST for per-account Neurons (dashboard only);
-        // show the repeatable free-allocation window (10,000 Neurons/day,
-        // resets daily 00:00 UTC) and best-effort plan detection.
+        // Workers AI has no REST for per-account Neurons (dashboard only), but
+        // the GraphQL Analytics API does: sum today's totalNeurons so the quota
+        // row shows the real used amount instead of a fake full allowance.
+        // Falls back to the repeatable free-allocation window (10,000
+        // Neurons/day, resets daily 00:00 UTC) when the token lacks the
+        // Analytics scope or the query fails. Plan detection stays best-effort.
         const auth = await getAuth?.();
         const acct = auth?.metadata?.accountId || accountId;
         if (!acct || !/^[0-9a-f]{32}$/i.test(acct)) {
@@ -348,6 +380,8 @@ export async function CloudflareWorkersAIPlugin(_input, options = {}) {
           return { plan: "Workers Free / Paid (confirm in the dashboard)", windows: [] };
         }
         let plan = "Workers Free / Paid (confirm in the dashboard)";
+        // Only a confirmed Free plan treats the included allowance as a hard cap.
+        let planIsFree = false;
         try {
           const res = await fetchImpl(`https://api.cloudflare.com/client/v4/accounts/${acct}`, {
             headers: { authorization: `Bearer ${auth?.key ?? apiKey}` },
@@ -357,24 +391,63 @@ export async function CloudflareWorkersAIPlugin(_input, options = {}) {
           if (res.ok) {
             const info = await res.json();
             const planName = info?.result?.plan?.name ?? info?.result?.plan ?? "";
-            if (/free/i.test(String(planName))) plan = "Workers Free";
-            else if (String(planName)) plan = String(planName);
+            if (/free/i.test(String(planName))) {
+              plan = "Workers Free";
+              planIsFree = true;
+            } else if (String(planName)) plan = String(planName);
           }
         } catch {
           /* token scope not enough or network issue — keep unknown */
         }
-        const nextUtcMidnight = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS + DAY_MS);
+        const nextMidnight = nextUtcMidnight();
+        let used = null;
+        try {
+          const res = await fetchImpl("https://api.cloudflare.com/client/v4/graphql", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${auth?.key ?? apiKey}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              query:
+                'query { viewer { accounts(filter: {accountTag: "' + acct +
+                '"}) { aiInferenceAdaptiveGroups(limit: 100, filter: {datetimeHour_geq: "' +
+                new Date(nextMidnight.getTime() - DAY_MS).toISOString() + '", datetimeHour_lt: "' + nextMidnight.toISOString() +
+                '"}) { sum { totalNeurons } } } } }',
+            }),
+            redirect: "error",
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (res.ok) {
+            const info = await res.json();
+            const rows = info?.data?.viewer?.accounts?.[0]?.aiInferenceAdaptiveGroups;
+            // An empty bucket list is a real zero (nothing ran today); a
+            // missing list or an error payload means we could not read usage.
+            if (Array.isArray(rows) && !info.errors?.length) {
+              used = rows.reduce((s, r) => s + (Number(r?.sum?.totalNeurons) || 0), 0);
+            }
+          }
+        } catch {
+          /* no Analytics scope, rate limit or network issue — keep unknown */
+        }
         return {
           plan,
           windows: [
             {
               name: "Neurons/day (free allowance)",
-              span: DAY_MS,
-              resetsAt: nextUtcMidnight.toISOString(),
-              amount: null,
+              span: DAY_S,
+              resetsAt: nextMidnight.toISOString(),
+              amount: used,
+              // Aside keeps Paid/unknown plans routable while showing the free allowance.
+              ...(used !== null
+                ? { used: Math.min(100, (100 * used) / FREE_ALLOCATION_NEURONS), aside: !planIsFree }
+                : {}),
               limit: FREE_ALLOCATION_NEURONS,
               unit: "neurons",
-              display: "≤10,000 Neurons/day; exact usage is on the Cloudflare dashboard (no public API)",
+              display:
+                used === null
+                  ? "≤10,000 Neurons/day; exact usage is on the Cloudflare dashboard (grant Account Analytics → Read to see it here)"
+                  : "",
             },
           ],
         };
