@@ -76,3 +76,18 @@ test('a failed sign-in says which file it looked for, and a failed Work check is
   const gone=I.createPlugin({readSession:()=>session,fetchImpl:async()=>new Response('{}',{status:401})});
   expect((await (await gone.auth.methods[0].authorize()).callback()).error).toContain('过期');
 });
+
+for(const [label,fail,detail] of [
+  ['HTTP 503',()=>new Response('{}',{status:503}),'HTTP 503'],
+  ['timeout',()=>{throw new DOMException('synthetic request timed out','TimeoutError');},'超时'],
+])test('a found session with '+label+' is a connection failure, not a missing or expired sign-in',async()=>{
+  const session={uid:'fixture-user',workToken:'synthetic-work-key',webToken:'synthetic-web',webRefresh:'synthetic-refresh'};
+  let calls=0;
+  const p=I.createPlugin({readSession:()=>session,fetchImpl:async()=>{calls++;return fail();}});
+  const result=await (await p.auth.methods[0].authorize()).callback();
+  expect(result.type).toBe('failed');expect(result.error).toContain(detail);
+  expect(result.error).toContain('已找到本机 Kimi Work 登录');
+  expect(result.error).not.toContain('没有可用');expect(result.error).not.toContain('登录已过期');
+  expect(result.error).not.toContain(session.workToken);expect(result.error).not.toContain(session.webRefresh);
+  expect(calls).toBe(1);
+});
