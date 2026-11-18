@@ -63,6 +63,17 @@ pay-as-you-go 不发请求、缺凭据、控制面拒绝，以及签名与 Volce
 在 provider 编辑器里删掉套餐不支持的 id 即可；`ark/glm-5-3-flash`、`deepseek-v4-1-flash-*`
 在当前的团队版 Medium 上实测可用。
 
+## 发布（维护者）
+
+```sh
+npm login --registry https://registry.npmjs.org
+npm publish --registry https://registry.npmjs.org --access public
+```
+
+或推送 `v*` 标签，让 `.github/workflows/publish.yml` 发（需要仓库 secret `NPM_TOKEN`）。
+发布后 tagged 列表会改用 npm spec，社区审核区（`magpie-community/plugins` 的
+`registry.json`）才收——它只列 npm 包。
+
 ## 限额
 
 插件只声明 Chat 与 Responses 两种 API；Anthropic messages（`/api/plan`）没有接入。
