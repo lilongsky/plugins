@@ -101,6 +101,21 @@ magpie plugin login modelscope-ai
 supported" 的条目）标成 `deprecated`，magpie 会把它们从选择器和路由组里滤掉。
 国内站没有逐个实测，不设黑名单。
 
+### 图片与多模态
+
+`/v1/models` 同样给不了「收不收图」。之前每个模型都写 `image: false`，在 magpie
+里这不是「不知道」，而是**明说「不支持」**：网关会把图片先描述成文字，视觉模型
+也用不上自家的眼睛。现在 `src/modalities.mjs` 按魔搭模型页的 pipeline 标签补：
+
+| pipeline | 例子 | 声明 |
+| --- | --- | --- |
+| `image-text-to-text` | Qwen3.5 / 3.8 全系、DeepSeek-V4.1、InternVL、ERNIE-VL、Kimi-K3.1、MiniMax-M3、Intern-S | 收图，出文本 |
+| `text-generation` | DeepSeek-V4 / V4-Pro、GLM、Nex、Step-5 | 只说自己是文本模型，不硬写「不收图」 |
+| `image-to-image` | Qwen-Image-Edit、MusePublic/Qwen-Image-Edit | 只收图、只出图；`output.text: false`，magpie 会把它从聊天列表摘掉，只在画图入口出现 |
+
+2026-11-18 对国内站 38 个模型逐个核过 pipeline 标签。表里没有的新 id 只报文本、
+不声明图片能力，将来上的视觉模型仍能收到图，不会被本地网关先挡掉。
+
 ### 推理强度
 
 `/v1/models` 只给 id，给不了「是不是思考模型」「支持哪几档推理强度」。不补这张
@@ -112,7 +127,7 @@ supported" 的条目）标成 `deprecated`，magpie 会把它们从选择器和�
 | `nex-agi/Nex-N2.5-*` | 模型卡 | ✅ | none / medium / high |
 | `Qwen/Qwen3.8-Flash-Next` | 模型卡（默认 xhigh） | ✅ | low / medium / xhigh |
 | `Qwen/Qwen3.5-*` | 模型卡（默认思考，开关型） | ✅ | — |
-| `Qwen/Qwen3.8-27B` | 同代 | ✅ | — |
+| `Qwen/Qwen3.8-27B` | 模型卡（默认 xhigh） | ✅ | low / medium / xhigh |
 | `deepseek-ai/DeepSeek-V4*` | 思考模型（输出 reasoning_content） | ✅ | — |
 | `ZhipuAI/GLM-4.5 / 4.6 / 4.7 / 5.2` | models.dev 目录 | ✅ | — |
 
@@ -121,7 +136,19 @@ supported" 的条目）标成 `deprecated`，magpie 会把它们从选择器和�
 
 没有文档依据的 id 一律不猜：`variants` 留空、`reasoning` 不硬写 true。一个填了
 档位但上游不认的变体，会让用户选「high」而实际仍是默认档——比没有更糟。国内站
-38 个模型里，15 个标了思考，其中 2 个有档位。
+38 个模型里，15 个标了思考，其中 4 个有档位。
+
+### 一次请求花了多少魔粒？
+
+做不到按请求归因，三个来源都不给这个粒度：
+
+- 推理响应里只有 token 用量，没有魔粒字段，响应头也没有（2026-11-18 实测）
+- 账单只有按 (天, 档位) 聚合的 `SPEND_CONFIRM` 行（`model_tier` + `total_amount` + `count`）
+- magpie 的账本本身没有按请求的积分记账，并发时余额差也分不清是谁花的
+  （`docs/subsystems/providers-accounts.md` 明说不做按次归因）
+
+所以卡片说的是「今天花了 5 魔粒 · 3 次（旗舰 2×2、标准 1×1）」，不是「这一笔 2 魔粒」。
+每笔按 2 的估算只在本地用来判断什么时候该提前去读余额。
 
 ### 用量卡
 
@@ -200,8 +227,8 @@ cd D:\magpie-plugin\magpie-modelscope-hub
 node --test
 ```
 
-17 个用例：15 个单元（北京时间换算、账单汇总与额度分桶、用量卡三种形态、模型
-条目形态与 deprecated 判定、推理强度覆盖、两个 provider 的钩子形状）+ 2 个端到端
+19 个用例：17 个单元（北京时间换算、账单汇总与额度分桶、用量卡三种形态、模型
+条目形态与 deprecated 判定、推理强度覆盖、图片与多模态能力、两个 provider 的钩子形状）+ 2 个端到端
 （起一个本地假站点，跑通「签到 → 到账 → 用量卡 → 模型列表」和「401 标记过期」
 两条链路，不联外网、不碰真令牌）。
 
