@@ -35,7 +35,7 @@ Open **模型评测** after installation. Magpie manages the runtime, connects l
 3. Review the sample count and timeout, then click **开始评测**.
 4. Open **分析** to compare scores against cost, tokens, or elapsed time, and inspect individual answers below.
 
-You can cancel a run or task at any time, or manually retry failed, timed-out, interrupted, or cancelled samples in task history without rerunning completed ones. To target specific local accounts instead of automatic selection, see [account binding](magpie/README.md#explicit-local-account-bindings).
+You can cancel a run or task at any time, or manually retry failed, timed-out, interrupted, or cancelled samples in task history without rerunning completed ones. To target specific local accounts instead of automatic selection, see [account binding](magpie/README.md#local-account-and-multi-key-bindings).
 
 ## Read the results
 
