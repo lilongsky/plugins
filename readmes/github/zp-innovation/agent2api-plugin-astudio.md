@@ -211,6 +211,9 @@ agent2api-server 二进制（`web_shim.rs:47`），只要 `login/start` 回了�
 | `install.sh` | `docker cp` 到容器 `/app/ui/`，并在 `index.html` 的 `</body>` 前幂等注入 `<script>`（先备份成 `index.html.a2a-orig`）；`install.sh uninstall` 还原 |
 | `verify-modal.py` | 用 playwright 取一张**真二维码**跑补丁：断言弹窗出现、图片真加载、`context.pages` 仍是 1、取消按钮生效、非图片 URL 仍开新标签页 |
 
+`host-patch/` 里还有两个补丁，各自在下面单独一节：`astudio-sms-login.js`（手机验证码登录搬进面板）、
+`astudio-usage-compact.js`（余额列改成单条读数 + 弹窗）。`install.sh` 一次把三个都装上。
+
 ```bash
 # 在网关宿主机上（容器名默认 agent2api，可用 CONTAINER=xxx 覆盖）
 sudo bash install.sh          # 安装
@@ -261,6 +264,40 @@ wasm 包才有的 `login.captcha.geetest` 能力；发码接口 `login/mobile/se
 > 「获取验证码」」，重试即可，不会白费一次登录（发码还没发生）。
 > 补丁依赖上游 CORS 与 `document.referrer` 可伪造这两点，属于**非承诺行为**：哪天极验改成校验真实 Referer 头，
 > 这条会退化回 A/B 两条老路，微信扫码不受影响。
+
+### 余额列：单条读数 + 弹窗（`astudio-usage-compact.js`）
+
+面板里 AStudio · zp 的余额格原本是**整块内联卡片**（体验版徽章 + 每个积分池一行 + 「额度详情 ⌄」），
+WorkBuddy 那种是**一行「可用 466 ▾」**、明细收进浮层。这件事插件决定不了：
+
+- 余额格形态由宿主 `reports.mjs:11-39 usageReport()` 透出的字段决定，它只透
+  `{success, windows[], user, signIn, resets, subscription, available, availableView, balanceView, warnings}`；
+- WorkBuddy 的单行读数走的是 `totalLeft`、明细走的是 `credits`（`ui.js` 里 `lOe()` 判 `hasOwnProperty("totalLeft")`、
+  弹层读 `t.credits`）——这些键由宿主自己的 native provider 直接产出，脚本插件这条路上**全部被裁掉**；
+- `wallets` 那条路（`uOe`/`dOe`）同样要求 `wallets` 非空，脚本插件也没有。
+
+所以 `lib/usage.mjs` 怎么填，余额列都只会落到 `.usage-window-cell`（分窗口卡片）那一支。补丁因此做的是
+**换皮不换数**：在 `tr.acct-row[data-provider="astudio"]` 里隐藏 React 渲染的 `.usage-window-cell`，
+在同一个 `td.cell-usage` 里插入一枚**与 WorkBuddy/AutoClaw 完全同款**的胶囊按钮「可用 1,500 积分 ▾」，
+点开浮层显示套餐、总积分（各池相加）、各池余额、更新时间。
+
+**样式统一靠复用宿主类，不是自造**：按钮直接挂 `usage-toggle ok`，内部是 `.val` + `.caret`（`▾`），
+底色/描边/圆角/绿字/悬停/展开翻转全由 `/app/ui/css/page-accounts-table.css` 提供；浮层内容整段用
+`usage-pop` / `usage-pop-total` / `usage-pop-group` / `usage-pop-row` / `usage-pop-line` / `usage-pop-name` /
+`usage-pop-view`（0 值 `muted`、有值 `ok`）。补丁只保留浮层容器的 fixed 定位（宿主走 Popover portal，
+我们没法直接用它的定位层）和按钮宽度收敛到单元格内。主题切换、深浅色自动跟随宿主。
+
+- 数据**从被隐藏的那张卡片 DOM 里读**（`.usage-window-value` 的 `title` 优先，因为面板把 `title` 设成原始读数、
+  显示文本可能被换成「剩余 43%」），不碰接口、不需要面板 Key；
+- MutationObserver 跟着 React 的重渲染走（面板每 15 秒刷一次读数，单元格节点会被整体替换）；
+- 卡片没渲染时（未登录 / 读额度中 / 该账号只有 Bearer）补丁什么都不做，面板保持原样 —— 补丁失效也不会把余额列弄空；
+- 分组表头那行「可用合计 5,298」来自 `usage.available`（`lib/usage.mjs` 的顶层 `balance`），与余额格无关，不受影响。
+
+`verify-usage.py` 用**面板自己的 `tokens.css` + `ui.css` + `page-accounts-table.css`** 加一段仿真的账号行做验证
+（WorkBuddy 那一行直接造一枚真的宿主 `usage-toggle` 当对比基准）：断言 AStudio 按钮 class 含
+`usage-toggle ok`、`.val` 读数和 `.caret` 都是 `▾`、浮层复用的是 `usage-pop-*` 那一套类、
+只装饰 `data-provider="astudio"` 的行、原生卡片被隐藏、点外面/Esc 能关、整格替换后能自动重新装饰。
+截图 `preview/usage-1-closed.png` / `usage-2-open.png` 里上下两行的胶囊完全同款。
 
 ## 账号记录长什么样
 
@@ -387,5 +424,5 @@ python scripts/gen-icon.py        # 重画图标（需要 Pillow），同时写 
 | `lib/usage.mjs` / `lib/checkin.mjs` | 余额与签到 |
 | `host-patch/astudio-qr-modal.js` | 宿主补丁①：二维码改在面板内弹窗 |
 | `host-patch/astudio-sms-login.js` | 宿主补丁②：手机号 + 极验滑块 + 短信验证码全在面板内完成 |
-| `host-patch/install.sh` | 把两个补丁 `docker cp` 进容器并注入 `index.html`（`uninstall` 还原） |
-| `host-patch/verify-modal.py` / `verify-sms.py` | 两个补丁的无头验证（真二维码 / 真极验滑块） |
+| `host-patch/install.sh` | 把三个补丁 `docker cp` 进容器并注入 `index.html`（`uninstall` 还原） |
+| `host-patch/verify-modal.py` / `verify-sms.py` / `verify-usage.py` | 三个补丁的无头验证（真二维码 / 真极验滑块 / 面板真 CSS 下的余额列） |
