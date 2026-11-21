@@ -21,6 +21,10 @@ magpie tools generate_video
 
 在已经启用 Magpie Image 的 Agent 中说「用 `zenmux-video/bytedance/doubao-seedance-2.0` 生成 5 秒海浪视频」。也可给 `generate_video` 传首帧 `image`、参考图 `reference_images`、`seconds` 和 `size`。不同型号允许的时长、分辨率和参考素材组合以 ZenMux 的模型页面为准。生成按所选供应商的 ZenMux 账户计费。
 
+「视频生成」列表显示 ZenMux 的发布日期，按日期从新到旧排列，同一天按模型 ID 排列，缺少日期的型号排在末尾。Magpie 会单独置顶当前选中的型号，输入搜索词后按匹配程度排列。
+
+有公开优惠的型号会标注如「商城 6.5 折」，表示 ZenMux 商城价格为原价的 65%。插件刷新时匿名读取一次视频商城目录，只给当前供应商可用的型号加标记。目录暂时不可用时仍可选择模型，刷新后不再使用已过期的折扣标记。实际费用以账户账单为准。[ZenMux 视频商城目录](https://zenmux.ai/api/frontend/model/listByFilter?output_modalities=video)
+
 ## 模型和协议
 
 插件从 `/api/v1/models` 和 `/api/vertex-ai/v1beta/models` 读取支持视频输出的模型。两个目录里重复的 Seedance 型号走原生视频接口。公开目录和接入协议见 [ZenMux 视频模型](https://zenmux.ai/models?output_modalities=video&sort=newest)。
