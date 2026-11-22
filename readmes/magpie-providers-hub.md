@@ -1,5 +1,9 @@
 # magpie-providers-hub
 
+> **只在 [magpie 社区](https://github.com/magpie-community/plugins) 上架。** 其它 registry
+> （含 Our Free Model）里的同名 `magpie-providers-hub` 条目不是本仓库发布 —— 卡片绿标应显示
+> 「magpie 社区」，显示别的徽标请核对作者与仓库地址（`Gyl1219/magpie-providers-hub`）。
+>
 > **原项目：** [iJetLi/dsh-providers-hub](https://github.com/iJetLi/dsh-providers-hub) ｜ **作者：** [JetLi](https://github.com/iJetLi)
 >
 > **本仓库是原项目的第三方 Magpie 适配版本，不是原项目官方发布。**
