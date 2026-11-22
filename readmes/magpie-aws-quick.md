@@ -163,9 +163,11 @@ See the file header for options (`PROXY_TOKEN` auth recommended).
   (rotation persisted). No outpost is spawned at request time — the chat
   WebSocket goes straight to the tenant's `ws_host`.
 - **复制登录地址（Copy sign-in link）**: the same browser OAuth flow, but
-  magpie doesn't open a browser — copy the link and paste it into the
-  browser you use to sign in to Amazon. The callback is `127.0.0.1`, so that
-  browser must run on the same machine as magpie.
+  magpie opens nothing — copy the link into the browser you sign in to
+  Amazon with, then paste the address-bar URL into the box magpie shows.
+  On another computer the browser can't reach the `127.0.0.1` callback: the
+  first paste saves the account info and asks you to start again — the
+  second paste finishes the login (saved info valid for 15 minutes).
 - **本地凭据（Local credentials）**: on Windows reads the app's session from
   Credential Manager and chats directly (OIDC auto-refresh, write-back keeps
   the app's tokens valid); elsewhere or on failure it boots the bundled
@@ -189,19 +191,25 @@ widget, which also assumes the allowance resets on the 1st of next month.
   and `message_complete.tool_calls` is always empty. OpenAI `tools` sent by
   the client are injected as a `<tool_call>{json}</tool_call>` text convention
   and parsed back into standard `tool_calls`; `tool`-role results render as
-  `[tool_result …]` continuing the same thread. Reliability depends on the
+  `[tool_result …]` continuing the same thread. The full tool spec is sent
+  once per thread; later turns on a reused thread carry only a short
+  reminder, because everything in the message stays in Quick's thread
+  history and counts toward the context. Reliability depends on the
   model honoring the convention — verified stable under
   `tool_choice:'required'` for smart/advanced; occasionally the model answers
   directly with its own tools (e.g. web search) instead, which shows up as a
   plain-text reply. Quick's built-in tool results are never mapped to OpenAI
   `tool_calls` (that's its internal process).
-- **Images: small ones only.** Inline images (`data:` URLs, Anthropic base64
-  blocks, images inside tool results) are sent as `user_message.attachments`,
-  but Quick counts their base64 against the same 64 KB frame as the text, so
-  only roughly ≤ 40 KB images get through; larger ones are dropped with a
-  note telling the model so. Quick's own upload API only delivers files to a
-  connected device, which direct sessions don't have. Non-image files
-  (`file`/`input_file` parts) are still placeholders.
+- **Images: small ones inline, larger ones uploaded.** Inline images (`data:`
+  URLs, Anthropic base64 blocks, images inside tool results) that fit the
+  frame go as `user_message.attachments` base64; bigger ones (up to 3 MiB
+  each, 4 per turn, 5 MiB total, inline data only) are uploaded through
+  Quick's own attachment flow and land in the account's cloud session
+  workspace — the same place the Quick app puts them. Remote URLs and
+  non-image files (`file`/`input_file` parts) are still unsupported; a
+  failed upload falls back to a note telling the model the image is
+  missing. Cloud upload needs a direct session (OAuth / Credential Manager
+  sign-in); the local-outpost fallback stays inline-only.
 - **Sampling params**: `temperature` etc. don't exist in the protocol and are
   ignored server-side (`capabilities.temperature:false`).
 - **Sessions are account-bound**: the thread-reuse scope includes an account
