@@ -63,7 +63,7 @@ Open `http://127.0.0.1:3481/#token=YOUR_TOKEN` (using your `MAGPIE_BENCH_TOKEN`)
 ## Costs and privacy
 
 - **Billing & limits**: Requests may incur charges, and displayed costs are estimates, not bills. New tasks cap only per-sample time (600s default).
-- **Privacy**: Prompts and answers go through your selected upstream. Local results (including full transcripts) live in `~/.local/share/magpie-mini-bench/`; review before sharing.
+- **Privacy**: Prompts and answers go through your selected upstream. Use the top-bar account mask toggle before taking screenshots; local results (including full transcripts) live in `~/.local/share/magpie-mini-bench/`, so review before sharing.
 - **Security**: The service binds to loopback only. Do not expose the port or share the token.
 
 More docs: [documentation index](docs/README.md).
