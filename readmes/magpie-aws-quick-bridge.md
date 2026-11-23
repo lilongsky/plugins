@@ -59,6 +59,7 @@ Key 用 `npx magpie-aws-quick-bridge status` 看。
 - **`serve` 得一直开着**，关了 agent 就连不上。macOS 上可以先 `npm install -g magpie-aws-quick-bridge`，再 `magpie-aws-quick-bridge service install` 让它在后台常驻。
 - CC Switch 里**不用开「本地路由」**，每个应用拿到的已经是它自己的接口格式。
 - token 快到期会自己续；真过期了请求会报 401，重新 `login` 一次就行，不用重启 `serve`。
+- 登录时浏览器提示 **`Your session has expired`**：多半是浏览器里留着一份过期的 AWS 登录状态。换个无痕窗口打开登录地址，或者清掉 `signin.aws` 的 Cookie 再登（在 Magpie 里登录也一样）。这一条我自己没碰到过，是别人遇到后这样解决的。
 - 服务只听 `127.0.0.1`，每个请求都要带 Key。别把它放到公网上。
 - Claude Code 启动时会提示不认识 `smart` 这个模型名，不影响使用。
 - Gemini CLI 用的是另一种接口，暂时不支持。
@@ -84,12 +85,13 @@ Key 用 `npx magpie-aws-quick-bridge status` 看。
 - 多轮对话接着上一轮的线程走，只发新增的内容
 - Amazon Quick 每条消息最多 64 KB：工具很多、提示词很长时会自动压缩工具说明和系统提示词，很长的对话内容和图片转成附件，保证发得出去
 - 额度查询，模型列表按账号实际开通的来
+- 额度用完时返回 429，并带上额度恢复还要多久（最长按 6 小时算，到点再问一次），Magpie 会让这个账号休息到那时，先用别的账号；报错里也写明是哪种额度、多久恢复
 - 用中文（或日文、韩文）提问时，会让模型用同一种语言思考，文件名、日志、搜索词照原文用，不会被翻成英文
 
 ## 我验证到了哪一步
 
 - **真实账号（我自己的个人账号）**：Magpie 插件的登录、对话、工具调用、线程复用、附件、额度；CC Switch 模式下 Claude Code、Codex、OpenCode 经本机 API 读文件、写文件。
-- **只用模拟服务测过**：企业账号、`advanced` 模型、图片附件。
+- **只用模拟服务测过**：企业账号、`advanced` 模型、图片附件、额度用完后的休息时间（我没把额度用完过）。
 - 工具调用是靠提示词约定的文本协议做的，模型偶尔会不按约定来，重试一下通常就好。
 - Amazon Quick 每轮会带上它自己的一大段系统提示词，所以 token 数看起来很大；额度按它的 credits 算。
 
