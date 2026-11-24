@@ -26,14 +26,14 @@ Install **one** source from Magpie's Plugins page:
 - **npm**: `npm:llm-mini-bench`
 - **GitHub**: `github:FibonaAI/llm-mini-bench`
 
-Open **模型评测** after installation. Magpie manages the runtime, connects locally, and loads your model catalog automatically.
+Open **LLM Mini Bench** after installation. Magpie manages the runtime, connects locally, and loads your model catalog automatically.
 
 ### Run a comparison
 
-1. Open **任务** and pick one or more models and Thinking settings.
+1. Open **Tasks** and pick one or more models and Thinking settings.
 2. Pick **1 round** for a quick pass (12 samples) or keep the default **3 rounds** (36 samples) to check consistency.
-3. Review the sample count and timeout, then click **开始评测**.
-4. Open **分析** to compare scores against cost, tokens, or elapsed time, and inspect individual answers below.
+3. Review the sample count and timeout, then click **Start evaluation**.
+4. Open **Analysis** to compare scores against cost, tokens, or elapsed time, and inspect individual answers below.
 
 You can cancel a run or task at any time, or manually retry failed, timed-out, interrupted, or cancelled samples in task history without rerunning completed ones. To target specific local accounts instead of automatic selection, see [account binding](magpie/README.md#local-account-and-multi-key-bindings).
 
