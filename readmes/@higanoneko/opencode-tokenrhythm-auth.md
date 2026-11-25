@@ -1,4 +1,4 @@
-# @magpie-community/opencode-tokenrhythm-auth
+# @higanoneko/opencode-tokenrhythm-auth
 
 TokenRhythm provider for Magpie / OpenCode.
 
@@ -68,6 +68,25 @@ curl https://tokenrhythm.studio/v1/decision \
   -H "Authorization: Bearer $TOKENRHYTHM_KEY" -H "Content-Type: application/json" \
   -d '{"model":"NeoHorse-Jev-4B","criteria":[{"key":"fast","description":"prioritize speed"}],"input":"..."}'
 ```
+
+## Usage card
+
+The card is the wallet TokenRhythm reports through the OpenSquilla integration:
+
+- **What is left** — the card's balance line is the wallet's `available`, in CNY
+  to two decimals. magpie writes its own label and says "left" in the interface's
+  language; the account with more left goes first in routing.
+- **Gift credits** — a window carrying `balance` and `unit`, with no `used` and
+  no `limit`: a pay-as-you-go wallet is no share of anything, so magpie draws no
+  meter and says "6,291 积分 left" itself in the account's own unit. A wallet with
+  a zero balance is no window at all, since magpie reads 0 as used up.
+- **Debt** and **Frozen** — money owed or held, shown as plain rows (no meter, and
+  kept out of routing) only when they are not zero.
+
+Row names in a provider plugin are data: magpie translates the words its own
+interface knows (`Gift credits`) and shows the rest as they came. That is why the
+card keeps to one balance line and a couple of windows rather than five rows of
+plugin-invented English.
 
 ## Configuration
 
