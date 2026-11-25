@@ -29,7 +29,8 @@
 | **看清哪些模型能用** | 「模型」视图列出国内版和国际版（添加了企业账号时还有企业）的模型、模型 ID、原生推理档位、上下文和积分倍率，把国际版只给 Pro 的模型单独收起来，标出订阅优先和限时优惠。 |
 | **国际版也领** | 在 Magpie 登录了 WorkBuddy AI 的，国际版账号同样每天活跃、兑换连登档位，有签到活动时自动签到。国际版有自己的定时开关和时段，和国内版互不影响。 |
 | **提醒你该做的** | 快作废的积分、企业额度重置、已过期的登录，集中列在看板底部；模型额度用完或排队单独成一张「模型额度监控与防限流路由」卡片。 |
-| **添加账号** | 选国内版或国际版，直接打开 Magpie 官方 WorkBuddy 插件的浏览器登录，本插件不经手任何令牌。 |
+| **添加账号** | 选国内版或国际版，直接打开 Magpie 官方 WorkBuddy 插件的浏览器登录，登录和续期仍由 Magpie 负责。 |
+| **多机账号同步（试用）** | 在 Magpie 的「WorkBuddy Plus → 设置 → 账号同步」选择主机或从机。通过 Magpie 的 GitHub 私有仓库共享选中的个人账号，默认关闭。 |
 
 ## 截图
 
@@ -125,7 +126,7 @@ bun server.mjs
 <details>
 <summary>查看完整功能</summary>
 
-- 公众号关注、实际捐赠需要本人完成，看板不再列出；分享技能会创建真实分享渠道并上报复制链接动作，自动完成；已达成的任务会自动领奖。
+- 公众号关注、实际捐赠需要本人完成，看板不再列出；分享技能会创建真实分享渠道并上报分享结果，不会发送微信消息。只在服务端确认达标后领奖。
 - 桌面端、网页端和小程序任务的事件形状参考 [workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)。
 
 ```mermaid
@@ -157,7 +158,7 @@ flowchart LR
 | 小程序任务 | `Sequential_Tasks_1`～`7` 涵盖对话、专家、GLM5.2、创建定时任务、10 次对话和 PC 灵感。一天解锁一个，前一项领奖后才能接下一项。 |
 | 小程序对话间隔 | 每次约间隔 45 秒；连发会被上游回滚。 |
 | 新专家任务 | 从任务的 `jump_url` 读取 `expertId`，兼容 `deeplink` 和 `expert_use_<slug>`；识别后自动执行，否则在对应账号标为「需手动」。 |
-| 技能分享 | 创建真实分享渠道并上报复制链接；同一账号当天复用渠道。关闭「自动分享技能给好友」后，批量执行会跳过，仍可单独执行。 |
+| 技能分享 | 创建真实分享渠道并按渠道编号上报；同一账号当天复用渠道，服务端确认达标后才领奖。关闭「自动分享技能给好友」后，批量执行会跳过，仍可单独执行。 |
 | 运营活动 | 读取星巴克、记者节等活动进度，按适配情况执行对话、专家、技能与桌面任务，达标后领奖。邀请好友由本人完成；活动结束后跳过。 |
 | 活动 App 对话 | 真实创建一轮云端对话，完成后领奖，**可能扣积分**。自动执行默认关闭；定时及「执行所有任务」会跳过，任务中心标「设置已关闭」，其他任务照常。 |
 | 本人完成的任务 | 关注公众号、公益捐赠不显示在自动任务清单，也不计入总数；上游确认达标后仍会自动领奖。公众号关注须满 24 小时，以服务端进度为准。 |
@@ -427,12 +428,24 @@ magpie plugin options <插件名> '{"port":4389}'
 | --- | --- |
 | 任务列表缓存 | `tasksCacheTtl` 默认 20 秒（0–120），按账号、站点和客户端渠道分开；接取、上报或领奖后失效。 |
 | 进度缓存 | `progressCacheHours` 默认 6 小时（0–24）。读取失败时才用缓存展示进度，并注明时间和错误；它不参与任务执行。两种缓存都可以设为 0 关闭。 |
-| 由 Magpie 启动 | 由 Magpie 启动时，从 Magpie 当前的数据目录只读 `plugin-auth.json`，包括 Windows 便携版或迁移后的目录。 |
+| 由 Magpie 启动 | 后台从 Magpie 当前的数据目录只读 `plugin-auth.json`，包括 Windows 便携版或迁移后的目录。 |
 | 独立启动 | 独立启动默认读 `~/.config/magpie`，遵循 `XDG_CONFIG_HOME`；用 `WORKBUDDY_PLUS_MAGPIE_DIR` 指定 Magpie 目录，用 `WORKBUDDY_PLUS_DIR` 指定本插件的数据目录。 |
 | Windows 登录 | Windows 的「添加账号」找不到 Magpie 时，可以直接在「供应商」登录，或把 Magpie 安装目录加到 PATH 后重启 Magpie。 |
-| 登录和续期 | 本插件只读 Magpie 保存的登录状态。登录和续期由 Magpie 负责，建议在需要自动任务时保持 Magpie 网关运行。 |
+| 登录和续期 | 都由 Magpie 负责。Plus 后台始终只读登录状态；可选的「账号同步」仅允许从机的同步模块写入它导入的账号。 |
 | 旧版续期时段 | 升级会移除国内版和国际版旧的续期时段，其他时段照旧。 |
 | 存储格式与隐私 | Magpie 存储格式变化时可能需要更新本插件。发布源码不包含个人账号文件、配置或运行记录。 |
+
+</details>
+
+<details>
+<summary>多台设备共享 WorkBuddy 账号（默认关闭）</summary>
+
+在两台设备的 Magpie 中配置同一个 GitHub **私有仓库**、分支和同步口令。打开 Magpie 里的「WorkBuddy Plus → 设置 → 账号同步」：在一台设备选「主机」，勾选要共享的账号并保存；其他设备选「从机」并保存。首次同步后看「最近同步」。本机独立面板不配置同步。
+
+- 只同步通过浏览器登录的国内版和国际版个人 OAuth 账号。只上传加密的 access token 和必要账号信息，不同步企业账号、refresh token、API Key、桌面登录或定时配置。主机仍由 Magpie 登录和续期。两台真机上的续期与过期后的路由恢复需实测。
+- 从机保留本机登录，遇到冲突就跳过。主机取消共享的账号，在收到新快照后只从本模块导入的记录中移除。Plus 在从机暂停两套自动定时，不改原有开关和时段；手动执行和看板照常使用。主机未确认持有发布权限时也不执行自动定时。
+- 切换主机时，先在原主机关闭同步，再等最多 10 分钟让旧租约到期。关闭同步只停止后续传输，不删除已导入的账号，也不撤销已发送的凭据。
+- 使用过独立的 [WorkBuddy Sync](https://github.com/NotoChen/magpie-workbuddy-sync) 时，先在所有相关设备停用旧插件，再启用 Plus 的同步。Plus 使用单独的快照路径，不读取旧快照，也不会自动清理旧插件导入的账号。
 
 </details>
 
@@ -479,13 +492,22 @@ bun install.mjs
 在 Magpie 中停用插件只会停用工具入口。**要停止自动任务，先在「今日定时」里把国内版、国际版两排的开关都关掉**，或执行 `bun cli.mjs pause`（两边一起暂停）。
 
 <details>
-<summary>版本固定、旧版升级与 v0.8.0 变更</summary>
+<summary>版本固定、旧版升级与近期变更</summary>
 
 | 事项 | 说明 |
 | --- | --- |
 | 固定版本 | 如果安装时指定了版本（`magpie plugin list` 里显示 `#v0.4.0` 这类后缀），先用 `magpie plugin rm` 移除，再按不带版本的地址重新 `magpie plugin add`；插件选项（例如端口）需要重新设置。 |
 | 0.5.5 起 | 从 0.5.5 起，Magpie 重载更新后的插件时会发现旧版后台服务、请它退出并以新版启动，不用再手动重启（有任务正在执行时会等它跑完，每分钟再试）。 |
 | 0.5.4 或更早 | 从 0.5.4 及更早版本升级时，旧服务还不认识这个请求，需要最后一次结束它（或注销、重启电脑、重启容器）。 |
+
+**v0.8.2 变更**
+
+- 技能分享改按分享渠道编号上报，缺少渠道回执时不发上报、不领奖。任务计分仍需真号实测。
+- 模型限制或临时限流不会仅因为返回 `11140` 就暂停账号全天定时；明确的账号限制仍会触发暂停。
+
+**v0.8.1 变更**
+
+新增「设置 → 账号同步」，默认关闭，升级不会自动同步账号或改动定时。需要试用时，按上文「多台设备共享 WorkBuddy 账号」配置主机和从机；如已装独立 WorkBuddy Sync，请先停用旧插件。
 
 **v0.8.0 变更**
 
@@ -590,9 +612,11 @@ README 截图由 `sh docs/screenshots.sh` 生成：`docs/demo-data.mjs` 写入�
 
 ## 许可与来源
 
-MIT。积分包合并与用量分页改编自 [zseeu1/wbkit](https://github.com/zseeu1/wbkit)（MIT），企业额度的读取方式参考 Magpie 的 WorkBuddy 插件。任务与活动相关实现还参考了：
+MIT。多机账号同步复用了 [NotoChen 的 Magpie WorkBuddy Sync](https://github.com/NotoChen/magpie-workbuddy-sync) 的加密模块，并改编了其 GitHub 同步客户端、文件锁和主机租约逻辑。感谢 NotoChen 在 [#20](https://github.com/sabercomo/magpie-workbuddy-plus/issues/20) 分享实现。
 
-- [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)：成长任务编号与事件形状、旅行/连登、签到结果和技能分享渠道；社区分支的 Buddy 盲盒、从 `jump_url` 解析专家任务、签到双记录取较晚者。
+积分包合并与用量分页改编自 [zseeu1/wbkit](https://github.com/zseeu1/wbkit)（MIT），企业额度的读取方式参考 Magpie 的 WorkBuddy 插件。任务与活动相关实现还参考了：
+
+- `ardeyouxipianyi/workbuddy2api-hub`：成长任务编号与事件形状、旅行/连登、签到结果和技能分享渠道。原仓库目前无法访问；[M-strange 的社区分支](https://github.com/M-strange/workbuddy2api-hub)提供了 Buddy 盲盒、从 `jump_url` 解析专家任务和签到双记录取较晚者的参考实现。
 - [jichie/magpie-workbuddy-tasks](https://github.com/jichie/magpie-workbuddy-tasks)：Buddy 盲盒的配额查询、批量开盒和默认关闭的排程。
 - [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)：桌面端、网页端和小程序上报通道，任务中心、补领清扫，以及活动和技能分享流程；官方补偿先查状态再领取的语义参考 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)。
 - [L0NE-6/WorkBuddy-Daily](https://github.com/L0NE-6/WorkBuddy-Daily)：`Sequential_Tasks_4`～`7` 的事件形状和活动 App 会话流程。

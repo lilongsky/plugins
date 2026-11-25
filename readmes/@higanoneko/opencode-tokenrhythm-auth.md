@@ -2,7 +2,7 @@
 
 TokenRhythm provider for Magpie / OpenCode.
 
-[中文文档 / Chinese docs](README.zh-CN.md)
+**English** · [简体中文](README.zh-CN.md)
 
 ## Sign-ins
 
@@ -69,24 +69,20 @@ curl https://tokenrhythm.studio/v1/decision \
   -d '{"model":"NeoHorse-Jev-4B","criteria":[{"key":"fast","description":"prioritize speed"}],"input":"..."}'
 ```
 
-## Usage card
+## Balance card
 
-The card is the wallet TokenRhythm reports through the OpenSquilla integration:
+The wallet shows as a single spendable balance in the currency's own glyph.
 
-- **What is left** — the card's balance line is the wallet's `available`, in CNY
-  to two decimals. magpie writes its own label and says "left" in the interface's
-  language; the account with more left goes first in routing.
-- **Gift credits** — a window carrying `balance` and `unit`, with no `used` and
-  no `limit`: a pay-as-you-go wallet is no share of anything, so magpie draws no
-  meter and says "6,291 积分 left" itself in the account's own unit. A wallet with
-  a zero balance is no window at all, since magpie reads 0 as used up.
-- **Debt** and **Frozen** — money owed or held, shown as plain rows (no meter, and
-  kept out of routing) only when they are not zero.
+- **Live wallet** — refreshed with the account, to two decimals
+- **Money trend line** — because the card reports a balance rather than a
+  percentage window, magpie keeps it in its amount history: the card charts
+  the actual balance over time, and estimates when it runs out at the pace it
+  has been spent
+- **Currency-native display** — `¥` for CNY, `$` for USD, `€` for EUR; other
+  currencies fall back to their code
 
-Row names in a provider plugin are data: magpie translates the words its own
-interface knows (`Gift credits`) and shows the rest as they came. That is why the
-card keeps to one balance line and a couple of windows rather than five rows of
-plugin-invented English.
+The balance intentionally shows the total only. Pay-as-you-go is about what is
+left, and a single figure keeps the card readable at a glance.
 
 ## Configuration
 
