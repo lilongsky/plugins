@@ -57,10 +57,11 @@ on the same computer, and signing in here again updates the same session.
   agent's request in the protocol the agent sent it in. The plugin adds the current access token.
 - **Quota**: `magpie quota`, magpie's usage views and Quota first routing read ZGAP's remaining usage, the same
   gateway-wide figures **Live activity** shows: per upstream (Claude, Codex, Kimi and the rest), the mean share
-  used of each window over ZGAP's accounts. An upstream's 5-hour and weekly windows count only the models it
-  serves, and a window named after a model (Claude's Fable) counts only that model. Other windows are shown but
-  never hold back routing. ZGAP does not say when its pooled windows reset, so magpie takes each window to renew a
-  full span from now, and Quota first spends accounts that renew sooner first. A 5-hour window at 90% used, or any
+  used of each window over ZGAP's accounts. A window ZGAP marks as the upstream's whole account (Session, Weekly,
+  Kimi's 5h, xAI's credits) counts every model that upstream serves, and a window named after a model (Claude's
+  Fable) counts only that model. Other windows (Codex's code review, xAI's on-demand cap) are shown but never hold
+  back routing. ZGAP says how long each window runs but not when its pooled windows reset, so magpie takes each
+  window to renew a full span from now, and Quota first spends accounts that renew sooner first. A 5-hour window at 90% used, or any
   window at 98%, still puts ZGAP behind the others. A window no ZGAP account measured is left out, and a failed read
   shows as an error, never as 0% used. While the app or `magpie serve` runs, each sign-in reads it at most once
   every 3 minutes, so the figures there can be up to 3 minutes old; each `magpie quota` run reads it afresh. A failed

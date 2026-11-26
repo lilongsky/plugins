@@ -45,16 +45,35 @@ magpie plugin options magpie-codex-relay '{"baseURL":"https://codex-relay.oaifre
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `baseURL` | `https://codex-relay.oaifree.com/backend-api/codex` | 上游网关地址，填到 `/backend-api/codex` 这一层 |
-| `codexVersion` | `0.172.0` | 发给上游的 `version` 头。上游按它卡模型能力，太老会被 400 `requires a newer version of Codex` |
+| `baseURL` | `https://codex-relay.oaifree.com/backend-api/codex` | 上游网关地址，填到 `/backend-api/codex` 这一层。不填就用这个默认中转站 |
+| `codexVersion` | 读 magpie 的 catalog | 发给上游的 `version` 头。默认跟 magpie 内置 codex 问上游用的版本（`<config>/cache/magpie/models/codex*.json` 的 `asked`），不写死；上游按它卡模型能力，太老会被 400 `requires a newer version of Codex` |
 
 改完不需要重装插件；`magpie plugin options` 会重启 plugin host。
+
+## 模型列表跟着官方
+
+插件的模型目录**直接读 magpie 为官方 codex 缓存的列表**，不自己编、也不问中转站。
+官方那边加了新模型，这边下次刷新就跟着有；官方下架了，这边也一起消失。
+只有读不到官方缓存时才退回问上游。
+
+## 让 gpt 系列优先走 relay
+
+路由顺序是 magpie 的配置，不在插件里。用 `routing=order` 把 relay 排在官方前面：
+
+```bash
+magpie group set auto/gpt-6.1-sol \
+  models=codex-relay/gpt-6.1-sol,codex/gpt-6.1-sol routing=order
+```
+
+`order` 表示按顺序试：relay 接得住就用它，接不住（超额、限流、宕机）才落到官方。
+`smart` 是按额度挑，不保证顺序，要严格优先必须用 `order`。
 
 ## 使用
 
 ```bash
-magpie provider models codex-relay          # 看上游的模型目录
-magpie codex codex-relay/gpt-5.6-sol        # Codex 走这个 provider
+magpie provider models codex-relay          # 看模型目录（与官方 codex 一致）
+magpie codex codex-relay/gpt-5.6-sol        # 显式走这个 provider
+magpie codex auto/gpt-6.1-sol               # 或走顺序路由：先 relay 再官方
 ```
 
 任何 agent 都可以用 `codex-relay/<model>`，与内置 `codex/<model>` 并列。

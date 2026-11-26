@@ -73,6 +73,8 @@ The plugin preserves the selected model, reasoning effort, cache-related fields,
 
 Magpie stores the API key. dao stores settings, scheduling metadata, manually added model IDs, and the last successful model list per account under `qiandao-gateway/` in Magpie's data directory. These files contain neither conversation bodies nor API keys. Model caches are scoped to the configured Base URL. The settings page shows active requests, queued requests, cooldown, and the current host's latest 20 results.
 
+The **报错记录** tab shows each failure's local date and time, original numeric status or error code, attempt number and a plain-language explanation. It has category filters and lists 20 errors per page. The page shows the retry schedule, remaining shared cooldown, and each failure's earliest retry wait or observed wait if the next attempt has been recorded. The observed wait includes queueing. Older rows without a recorded wait display **未记录**. A later success in the same request marks the earlier failure as recovered. The percentage is based on the most recent 100 recorded upstream attempts, not on conversations or final request failures. The log survives host reloads and excludes client cancellations.
+
 The plugin configures header forwarding and disables additional patience waiting and rate-limit rests for its own provider. Codex's default timeout and unrelated providers are left unchanged.
 
 The settings page uses loopback port **38418**. It serves configuration only; model traffic goes directly from the provider plugin to QianDao. If the port is occupied, chat remains available with the saved settings; change `settingsPort` in the plugin options to restore the page. Unlike routine URL and concurrency edits, changing that plugin option reloads Magpie's shared plugin host.
@@ -92,7 +94,7 @@ npm pack
 Pass a release archive as the final argument to test its contents:
 
 ```sh
-node tests/magpie-host.mjs /path/to/magpie /path/to/bun dao-0.1.0-rc.10.tgz
+node tests/magpie-host.mjs /path/to/magpie /path/to/bun dao-0.1.0-rc.11.tgz
 ```
 
 For comparison with the original gateway:
@@ -104,9 +106,9 @@ npm run test:parity
 
 You can also pass the original gateway file to `node tests/parity.mjs /path/to/gateway.mjs`.
 
-Validation covers 49 core and contract tests. Isolated host checks cover V2 handoff calls, tool discovery, native model refresh and selection, balance queries, closures and reopening, manually added models, native Fast controls, request-field preservation, live settings changes, shared concurrency during host reload, terminal errors, bounded 429 recovery, and cancellation. Browser checks exercise the settings page inside Magpie's `allow-scripts` iframe: clicking Save writes the URL and concurrency, invalid values remain unsaved, Enter saves, and the provider successfully uses the saved URL.
+Core and contract tests cover error-log visibility during recovery, reload persistence, numeric codes and cancellation. Isolated host checks cover V2 handoff calls, tool discovery, native model refresh and selection, balance queries, closures and reopening, manually added models, native Fast controls, request-field preservation, live settings changes, shared concurrency during host reload, terminal errors, bounded 429 recovery, and cancellation. Browser checks exercise the settings page inside Magpie's `allow-scripts` iframe: clicking Save writes the URL and concurrency, invalid values remain unsaved, Enter saves, and the provider successfully uses the saved URL.
 
-For the browser regression, `node tests/settings-browser-fixture.mjs` serves the actual settings page in an `allow-scripts` iframe and writes its test URL and settings path to `.sandbox/settings-browser-session.json`. Open that URL with the Ego browser SDK and run the exported `checkSettingsSave(page, { settings, baseURL: "https://example.invalid" })` from `tests/settings-browser.mjs`. It checks the persisted file as well as the visible success message. Stop the fixture with Ctrl+C when finished.
+For the browser regression, `node tests/settings-browser-fixture.mjs` serves the actual settings page in an `allow-scripts` iframe with 100 simulated attempts. It writes its test URL and settings path to `.sandbox/settings-browser-session.json`. The **报错记录** tab has multiple pages and examples of planned, observed, unavailable and skipped retries. Run the exported `checkSettingsSave(page, { settings, baseURL: "https://example.invalid" })` from `tests/settings-browser.mjs` to check the persisted file and the visible success message. Stop the fixture with Ctrl+C when finished.
 
 Set `QIANDAO_UI_MODE=1` when running the isolated Magpie host test to exercise the complete embedded-page flow. Read `.sandbox/ui-session.json`, open its authenticated test URL, enter the **dao** page, and run `checkSettingsSave` using its `settings` and `upstreamURL` fields. Write `.sandbox/ui-done` after the browser check; the host test then verifies a request reaches that saved upstream.
 
@@ -122,7 +124,7 @@ Set `QIANDAO_CODEX_LOOP=1` with `QIANDAO_OMITTED_OUTPUT=1` or `QIANDAO_AGGREGATE
 
 Set `QIANDAO_CODEX_SEARCH=1` to run the real Codex CLI with the isolated host's model catalog and a local MCP tool. The test requires discovery, two calls in one batch, both results matched by call ID and a final answer. Set `QIANDAO_HOST_SEARCH=1` to test Magpie's web-search takeover with a fixture credential. The upstream does not invoke a search service. Neither test needs QianDao credentials.
 
-The plugin retains the latest 100 response-structure records in `qiandao-gateway/scheduler.json`: version, request/response identifiers, attempt, HTTP status, terminal event and output item types. Records exclude prompts, answers, reasoning text, tool arguments and credentials. The settings service health response includes its running version.
+The plugin retains the latest 100 attempt records in `qiandao-gateway/scheduler.json`, including version, request identifier, attempt number, timestamp and, when available, HTTP status, numeric error code and response structure. Transport failures without an HTTP response have no HTTP code. Records exclude raw error messages, prompts, answers, reasoning text, tool arguments and credentials. The settings service health response includes its running version.
 
 ## Limitations
 
