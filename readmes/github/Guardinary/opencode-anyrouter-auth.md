@@ -2,7 +2,7 @@
 
 面向 **magpie** 的 AnyRouter（`https://anyrouter.top`）供应商插件：六种登录入口、余额与北京时间今日消耗、由宿主调度的每日签到，以及 Claude / GPT / Gemini 模型分派。
 
-**当前版本：0.2.1，通过独立 GitHub 仓库发布，不发布同名 npm 包。** 源码更新或 GitHub Release 不等于你的生产网关已升级。主要验证宿主为 Magpie 0.1.4720 + Bun 1.4.5；使用 OpenCode 风格的 hooks，但未独立验证原版 OpenCode 的加载器及专有扩展兼容性。
+**当前版本：0.2.2，通过独立 GitHub 仓库发布，不发布同名 npm 包。** 源码更新或 GitHub Release 不等于你的生产网关已升级。主要验证宿主为 Magpie 0.1.4720 + Bun 1.4.5；使用 OpenCode 风格的 hooks，但未独立验证原版 OpenCode 的加载器及专有扩展兼容性。
 
 运行时依赖 `tough-cookie` 6；本项目的 [锁文件](<pnpm-lock.yaml>) 固定了实际依赖。插件不执行远端 JavaScript，不启动代理／保活服务，不建立自己的账号池，不创建或轮换站点 Key，也不在推理 fetch 内自动重试。
 
@@ -13,12 +13,12 @@
 按 [Magpie 官方发布说明](<https://usemagpie.ai/docs/zh/plugins#发布与上架>)，此仓库根目录提交可直接加载的入口，不依赖发布时才生成的 dist。可以固定 Release 对应标签：
 
 ```sh
-magpie plugin add github:Guardinary/opencode-anyrouter-auth#v0.2.1
+magpie plugin add github:Guardinary/opencode-anyrouter-auth#v0.2.2
 magpie plugin login anyrouter
 magpie quota anyrouter --json
 ```
 
-不写 `#v0.2.1` 时安装默认分支代码。仓库的 `magpie-plugin` topic 用于“非官方插件 · GitHub”发现，**不代表官方审核或推荐列表收录**。本仓库没有把同名上游 npm 包当作自己的发布物。
+不写 `#v0.2.2` 时安装默认分支代码。仓库的 `magpie-plugin` topic 用于“非官方插件 · GitHub”发现，**不代表官方审核或推荐列表收录**。本仓库没有把同名上游 npm 包当作自己的发布物。
 
 ### 本地源码
 
@@ -121,9 +121,12 @@ GET /api/user/self（被拒绝）→ GET /api/status → 一次 POST /api/user/l
 | 模型／形态 | 默认 SDK | 网关路径 |
 | --- | --- | --- |
 | `claude-*` 与 `*-cc-format` | `@ai-sdk/anthropic` | `/v1/messages`，兼容开关开启且请求可识别时加 `beta=true` |
-| GPT / Codex / Gemini | `@ai-sdk/openai` | `/v1/responses` |
+| GPT / Codex | `@ai-sdk/openai` | `/v1/responses` |
+| `gemini-*`（非 `*-cc-format`） | `@ai-sdk/google` | `/v1beta/models/{model}:generateContent` 或 `:streamGenerateContent?alt=sse` |
 
-历史真实探测中 Chat Completions 返回 404；Gemini 名称不意味着该站提供 Google 原生协议。用户选择其他 SDK 不会让不存在的上游接口变得可用。
+2026-11-26 实测 `gemini-4-neon` 经本插件原生 Google 路径返回 200 SSE 并以 `STOP` 结束。旧版本把 Gemini 误分派到 Responses，会出现图示 404；0.2.2 修正默认 SDK／路径，并保留显式用户 SDK 与端点声明。carbon 原生路径当时返回负载上限，2.5-pro 原生路径返回 404；协议正确不保证所有上游模型当前可用。模型列表发现仍走 `/v1/models`，不会改为 `/v1beta/models`。
+
+更新后在模型页点击“重新获取模型”。如果你曾手动固定某个 Gemini 的 Responses API，请恢复默认，或将 SDK 设为 `@ai-sdk/google`、基础地址设为 `https://anyrouter.top/v1beta`；插件不会偷偷覆盖明确的用户配置。无需重新登录或轮换 Key。历史 Chat Completions 探测仍为 404，不通过自动改协议重发来掩盖错误。
 
 [内置声明](<lib/declared-models.mjs>)提供 16 个登录前展示／临时兜底模型，不默认启用它们。**成功的账号 `/v1/models` 列表是权威，包括空列表**；公开定价、models.dev 和手工配置不向成功列表添加未发现的模型。临时发现失败使用插件自己的保守兜底并带 `fellBack`，不把宿主缓存模型无条件并入。
 
