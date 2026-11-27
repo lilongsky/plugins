@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-在 Trae CN 的模型菜单中使用 Magpie 配置的模型和路由组。自动同步的条目带有“· Magpie”后缀。本文适用于插件 0.4.0。
+在 Trae CN 的模型菜单中使用 Magpie 配置的模型和路由组。自动同步的条目带有“· Magpie”后缀。兼容性表以 `main` 分支为准。
 
 ## 兼容性
 
@@ -13,8 +13,9 @@
 | Windows 3.4.18 | 标准安装支持自动同步 | 0.3.x 已验证目录同步和 DeepSeek 对话。 |
 | Windows 3.4.20 | 标准安装支持自动同步 | 0.3.x 已验证模型新增、修改、删除和回读。 |
 | Windows 3.4.24 | 标准安装支持自动同步 | 0.4.0 已验证凭据和登录会话。验证时用实际账户新增、查询和删除临时模型，测试条目已清理。 |
+| Windows 3.4.25（构建 2.3.108162） | 标准安装支持自动同步 | 已验证 4 个现有模型的后台同步和 Trae 账户目录回读。 |
 | macOS 3.4.20 | 标准安装支持自动同步 | 审阅者验证了模型新增和移除，确认客户端文件未改动，应用代码签名仍有效。 |
-| macOS 3.4.24 及其他未列出的版本或构建 | 手动接入 | 自动同步未经验证。 |
+| 其他版本或构建（包括 macOS 3.4.24 和 3.4.25） | 手动接入 | 自动同步未经验证。 |
 | Linux | 桌面端适配未经验证 | CI 运行可移植代码的单元测试。 |
 
 Windows 标准安装位于 `%LOCALAPPDATA%\Programs\Trae CN`。macOS 标准安装为 `/Applications/Trae CN.app` 或 `~/Applications/Trae CN.app`。可以将 `TRAE_APP` 设为包含 `product.json` 的应用资源目录，供插件发现客户端。自定义路径仍使用手动模式。感谢 CN-P5 分享 Windows 多盘安装的发现方法。[Magpie Trae Evergreen](https://github.com/CN-P5/magpie-trae-evergreen)
@@ -28,6 +29,8 @@ magpie plugin add "github:lmy414/magpie-agent-trae#v0.4.0"
 ```
 
 也可以下载发布版源码，在解压后的目录运行 `magpie plugin add .`。[Release](https://github.com/lmy414/magpie-agent-trae/releases)
+
+Windows 3.4.25（构建 2.3.108162）需要 `main` 分支上的兼容补丁。在检出 `main` 的源码目录运行 `magpie plugin add .`。
 
 在 Magpie 的 Agent 页面打开 Trae 接入开关。如果列表中看不到 Trae，展开底部的“显示其余”。插件在 Windows 和 macOS 上都使用 `dir: '~/.trae-cn'` 发现 Trae。`~/.trae-cn` 是 Trae 的跨平台产品数据目录。
 
