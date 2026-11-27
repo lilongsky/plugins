@@ -21,16 +21,16 @@
 
 ## 一眼看懂
 
-| | |
-| --- | --- |
-| **装上就能用** | `magpie plugin add` 一条命令。Magpie 启动时自动拉起后台服务，侧栏多出「WorkBuddy Plus」页面。 |
-| **自动做任务** | 连登活跃、成长任务接取与领奖、运营活动任务、补领清扫、猫猫旅行派出与领奖、连登福利、夜猫子任务，按时段自动执行，失败自动重试。 |
-| **账号看板** | 每个账号的可用积分、哪笔积分什么时候作废、近 7 天用量、旅行与任务进度，五种视图随时切换；导航默认横排，标题左侧的固定按钮可切换成左侧栏并记住选择。 |
-| **看清哪些模型能用** | 「模型」视图列出国内版和国际版（添加了企业账号时还有企业）的模型、模型 ID、原生推理档位、上下文和积分倍率，把国际版只给 Pro 的模型单独收起来，标出订阅优先和限时优惠。 |
-| **国际版也领** | 在 Magpie 登录了 WorkBuddy AI 的，国际版账号同样每天活跃、兑换连登档位，有签到活动时自动签到。国际版有自己的定时开关和时段，和国内版互不影响。 |
-| **提醒你该做的** | 快作废的积分、企业额度重置、已过期的登录，集中列在看板底部；模型额度用完或排队单独成一张「模型额度监控与防限流路由」卡片。 |
-| **添加账号** | 选国内版或国际版，直接打开 Magpie 官方 WorkBuddy 插件的浏览器登录，登录和续期仍由 Magpie 负责。 |
-| **多机账号同步（试用）** | 在 Magpie 的「WorkBuddy Plus → 设置 → 账号同步」选择主机或从机。使用 Magpie 已配置的私有存储共享勾选的账号，默认关闭。 |
+<table>
+  <tr><td><strong>装上就能用</strong></td><td><code>magpie plugin add</code> 一条命令。Magpie 启动时自动拉起后台服务，侧栏多出「WorkBuddy Plus」页面。</td></tr>
+  <tr><td><strong>自动做任务</strong></td><td>连登活跃、成长任务接取与领奖、运营活动任务、补领清扫、猫猫旅行派出与领奖、连登福利、夜猫子任务，按时段自动执行，失败自动重试。</td></tr>
+  <tr><td><strong>账号看板</strong></td><td>每个账号的可用积分、哪笔积分什么时候作废、近 7 天用量、旅行与任务进度，五种视图随时切换；导航默认横排，标题左侧的固定按钮可切换成左侧栏并记住选择。</td></tr>
+  <tr><td><strong>看清哪些模型能用</strong></td><td>「模型」视图列出国内版和国际版（添加了企业账号时还有企业）的模型、模型 ID、原生推理档位、上下文和积分倍率，把国际版只给 Pro 的模型单独收起来，标出订阅优先和限时优惠。</td></tr>
+  <tr><td><strong>国际版也领</strong></td><td>在 Magpie 登录了 WorkBuddy AI 的，国际版账号同样每天活跃、兑换连登档位，有签到活动时自动签到。国际版有自己的定时开关和时段，和国内版互不影响。</td></tr>
+  <tr><td><strong>提醒你该做的</strong></td><td>快作废的积分、企业额度重置、已过期的登录，集中列在看板底部；模型额度用完或排队单独成一张「模型额度监控与防限流路由」卡片。</td></tr>
+  <tr><td><strong>添加账号</strong></td><td>选国内版或国际版，直接打开 Magpie 官方 WorkBuddy 插件的浏览器登录，登录和续期仍由 Magpie 负责。</td></tr>
+  <tr><td><strong>多设备管理账号（试用）</strong></td><td>在 Magpie 的「WorkBuddy Plus → 设置 → 账号同步」共享勾选的账号、查看设备状态，也可更换同步主机。使用 Magpie 已配置的私有存储，默认关闭。 <a href="#多设备管理账号">操作说明</a></td></tr>
+</table>
 
 ## 截图
 
@@ -97,7 +97,18 @@ bun install.mjs
 
 Windows、Linux 同样用 `magpie plugin add` 安装，由 Magpie 启动服务；上面的 `bun install.mjs` 只用于 macOS，在其他系统上会直接报错退出。Windows 10 上已用 Magpie 安装运行验证；Linux 尚未验收。
 
+Windows 上用系统自带的 Windows PowerShell 和 WMI 独立启动后台。Magpie 重载插件时，同版本的后台继续监听本机端口。
+
 Windows 会为 Hyper-V、WSL 等保留一些端口范围，默认端口 3439 可能落在里面，也可能被其他程序（包括 Windows 自带的 HTTP 服务）占用。这时服务不会启动，并在 `%USERPROFILE%\.config\workbuddy-plus\service.log` 里写明原因。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 查看保留范围，然后换一个不在范围内的端口（见「设置与数据」中的端口）。
+
+如果本机面板连接超时，用 PowerShell 检查监听和 TCP 连通性。改过端口时，把两条命令里的 `3439` 换成实际端口。
+
+```powershell
+Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 3439 -State Listen
+Test-NetConnection 127.0.0.1 -Port 3439
+```
+
+如果仍在监听，但 `TcpTestSucceeded` 为 `False`，可用 `Get-Process -Id <OwningProcess> | Select-Object Id, Path` 核对进程路径，再检查 Windows 防火墙或终端安全软件对该进程的规则。需要添加允许规则时，由管理员将范围限定到实际的 `magpie-bun.exe`、本机回环地址和 Plus 端口，然后重试本机面板和侧栏。无需开启定时或执行任务。 [Windows TCP 排查](https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/tcp-ip-connectivity-issues-troubleshooting)
 
 想不开 Magpie 也运行时，安装 Bun 并登录国内账号后，在源码目录运行：
 
@@ -411,7 +422,7 @@ magpie plugin options <插件名> '{"port":4389}'
 ```
 
 - 独立运行用 `WORKBUDDY_PLUS_PORT`。macOS 后台版改端口要带新值重新安装；Magpie 插件选项要用同一端口。
-- 端口被占用或保留时，服务记录原因后退出。只有同端口已运行 WorkBuddy Plus 时，新进程才会待命接手。
+- 端口被其他程序占用或被系统保留时，服务记录原因后退出。端口已有 WorkBuddy Plus 时，Windows 上 Magpie 启动的重复进程会退出，其他独立启动的实例会等待接手。
 
 <details>
 <summary>配置项与数据目录</summary>
@@ -438,8 +449,10 @@ magpie plugin options <插件名> '{"port":4389}'
 
 </details>
 
+### 多设备管理账号
+
 <details>
-<summary>多台设备共享 WorkBuddy 账号（默认关闭）</summary>
+<summary>共享 WorkBuddy 账号（默认关闭）</summary>
 
 在各台 Magpie 中配置同一个**私有存储目标**和同步口令：GitHub 私有仓库（同一分支和目录）、WebDAV 或 S3。打开「WorkBuddy Plus → 设置 → 账号同步」：在一台设备选「主机」，勾选要共享的账号并保存；其他设备选「从机」并保存。在「状态」查看结果。本机独立面板不配置同步。
 
@@ -450,13 +463,19 @@ magpie plugin options <插件名> '{"port":4389}'
 - 「状态」显示当前租约和快照代数。「设备」用随机编号区分机器，不上传设备名；从机能连接同步存储时，即使正在等新快照，也至多每 10 分钟写一次心跳。心跳记录最后在线时间和已应用的快照代数，超过 30 分钟未收到才显示离线。只有读取权限的从机仍能接收账号，但无法上报心跳。
 - 「状态」旁可点「立即同步」，按已保存角色立即同步一次；也可调用 Magpie 工具 `sync_now`。两者都不会启用已关闭的同步，也不保存未保存的账号勾选。
 - 「同步成功」说明快照传输成功，不代表 WorkBuddy 接受当前访问凭据。如果 Magpie 提示主机的 OAuth 续期凭据已撤销或账号已退出，请在主机的「供应商」重新登录，再点「立即同步」让从机接收新的访问凭据。Plus 不续期，也不共享续期凭据。
-- 切换主机时，原主机先关闭 Plus 同步，再等最多 10 分钟让旧租约到期。新主机可选本机已导入的 API Key，不用重填；对 OAuth 则须先在新机的 Magpie 建立可续期的登录。本机关闭同步不删除已导入的账号，也不撤销已发送的凭据。
+- [更换同步主机](#更换同步主机)前，先在原主机关闭 Plus 同步。本机关闭同步不删除已导入的账号，也不撤销已发送的凭据。
 - 使用过独立的 [WorkBuddy Sync](https://github.com/NotoChen/magpie-workbuddy-sync) 时，先在所有相关设备停用旧插件，再启用 Plus 的同步。Plus 使用单独的快照路径，不读取旧快照，也不会自动清理旧插件导入的账号。
 
 </details>
 
+#### 更换同步主机
+
+1. 在原主机打开「Magpie → WorkBuddy Plus → 设置 → 账号同步」，将「本机角色」选为「关闭」并保存。
+2. 在新机打开同一设置。当前角色为「从机」时，「状态」旁会显示「切换为主机」。新机可以直接勾选已同步的 API Key。OAuth 账号需要先在新机的 Magpie 建立可续期的登录，才能勾选共享。
+3. 点击「切换为主机」，勾选共享账号并保存。旧主机的租约到期后，新主机开始发布，最多等 10 分钟。
+
 <details>
-<summary>换主机时能否批量迁移 OAuth，不逐个打开浏览器？</summary>
+<summary>批量导入 OAuth 登录</summary>
 
 如果已经有受 [Magpie 官方 WorkBuddy 插件](https://github.com/magpie-community/plugins/blob/6495fb6095a03eb0ba98178395d44ac90a53387b/packages/workbuddy/index.mjs#L2535-L2550) 支持、仅含待迁移账号的有效登录文件，新机可在「供应商 → 对应的 WorkBuddy 版本」使用「从文件导入账号…」批量导入。这是一次性迁移，不是 Plus 的同步功能。没有这类文件，或其中的续期凭据已失效，就仍需重新登录。Magpie 的[整机同步和备份](https://github.com/yetone/magpie/blob/7281f97bed6d10f7160ed084fc4c98d316370cc5/docs/subsystems/sync-backup.md#L468-L477) 不携带一次性轮换的 OAuth 登录，不能用它来迁移这批账号。
 
@@ -517,8 +536,11 @@ bun install.mjs
 
 **v0.8.8 变更**
 
+- 修复 Windows 上 Magpie 重载插件时一并结束 Plus 后台、导致本机面板掉线的问题（[#22](https://github.com/sabercomo/magpie-workbuddy-plus/issues/22)）。
+- Windows 访问本机后台超时时，Magpie 日志会显示具体地址和排查提示。
 - 「共享账号」支持全选和取消全选，仍需点击「保存设置」才生效。
-- 补充换主机说明：有官方支持的登录文件时，可用 Magpie 批量导入，不必逐个打开浏览器。Plus 的同步协议不变，仍不传续期凭据。
+- 修复换主机时账号已由 Magpie 保存为可续期登录、但因保留旧同步标记而无法勾选共享的问题（[#20](https://github.com/sabercomo/magpie-workbuddy-plus/issues/20)）。
+- 补充 Magpie 批量导入登录文件的迁移说明。Plus 的同步仍只共享 OAuth 访问凭据。
 
 **v0.8.7 变更**
 
