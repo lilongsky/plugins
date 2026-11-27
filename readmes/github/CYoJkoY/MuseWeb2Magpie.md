@@ -2,7 +2,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-wabi-dark.svg">
-  <img src="assets/readme/hero-wabi.svg" alt="magpie-muse-web bridges a muse.ai web account into a Magpie provider through a local headless fingerprint browser" width="100%">
+  <img src="assets/readme/hero-wabi.svg" alt="MuseWeb2Magpie bridges a muse.ai web account into a Magpie provider through a local headless fingerprint browser" width="100%">
 </picture>
 
 <p>
@@ -45,9 +45,9 @@
 
 ## <img src="assets/readme/icons/overview.svg" width="24" height="24" alt=""> 概述
 
-**magpie-muse-web** 是一个非官方的 [Magpie](https://github.com/yetone/magpie) provider 插件，把 [muse.ai](https://muse.ai) 的网页账号接进 Codex、OpenCode 等 Agent。
+**MuseWeb2Magpie** 是一个非官方的 [Magpie](https://github.com/yetone/magpie) provider 插件，把 [muse.ai](https://muse.ai) 的网页账号接进 Codex、OpenCode 等 Agent。
 
-provider id 是 `muse-web`，模型是 `muse-web/muse-spark`。每个账号在浏览器窗口里登录一次；之后 Magpie 通过插件自带的本机引擎，用一个无头的开源指纹浏览器与 muse.ai 聊天页对话，在多个账号之间调度请求，并在账号卡片上显示各自的用量。
+provider id 是 `muse-web`，模型是 `muse-web/muse-spark`。每个账号在浏览器窗口里登录一次；之后 Magpie 通过插件自带的本机引擎，用一个无头的指纹浏览器（优先本机 Donut Browser 的 Wayfern 内核，其次是开源指纹浏览器 Apostate）与 muse.ai 聊天页对话，在多个账号之间调度请求，并在账号卡片上显示各自的用量。
 
 muse.ai 没有公开 API。这个引擎把 Magpie 发来的 Chat Completions 请求变成网页上的一条消息，再把回复流式送回去。选哪个账号、忙时换号、失败重试都交给 Magpie 自己的调度；引擎只执行被点名的那一个账号。
 
@@ -58,7 +58,7 @@ muse.ai 没有公开 API。这个引擎把 Magpie 发来的 Chat Completions 请
 | 能力 | 说明 |
 | :--- | :--- |
 | **网页账号即模型** | 每个 muse.ai 网页账号单独出现在 Magpie 里，选号与换号由 Magpie 调度。 |
-| **无头指纹浏览器** | 默认用开源指纹浏览器 Apostate 打开 muse.ai，保持稳定的 GPU / 屏幕 / 字体 / 时区指纹；缺失时自动下载固定版本并做 sha256 校验。 |
+| **无头指纹浏览器** | 优先用本机 Donut Browser 的 Wayfern 内核，其次用开源指纹浏览器 Apostate 打开 muse.ai，保持稳定的 GPU / 屏幕 / 字体 / 时区指纹；两者都没有时自动下载固定版本的 Apostate 并做 sha256 校验。 |
 | **Chat Completions** | 流式与非流式，OpenAI 兼容；工具调用以标准 `tool_calls` 返回。 |
 | **会话复用** | 每个账号只开一个页面，切换会话在页内跳转，不重新加载。 |
 | **额度卡片** | 每张卡片显示该账号的每周用量、额外额度与状态。 |
@@ -86,7 +86,7 @@ Go engine  ── 127.0.0.1:18611 · static native binary
 TypeScript driver ── prompt, tools, login, CDP and page evaluation
         │  Chrome DevTools Protocol
         ▼
-Apostate / Chromium fingerprint browser  ── headless
+Wayfern (Donut) / Apostate / Chromium  ── headless
         │  https://muse.ai  (muse.ai virtual machine)
         ▼
 Reply text  →  streamed back as OpenAI chunks
@@ -150,11 +150,11 @@ muse.ai 没有公开上下文上限。按 128K 声明，是为了让客户端在
 
 ## <img src="assets/readme/icons/providers.svg" width="24" height="24" alt=""> 方案对比
 
-### magpie-muse-web vs muse2api
+### MuseWeb2Magpie vs muse2api
 
 [muse2api](https://github.com/czg86389-hub/muse2api) 是一个独立运行的 muse.ai 转 API 服务，[magpie-muse2api-plugin](https://github.com/d0nkey8urger-bot/magpie-muse2api-plugin) 把它接进 Magpie。两者的区别：
 
-| | magpie-muse-web | muse2api + 插件 |
+| | MuseWeb2Magpie | muse2api + 插件 |
 | :--- | :--- | :--- |
 | Magpie 里看到的 | 每个 muse.ai 账号单独一个 | 一个 key，账号池在 muse2api 里 |
 | 选号、换号 | Magpie 按账号调度 | muse2api 自己调度 |
@@ -166,17 +166,17 @@ muse.ai 没有公开上下文上限。按 128K 声明，是为了让客户端在
 
 只在 Magpie 里用、想让 Magpie 管理多个账号，选这个插件；要生图生视频，或者要给 Magpie 以外的工具一个统一的 API，选 muse2api。两者的 provider id 不同（`muse-web` 和 `muse2api`），可以同时安装。
 
-### magpie-muse-web vs magpie-muse-auth
+### MuseWeb2Magpie vs magpie-muse-auth
 
 `magpie-muse-auth`（provider id `muse`）走 Meta 的 Muse Code API，设备码登录，属于非官方 API 接入。
 
-| | magpie-muse-web | magpie-muse-auth（Meta API） |
+| | MuseWeb2Magpie | magpie-muse-auth（Meta API） |
 | :--- | :--- | :--- |
 | 账号 | muse.ai 网页账号 | Meta Muse Code 订阅 |
 | 模型 | `muse-spark` | Wonder、Spark 1.1–1.3 |
 | 上下文 | 128K | 约 1M |
 | 工具调用 | prompt 解析 | 原生 Responses tools |
-| 浏览器 | 内置开源指纹浏览器或 Chromium 系浏览器 | 不需要 |
+| 浏览器 | Donut Browser 的 Wayfern 内核、内置开源指纹浏览器或 Chromium 系浏览器 | 不需要 |
 | 主要风险 | 网页改版、地区/代理 | 订阅条款、非官方 API |
 
 要原生工具、大上下文、多模型，选 `muse`；要在网页账号上跑、让 Magpie 按账号显示额度，选 `muse-web`。
@@ -203,7 +203,7 @@ Connector 不启动浏览器、不读 cookie、不 spawn 进程，只连接你�
 ### 环境要求
 
 - [Magpie](https://github.com/yetone/magpie)，在 0.1.1223 上验证过。
-- 默认用开源指纹浏览器 [Apostate](https://github.com/heretic-tech/apostate) 打开 muse.ai：本机已有就复用；没有时引擎启动时自动下载一次固定版本（带 sha256 校验）到数据目录，以后复用。下载失败或设为 `MUSE_WEB_FINGERPRINT=0` 时，用本机的 Chrome、Edge、Chromium 或 Brave。Firefox 不能当登录窗口：引擎靠 Chrome DevTools Protocol 操作页面。
+- 打开 muse.ai 的浏览器按这个顺序找：本机 [Donut Browser](https://github.com/donutbrowser/donutbrowser) 的 Wayfern 内核 → 本机已有的开源指纹浏览器 [Apostate](https://github.com/heretic-tech/apostate) → 引擎自动下载一次固定版本（带 sha256 校验）到数据目录。Wayfern 在命令行上就是普通 Chromium，所以按 Chromium 启动，不加指纹参数、不碰 Donut 的账号数据。两者都没有时用本机的 Chrome、Edge、Chromium 或 Brave；下载失败或设为 `MUSE_WEB_FINGERPRINT=0` 也一样。Firefox 不能当登录窗口：引擎靠 Chrome DevTools Protocol 操作页面。
 - 安装包已带当前平台和架构的 Go 原生引擎，日常使用不需要另装 Go；引擎会使用插件宿主提供的 TypeScript 运行时启动浏览器驱动。
 - 如果从源码开发或运行测试，需要 Go `>=1.27.4` 与 Node.js `>=22.18`；具体命令见[开发](#readme-development)。
 - 能访问 muse.ai 的网络。需要代理时见[设置](#readme-settings)。
@@ -211,12 +211,11 @@ Connector 不启动浏览器、不读 cookie、不 spawn 进程，只连接你�
 ### 命令
 
 ```sh
-magpie plugin add magpie-muse-web       # npm 包名；如果 npm 上还没有，用下面这行
 magpie plugin add github:CYoJkoY/MuseWeb2Magpie
 magpie plugin login muse-web
 ```
 
-也可以在 Magpie 的插件页添加对应的包名或 GitHub 地址，然后在账号页登录 `muse-web`。想登录多个账号，就多登录几次。
+也可以在 Magpie 的插件页添加这个 GitHub 地址，然后在账号页登录 `muse-web`。想登录多个账号，就多登录几次。npm 上的 `magpie-muse-web` 是旧版本，不再随这个仓库更新。
 
 更新用 `magpie plugin update`；卸载用 `magpie plugin rm`（名字见 `magpie plugin list`）。卸载不会删除引擎的数据目录，不再使用时可以手动删掉。
 
@@ -231,7 +230,7 @@ magpie plugin add ./MuseWeb2Magpie
 
 ## <img src="assets/readme/icons/login.svg" width="24" height="24" alt=""> 登录
 
-**muse.ai（浏览器登录）**：会开两个窗口。系统默认浏览器里打开的是本机进度页（`http://127.0.0.1:<端口>/login/…`），只显示进度、每 2 秒刷新，那里不能登录。真正的登录在引擎另外打开的窗口里：默认是开源指纹浏览器 Apostate（本机已有或引擎自动准备的那份；装了多个浏览器时，登录前会先让你选一个，Apostate 在前），其余可选 Chrome、Edge、Chromium 或 Brave。请在那个窗口里照常登录，什么都不用复制。
+**muse.ai（浏览器登录）**：会开两个窗口。系统默认浏览器里打开的是本机进度页（`http://127.0.0.1:<端口>/login/…`），只显示进度、每 2 秒刷新，那里不能登录。真正的登录在引擎另外打开的窗口里：默认用引擎自己准备的那份浏览器（Donut Browser 的 Wayfern 内核，其次开源指纹浏览器 Apostate）。装了多个浏览器时，登录前会先让你选一个：Donut Browser（Wayfern 内核）在最前，其次是 Apostate，其余是本机扫到的 Chrome、Edge、Chromium 或 Brave。列表里没有你的浏览器（便携版、绿色版、装在别的盘）时，选最后一项「手动填写浏览器路径…」，填浏览器可执行文件的绝对路径即可——粘贴时带的引号会自动去掉，相对路径、目录和不存在的路径在开始登录前就被直接拒绝。请在那个窗口里照常登录，什么都不用复制。
 
 登录后引擎向 muse.ai 确认会话，关掉登录窗口，再发一条很短的测试消息：账号真的能回答，才算登录成功。账号额度已用完的也算成功，只是暂时用不了。
 
@@ -269,6 +268,17 @@ Magpie 在会话到期前 10 分钟自动续期；续不上时额度卡片显示
 - `accounts.json` 和 `engine.key` 以 0600 写入（Windows 用当前用户目录的 ACL）；cookie 只在引擎、账号自己的浏览器上下文和 muse.ai 之间流动。
 - `engine.log` 不记录对话正文或 cookie；错误体和日志里的 Bearer / token / hatch cookie 会脱敏，但上游返回的普通文本仍可能出现在错误里，分享日志前请自己检查一遍。
 - 插件不会复用你日常浏览器的登录态；登录窗口用的是临时资料目录，完成后删除。
+- 引擎浏览器的 DevTools 端口只绑 `127.0.0.1` 且不带 `--remote-allow-origins=*`，所以账号资料目录里加载的网页连不上 CDP，控制不了浏览器、也读不到 muse.ai 会话；响应统一带 `nosniff`，不放缓存的默认 `no-store`，登录进度页另有 CSP、`X-Frame-Options: DENY` 和 `Referrer-Policy: no-referrer`。
+- 请求的 `Host` 必须是 `127.0.0.1`、`localhost` 或 `[::1]`（可带端口），其它一律 403 `host_not_allowed`：DNS rebinding 的页面到达端口时仍带着自己的域名，连免鉴权的 health 与登录进度页都读不到。
+- 插件把 `engine.key` 发给端口之前，先让端口证明自己持有这把密钥（health challenge，见 ADR 0004）：带 nonce 的 `/v1/health` 会回答一个只有 `engine.key` 持有者能算出的 HMAC。证明不了的端口（被抢注，或升级后仍在运行的旧引擎）拿不到密钥，插件会直接报「端口被占用」并请你重启 Magpie。
+- `engine.key` 和账号句柄只发给本机回环地址或 `https` 地址（见 ADR 0006）：用 `MUSE_WEB_ENGINE` 指向别的机器时必须是 `https`，明文 http 的局域网 / 域名地址会被直接拒绝、连接都不会建立。免鉴权的 `/v1/health` 只回答「引擎在、哪个版本」，不暴露账号数。
+- 免鉴权的登录进度页不做任何活：登录 ID 必须符合 `login_start` 发出去的形状（否则直接 404），没有驱动在跑时页面只回答「找不到这次登录」而不去拉起一个浏览器进程；同时处理的请求也有固定在飞上限（免鉴权页面 4 个、带密钥 64 个），超了就回 503 `engine_busy` 而不是排队把内存撑大（见 ADR 0008）。
+- 手填的浏览器路径必须是绝对路径、并且是一个真实的普通文件（见 ADR 0009）：相对路径会被引擎解析到自己所在目录、等于让一个名字决定跑哪个程序，所以插件在开始登录前、引擎在真正启动前都会拒绝它，并说明是哪里不对；粘贴带来的一对引号与首尾空白会被去掉。
+- `MUSE_WEB_SITE` 决定 muse.ai 会话 cookie 发到哪个源，所以它遵循和 `engine.key` 相同的凭据传输规则（见 ADR 0010）：明文 http 只能指向本机回环地址（`127.0.0.1`、`localhost` 或 `[::1]`），其他地方必须 https；不是完整网址或带了用户名密码的值在浏览器启动前就被拒绝，并说明原因。镜像站照旧可以指向回环，真实站点默认不需要配置。
+- 指纹浏览器的下载文件名只取远端名字的最后一段（见 ADR 0011）：绝对路径、盘符和 `..` 段不会成为落盘路径，压缩格式后缀保留；名字被改写后不再匹配固定版本的 sha256，这次下载必须自带 `.manifest.json` 的哈希，否则不安装、退回系统 Chromium。
+- 代理地址里的用户名和密码不进浏览器的命令行（见 ADR 0012）：`--proxy-server` 是子进程参数，macOS 和 Linux 上任何本机用户都能用 `ps` 读到，而 Chrome 解析这个参数时只取 scheme、host、port，本来就会丢掉 userinfo，所以引擎在拼参数前只保留 `scheme://host:port`（`engine/net.ts` 的 `proxyForBrowser()`）。引擎自己的请求照旧用完整地址，需要认证的代理仍然可用；启动日志会说明一次，免得以为浏览器也在用那组凭据。
+
+完整的威胁模型、必须保持的不变量和已知残留风险见 [`SECURITY.md`](SECURITY.md)；health challenge 的取舍见 [`docs/adr/0004-health-challenge.md`](docs/adr/0004-health-challenge.md)，凭据只走回环或 https 的取舍见 [`docs/adr/0006-credentials-over-the-wire.md`](docs/adr/0006-credentials-over-the-wire.md)，免鉴权面不做工与在飞上限的取舍见 [`docs/adr/0008-admission-control.md`](docs/adr/0008-admission-control.md)，手填浏览器路径的形状限制见 [`docs/adr/0009-typed-browser-path.md`](docs/adr/0009-typed-browser-path.md)，配置站点的传输规则见 [`docs/adr/0010-configured-site-transport.md`](docs/adr/0010-configured-site-transport.md)，下载文件名的限制见 [`docs/adr/0011-release-file-name.md`](docs/adr/0011-release-file-name.md)，代理凭据不进命令行的取舍见 [`docs/adr/0012-proxy-credentials-off-argv.md`](docs/adr/0012-proxy-credentials-off-argv.md)。
 
 <a name="readme-usage"></a>
 
@@ -292,8 +302,9 @@ magpie provider test muse-web          # 发一条真实的小请求，检查整
 | :--- | :--- | :--- |
 | `MUSE_WEB_PROXY` | 代理地址，或 `direct` 表示直连 | 依次用 `https_proxy` 等环境变量、系统代理，都没有就直连 |
 | `MUSE_WEB_BROWSER` | `headless`、`hidden`（窗口放到屏幕外）或 `show` | `headless` |
-| `MUSE_WEB_FINGERPRINT` | 设为 `0` 时不使用也不下载指纹浏览器 | 使用 |
-| `MUSE_WEB_FINGERPRINT_BROWSER` | 指定要复用的 Apostate 可执行文件路径 | 自动查找本机与数据目录 |
+| `MUSE_WEB_FINGERPRINT` | 设为 `0` 时不使用也不下载指纹浏览器，直接用 `MUSE_WEB_CHROME` 或系统浏览器 | 使用 |
+| `MUSE_WEB_DONUT_BROWSER` | Donut Browser 的 data 目录或 Wayfern 内核路径；设为 `0` 时不使用 Donut，只找 Apostate | 自动查找 Donut 的 data 目录与 Scoop 安装 |
+| `MUSE_WEB_FINGERPRINT_BROWSER` | 指定要复用的指纹浏览器可执行文件路径（优先级最高，Donut 的 Wayfern 也可以填） | 自动查找本机与数据目录 |
 | `MUSE_WEB_FINGERPRINT_VERSION` | 自动下载的 Apostate 版本 | 固定版本 |
 | `MUSE_WEB_FINGERPRINT_PLATFORM` | Apostate 的指纹平台（`windows`、`macos`、`linux`） | 跟随当前系统 |
 | `MUSE_WEB_CHROME` | 指纹浏览器不可用时的浏览器路径，必须是 Chromium 系；`firefox.exe` 不行。登录时选的浏览器只覆盖那一次登录窗口 | 自动查找 Chrome、Edge、Chromium、Brave |
@@ -302,9 +313,9 @@ magpie provider test muse-web          # 发一条真实的小请求，检查整
 | `MUSE_WEB_VERIFY_LOGIN` | 设为 `0` 时登录后不发测试消息 | 发送 |
 | `MUSE_WEB_ENGINE_PORT` | 引擎端口 | `18611` |
 | `MUSE_WEB_HOME` | 数据目录 | 见上表 |
-| `MUSE_WEB_ENGINE` | 改用自己运行的引擎地址，插件不再自己启动引擎 | 插件自带 |
+| `MUSE_WEB_ENGINE` | 改用自己运行的引擎地址，插件不再自己启动引擎；凭据只发给本机回环或 `https` 地址，明文 http 的局域网 / 域名地址会被拒绝 | 插件自带 |
 | `MUSE_WEB_ENGINE_KEY` | 外部引擎的 `engine.key`；配合 `MUSE_WEB_ENGINE` 使用 | 读数据目录的 `engine.key` |
-| `MUSE_WEB_SITE` | 改用别的 muse.ai 兼容站点（测试 / 镜像） | `https://muse.ai` |
+| `MUSE_WEB_SITE` | 改用别的 muse.ai 兼容站点（测试 / 镜像）。会话 cookie 发到这个地址，所以遵循 `MUSE_WEB_ENGINE` 的传输规则：明文 http 只能指向本机回环地址，其他地方必须 https；不是完整网址或带了用户名密码的值会被拒绝 | `https://muse.ai` |
 
 <a name="readme-performance"></a>
 
@@ -321,7 +332,7 @@ magpie provider test muse-web          # 发一条真实的小请求，检查整
 
 ## <img src="assets/readme/icons/troubleshooting.svg" width="24" height="24" alt=""> 排查问题
 
-先看数据目录里的 `engine.log`。每条请求一行，写明用了哪个账号、页面是复用（`kept`）还是新开（`new`）、是回到旧对话（`back`）还是开新对话（`new-thread`）、发了整段历史还是最新一条、首字用时；带工具的请求还会写 `tools=2→shell` 或 `tools=2→text`。
+先看数据目录里的 `engine.log`。每条请求一行（请求路径里的换行等控制字符会被换成空格，所以一条记录只会占一行），写明用了哪个账号、页面是复用（`kept`）还是新开（`new`）、是回到旧对话（`back`）还是开新对话（`new-thread`）、发了整段历史还是最新一条、首字用时；带工具的请求还会写 `tools=2→shell` 或 `tools=2→text`。
 
 | 现象 | 原因和处理 |
 | :--- | :--- |
@@ -330,10 +341,14 @@ magpie provider test muse-web          # 发一条真实的小请求，检查整
 | 首字等了很久，提示虚拟机正在预热 | muse.ai 那边的虚拟机还没就绪，稍后再试 |
 | 卡片上没有百分比 | 虚拟机还在连接，2 分钟后自动重读 |
 | 登录反复不完成，账号数一直是 0 | 默认浏览器里那个页面只是进度。请在另开的指纹浏览器或 Chromium 窗口里登录，并等引擎确认会话后它自己关掉。看 `engine.log` 有没有 `verify` 或 `warm`；状态页上的错误若是 `/api/session HTTP 403`，是出口地区或代理问题，可试 `MUSE_WEB_PROXY=direct` |
-| 日志显示指纹浏览器下载或安装失败 | 引擎会自动改用本机 Chrome/Edge/Chromium。检查网络代理后重试，或用 `MUSE_WEB_FINGERPRINT_BROWSER` 指定本机已有的 Apostate；确实不想用它时设 `MUSE_WEB_FINGERPRINT=0` |
+| 登录前没有出现我的浏览器 | 选最后一项「手动填写浏览器路径…」填可执行文件的绝对路径（粘贴的引号会自动去掉；相对路径、目录、不存在的文件会被当场拒绝）；或设 `MUSE_WEB_CHROME` 后重开 Magpie |
+| 用了 Donut Browser，但引擎没用它的内核 | 引擎会自己找 `%LOCALAPPDATA%\DonutBrowser`、`DONUTBROWSER_DATA_DIR` / `DONUTBROWSER_DATA_ROOT` 和 Scoop 的 `apps\donutbrowser\current` 下的 `binaries\wayfern\<版本>`。装在别处时设 `MUSE_WEB_DONUT_BROWSER` 指向 Donut 的 data 目录或 `chrome.exe`；不想用 Donut 时设 `MUSE_WEB_DONUT_BROWSER=0` |
+| 日志显示指纹浏览器下载或安装失败 | 引擎会自动改用本机 Chrome/Edge/Chromium。检查网络代理后重试，或用 `MUSE_WEB_FINGERPRINT_BROWSER` 指定本机已有的 Apostate 或 Wayfern 内核；确实不想用它时设 `MUSE_WEB_FINGERPRINT=0` |
 | 登录失败：「已登录，但账号没有回答测试消息」 | 会话拿到了但对话不通，常见于虚拟机还在预热，稍后重新登录 |
 | Agent 说它看不到你的文件，或让你自己运行命令 | 模型这次没按工具格式回答，重试或换种说法；日志里会是 `tools=…→text` |
 | 连不上 muse.ai | 检查网络，或用 `MUSE_WEB_PROXY` 指定代理 |
+| 提示端口被占用、无法证明持有 engine.key | 升级插件后旧版引擎可能还在跑。重启 Magpie（watchdog 会结束旧引擎），或手动结束占用该端口的进程 |
+| 偶发返回 503 `engine_busy` | 打给这个端口的请求太多，超过了引擎的在飞上限（免鉴权页面 4 个、带密钥请求 64 个），引擎拒绝而不是排队。响应带 `Retry-After`，稍后重试即可 |
 
 ### 错误码
 
@@ -342,12 +357,14 @@ magpie provider test muse-web          # 发一条真实的小请求，检查整
 | code | HTTP | 含义 | 处理 |
 | :--- | :--- | :--- | :--- |
 | `session_expired` | 401 | 会话被 muse.ai 登出 | 重新登录该账号 |
+| `host_not_allowed` | 403 | `Host` 不是回环地址 | 用 `127.0.0.1` / `localhost` 访问引擎 |
 | `account_busy` | 429 | 这个账号正在回答 | Magpie 换号；`Retry-After: 1` |
 | `quota_spent` | 429 | 这个账号额度用完 | 等重置或换号；`Retry-After: 60` |
 | `prompt_too_long` | 413 | 页面拒收过长的消息 | 开新会话或减少历史 |
 | `vm_warming` | 503 | 账号虚拟机还在预热 | 10 秒后重试 |
 | `page_unavailable` | 503 | 页面没加载出来 | 10 秒后重试 |
 | `send_failed` | 503 | 消息没有发出去 | 重试 |
+| `engine_busy` | 503 | 引擎同时在处理的请求太多 | 稍后重试；`Retry-After: 1` |
 | `stream_interrupted` | SSE | 流式回答中途失败 | 重试该轮 |
 | `tool_call_not_parsed` | 422 | required / 指定工具没有被调用 | 重试或换模型 |
 
@@ -385,8 +402,8 @@ git push origin v0.11.0
 没装浏览器时，用到浏览器的测试会自动跳过。Linux 环境可以用 Docker 跑：
 
 ```sh
-docker build -t magpie-muse-web-linux-test test/linux
-docker run --rm -v "$PWD:/source:ro" magpie-muse-web-linux-test sh -c 'cp -a /source /plugin && cd /plugin && npm ci && npm test'
+docker build -t museweb2magpie-linux-test test/linux
+docker run --rm -v "$PWD:/source:ro" museweb2magpie-linux-test sh -c 'cp -a /source /plugin && cd /plugin && npm ci && npm test'
 ```
 
 ### 代码结构
@@ -401,7 +418,7 @@ MuseWeb2Magpie
 │   ├── muse.ts              浏览器里的 muse.ai 页面操作
 │   ├── cdp.ts               Chrome DevTools Protocol 客户端
 │   ├── browser.ts           浏览器查找、启动、参数、清理
-│   ├── fingerprint.ts       Apostate 的查找、下载、校验与指纹参数
+│   ├── fingerprint.ts       Wayfern（Donut）/ Apostate 的查找、下载、校验与指纹参数
 │   ├── prompt.ts            把对话历史拼成发到页面的文本
 │   ├── tools.ts             工具调用：提示词与解析
 │   ├── login.ts             浏览器登录窗口
@@ -432,7 +449,7 @@ MuseWeb2Magpie
 <a href="https://cyojkoy.github.io/Payment/">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/readme/support-cta-dark.svg">
-    <img src="assets/readme/support-cta.svg" alt="Support magpie-muse-web through the maintainer payment page" width="100%">
+    <img src="assets/readme/support-cta.svg" alt="Support MuseWeb2Magpie through the maintainer payment page" width="100%">
   </picture>
 </a>
 
@@ -458,4 +475,4 @@ An unofficial [Magpie](https://github.com/yetone/magpie) provider plugin for mus
 
 Tool calls are supported through the prompt: the model writes them in `tool_call` code blocks, which come back as standard `tool_calls`; `tool_choice: required` gets one repair turn. Long histories are trimmed to roughly 400K characters / 80 turns with an explicit omission note. Errors carry `error.code` and 429/503 responses carry `Retry-After`.
 
-Install with `magpie plugin add magpie-muse-web` (or `github:CYoJkoY/MuseWeb2Magpie` if npm is not published yet), then `magpie plugin login muse-web`. Sign-in opens two windows: the system browser shows a local progress page, and the separate window where you actually sign in defaults to the open-source fingerprint browser Apostate. It reuses a local copy first; otherwise the engine downloads a pinned, sha256-checked release into its data directory, and falls back to Chrome, Edge, Chromium or Brave when that fails. Firefox cannot be that window. Text only. MIT licensed. For the Meta Muse Code API instead of the web account, see `magpie-muse-auth` (provider `muse`).
+Install with `magpie plugin add github:CYoJkoY/MuseWeb2Magpie`, then `magpie plugin login muse-web`. Sign-in opens two windows: the system browser shows a local progress page, and the separate window where you actually sign in uses the engine's own browser — Donut Browser's Wayfern kernel when Donut is installed, otherwise the open-source fingerprint browser Apostate (a local copy first, then a pinned, sha256-checked download into the data directory), falling back to Chrome, Edge, Chromium or Brave. Wayfern is an ordinary Chromium at the command line, so it launches without fingerprint flags. Set `MUSE_WEB_DONUT_BROWSER` to a Donut data folder or kernel path when Donut lives elsewhere, or to `0` to skip Donut. If the list misses your browser, pick the last entry and type the absolute path to the executable itself - pasted quotes are trimmed, and a relative path, a folder or a missing file is refused before sign-in starts. Firefox cannot be that window. Text only. MIT licensed. For the Meta Muse Code API instead of the web account, see `magpie-muse-auth` (provider `muse`).
