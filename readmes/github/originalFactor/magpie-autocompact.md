@@ -42,9 +42,12 @@ magpie models
 - `compactionTargetRatio`：压缩后希望保留的消息数占 `maxMessages` 的比例，大于 `0` 且不超过 `1`，默认 `0.5`。安全边界或必须保留的内容可能使实际结果高于目标。
 - `maxRetainedRatio`：可选，大于 `0` 且不超过 `1`。安全切分无法将保留项数降到 `maxMessages` 的此比例时，允许强制压缩、摘要或打包到最后一项，包括当前输入和未完成的工具调用。强制摘要与打包附加继续执行的提示。不透明上下文不能由摘要或打包处理；省略此项则不启用强制压缩。
 - `compactionNotice`：设为 `true` 时按实际使用的压缩方式及保留消息数显示提示；默认关闭。
+- `diagnostics`：设为 `true` 时记录请求结构和压缩诊断，默认关闭。日志写入该供应商的 `stateDir/diagnostics.jsonl`；默认 `stateDir` 为 `~/.local/state/magpie-autocompact/<供应商 ID>`，也可由 `XDG_STATE_HOME` 或 `stateDir` 指定。
 - `timeoutMs`：请求超时，默认 `120000` 毫秒（2 分钟）。
 
 更多选项见[配置示例中的注释](examples/options.jsonc)。
+
+诊断日志按 JSON Lines 记录请求 ID、会话标识的哈希、输入项类型、角色、文本长度和是否为空、缓存命中的前缀长度、压缩前后项数及推理结果状态；不记录消息正文、工具参数、媒体内容、请求头或密钥。每个输入列表最多记录前 2000 项，其余数量写在 `omitted`。日志会持续追加，排查后可关闭 `diagnostics` 并按需删除该日志文件。
 
 配置文件带有注释，请用上面的命令解析后导入。不要将真实密钥提交到版本库。
 

@@ -91,6 +91,35 @@ Two of them need care, and the plugin already handles both:
 - **DeepSeek V4 Pro was removed.** LiveKit silently served it with Gemma 4 31B, twice in a
   row on 2026-11-21, so the entry is gone rather than showing a model that is not itself.
 
+## Where each model is served
+
+LiveKit Inference is a reseller: the model ids here are LiveKit's aliases, and the gateway says
+which backend answered in `message.extra_content.livekit.inference_deployment`. Measured on
+**2026-11-28**:
+
+| Model | Backend the gateway reported |
+|---|---|
+| `gemini-3.8-flash` | `standard_aistudio` (Google AI Studio) **or** `standard_vertex` (Vertex AI) |
+| `deepseek-v4.1-flash` | `standard_baseten` (Baseten) |
+| `kimi-k2.6` | `standard_vercel` (Vercel) |
+| `gpt-6-luna` | `openai_eu` (OpenAI, EU) |
+| `grok-4.7` | `standard_xai` (xAI) |
+| a fallback reply (below) | `livekit_gemma_banana_echo` — Gemma 4 31B, hosted by LiveKit itself |
+
+Every call was billed at `inference_tier_billed: "standard"`.
+
+Two things follow:
+
+- **Gemini switches backends between calls.** The same id and prompt went to AI Studio once and
+  to Vertex the next time, with tools or without. The two serve different snapshots, so behaviour
+  drifts between otherwise identical requests.
+- **Not every sampling parameter is forwarded.** `temperature` at 3.0 and -1.0 (outside the 0–2
+  range) was accepted without an error, so it never reached Google; `frequency_penalty: 9` came
+  back as Google's own 400, so that one is forwarded. A client that sets `temperature` should
+  assume it is ignored here.
+
+Measured, not documented: LiveKit's docs name Baseten and Vercel as hosts and leave the rest out.
+
 ## Thinking content
 
 Whether a model's reasoning text comes back depends on the model, not on the plugin:
@@ -119,6 +148,10 @@ X-Livekit-Inference-Llm-Model-Fallback: google/gemma-4-31b-it
 Asked for `deepseek-v4-pro` on 2026-11-21 and this is what came back — Gemma 4 31B
 answering in DeepSeek's place. That is why it can feel "not really DeepSeek", and why that
 model was removed from this plugin.
+
+Still true on 2026-11-28: the same request returns HTTP 200, answered by `google/gemma-4-31B-it`
+from `livekit_gemma_banana_echo`, with that header set. The reply itself opens with "a large
+language model trained by Google" — the only hint in the body.
 
 The plugin does two things about it:
 
@@ -165,8 +198,10 @@ often runs several requests at once (sub-agents, tool loops, title generation), 
 sessions will queue or fail with `429`. The plugin declares `maxConcurrency: 5` so magpie
 can plan around it.
 
-**This is not an official model-vendor API.** LiveKit resells inference on infrastructure
-it does not run (its docs name Baseten and Vercel as the hosts). The endpoint is stable
+**This is not an official model-vendor API.** LiveKit resells inference on infrastructure it does
+not always run: measured backends are Google (AI Studio and Vertex), Baseten, Vercel, OpenAI (EU)
+and xAI, plus Gemma served by LiveKit itself — see “Where each model is served”. The gateway's
+own docs name only Baseten and Vercel. The endpoint is stable
 enough for development and personal use; treat it as a convenience, not as the backbone
 of a product. For production, use DeepSeek's, OpenAI's or Google's own key.
 

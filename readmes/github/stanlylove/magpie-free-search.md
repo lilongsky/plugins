@@ -167,6 +167,21 @@ node --test test.mjs
 
 也可以使用 `magpie plugin options magpie-free-search-port '{"mode":"multi"}'` 修改插件选项。排查某个来源时，可启用扩展工具后运行 `free_search_test`；此诊断会产生真实外部请求。
 
+## 在 Magpie 中搜索到本插件
+
+Magpie 的插件搜索按 GitHub 仓库 topic 抓取（`topic:magpie-plugin archived:false fork:false`），并按 star 排序截断索引；npm 侧读取 `package.json` 的 `keywords`。因此本仓库必须保留以下两项，否则在 Magpie 的插件搜索里既搜不到、也无法通过 `magpie plugin add` 按名字安装：
+
+- GitHub 仓库 topics：`magpie-plugin`（必需），另加 `magpie`、`web-search`、`search`、`plugin`、`opencode-plugin` 便于分类检索。
+- `package.json` 的 `keywords`：`magpie`、`magpie-plugin`、`web-search`、`search`、`plugin` 等。
+
+查看或补回 topics：
+
+```sh
+gh repo edit stanlylove/magpie-free-search --add-topic magpie-plugin
+```
+
+没有 `gh` 时，在仓库页面右侧 **About → 齿轮 → Topics** 添加 `magpie-plugin` 即可，GitHub 索引通常在数分钟内更新；Magpie 本地索引缓存约 15 分钟刷新一次，必要时重启 Magpie 强制重新拉取。
+
 ## 许可与致谢
 
 本项目使用 MIT 许可证。代码移植受 [DDDMUC/dsh-free-search](https://github.com/DDDMUC/dsh-free-search) 启发，并保留上游贡献者与本移植项目维护者的版权声明，详见 [`LICENSE`](LICENSE)。感谢 [guotree/magpie-websearch](https://github.com/guotree/magpie-websearch) 展示 Magpie 原生搜索 API 的接入方式。

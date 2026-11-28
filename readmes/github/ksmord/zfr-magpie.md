@@ -4,7 +4,7 @@
 
 把 [zfr-core](https://github.com/wayne091106-hash/zfr-core) 的**多出口 IP 轮换 / OpenCode v2.1.3 协议伪装 / 冷却式故障切换**以纯 JS/TS 移植成 **Magpie provider 插件**。
 
-**自包含：无 Rust、无 CLI、无 sidecar、不需要 `zfr serve`。** 装进 Magpie 就能用。当前版本 `0.2.0`。
+**自包含：无 Rust、无 CLI、无 sidecar、不需要 `zfr serve`。** 装进 Magpie 就能用。当前版本 `0.2.1`。
 
 ## 安装
 
