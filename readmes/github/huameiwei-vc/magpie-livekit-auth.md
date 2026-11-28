@@ -45,6 +45,45 @@ LiveKit retires models regularly — if one stops answering, check
 
 All five support tool calling, which is what coding agents rely on.
 
+### What they cost
+
+LiveKit publishes a per-model price. The plugin carries it so the agents that take their prices
+from magpie (OpenCode and the rest) count a session's cost. USD per million tokens, taken from
+[livekit.com/pricing/inference](https://livekit.com/pricing/inference) on **2026-11-28**:
+
+| Model | Input | Cached input | Output |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | $0.300 | $0.007 | $1.200 |
+| `gpt-6-luna` | $0.100 | $0.010 | $0.500 |
+| `gemini-3.8-flash` | $0.750 | $0.075 | $3.750 |
+| `kimi-k2.6` | $0.950 | N/A | $4.000 |
+| `grok-4.7` | $2.000 | $0.500 | $6.000 |
+
+**magpie's own Usage page does not read a plugin's price.** It prices a call at the price you set
+for that model, otherwise at its catalog (models.dev). For DeepSeek V4.1 Flash the two differ:
+models.dev lists the maker's $0.15/$0.60, while LiveKit charges $0.30/$1.20 — so without a price
+of your own, the page shows half the real cost. Gemini, GPT-6 Luna and Grok 4.7 happen to match.
+Set LiveKit's rates once and the page counts them:
+
+```sh
+magpie model price livekit/deepseek-v4.1-flash 0.3,1.2,0.007,0
+magpie model price livekit/gpt-6-luna          0.1,0.5,0.01,0
+magpie model price livekit/gemini-3.8-flash    0.75,3.75,0.075,0
+magpie model price livekit/kimi-k2.6           0.95,4,0,0
+magpie model price livekit/grok-4.7            2,6,0.5,0
+```
+
+`magpie model price livekit/<model> --reset` takes one back off. The four numbers are in, out,
+cache read and cache write, in USD per million tokens. These are list prices, so the figure is an
+estimate of what LiveKit will charge — not a reading of your balance. LiveKit bills thinking
+tokens at the output rate, and the gateway's `completion_tokens` already includes them, so visible
+and invisible reasoning are both counted.
+
+Prices change. When LiveKit updates its table, edit `cost` in `MODELS` and, if the Usage page
+should follow, set the same numbers with `magpie model price`. A model discovered from
+`/v1/models` is left without a price on purpose, so magpie falls back to models.dev instead of
+counting it as free.
+
 Two of them need care, and the plugin already handles both:
 
 - **Kimi K2.6** spends its whole output budget on thinking when the budget is small,
@@ -92,9 +131,13 @@ If a model falls back often, stop using it. That is exactly what happened to
 
 ## Remaining credits: what can and cannot be shown
 
-There is no API for the `$2.50` balance. `/v1/models` returns `{}`, and the LiveKit
-Cloud API has no usage or credits resource. The plugin asks anyway, on every quota refresh
-(one `max_completion_tokens: 1` request, about ten tokens):
+**What each request costs: yes, once you set the price.** The plugin gives every model its LiveKit
+price for the agents that read it, but magpie's Usage page prices from its own catalog unless you
+set a price of your own — the `magpie model price` commands above make DeepSeek's real rate show.
+
+**What is left of the $2.50: no.** There is no API for the balance. `/v1/models` returns `{}`, and
+the LiveKit Cloud API has no usage or credits resource. The plugin asks anyway, on every quota
+refresh (one `max_completion_tokens: 1` request, about ten tokens):
 
 - **if** LiveKit ever starts sending `X-Livekit-Inference-Credits-Limit` / `-Used`,
   `magpie quota livekit` shows a real `used / limit` window with a percentage, with no
@@ -161,6 +204,7 @@ Then read `magpie log -f` (or the log file) for lines starting with `plugin: [li
 | `404 Error getting model definition` | The model id is no longer served. Check the models list above. |
 | `429` | Credits used up, or more than 5 requests at once. |
 | Empty reply from Kimi | Output budget under 8,000 — the plugin fixes this, so please report it if you still see it. |
+| Cost shows `0` for a LiveKit model | magpie's Usage page is pricing it from its catalog, or has no price at all. Set LiveKit's rate with `magpie model price` (see “What they cost”). |
 | `400 Unsupported parameter: 'max_tokens'` | A client sent the old field name on an `openai/*` model. The plugin converts it; report if it still happens. |
 
 ## Test it
@@ -169,8 +213,9 @@ Then read `magpie log -f` (or the log file) for lines starting with `plugin: [li
 bun test
 ```
 
-Covers token signing (shape, TTL, signature length), request rewriting, the model table,
-and the plugin hooks — including that the loader overrides a stale `Authorization` header.
+Covers token signing (shape, TTL, signature length), request rewriting, the model table
+(including a price on every model), and the plugin hooks — including that the loader overrides a
+stale `Authorization` header.
 
 ## License
 

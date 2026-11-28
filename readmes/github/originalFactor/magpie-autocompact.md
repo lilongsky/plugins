@@ -1,8 +1,8 @@
 # Magpie 自动上下文压缩
 
-## 介绍
+Magpie 的 Provider 插件。对话历史超过设定条数时，自动压缩上下文，让长对话继续进行。
 
-Magpie 自动上下文压缩是一个 Provider 插件。它可在对话历史达到设定阈值时整理上下文，帮助长对话继续进行。支持 OpenAI Responses、Chat Completions 和 Anthropic Messages 上游。
+支持 OpenAI Responses、Chat Completions 和 Anthropic Messages。
 
 ## 安装
 
@@ -14,9 +14,11 @@ magpie plugin add "$PWD"
 
 ## 使用
 
-1. 编辑配置示例，填入上游地址、API 密钥和模型。
-2. 将配置导入 Magpie。
-3. 运行 `magpie models` 查看可用模型，并在 Magpie 中选择 `供应商ID/模型别名`。
+1. 编辑 [`examples/options.jsonc`](examples/options.jsonc)，填入接口地址、API 密钥和模型 ID。
+2. 在 PowerShell 7 或更高版本中，运行下面的命令导入配置。
+3. 在 Magpie 中选择模型，例如 `responses-main/coder`。
+
+自用配置见 [`examples/selfuse.jsonc`](examples/selfuse.jsonc)。使用时，将命令中的配置路径换成该文件。
 
 ```powershell
 $options = Get-Content -Raw -Encoding utf8 examples/options.jsonc |
@@ -26,31 +28,35 @@ magpie plugin options magpie-autocompact $options
 magpie models
 ```
 
-此命令适用于 PowerShell 7 或更高版本。修改配置后，重新执行导入命令。
+修改配置后，重新运行导入命令。
 
 ## 配置
 
-从 [`examples/options.jsonc`](examples/options.jsonc) 开始配置。先修改启用的 `responses-main` 条目中的 `baseURL`、`key` 和模型 ID；其他示例条目默认关闭，可按需修改并启用。已有供应商配置时，将插件配置合并到同一个 `providers` 对象中。
+示例默认启用 `responses-main`，其他供应商按需启用。所有供应商都放在 `providers` 中。
 
 常用选项：
 
-- `protocol`：上游类型，支持 `responses`、`chat` 和 `anthropic`。
-- `models`：可配置模型列表和 Magpie 中显示的模型别名；省略时尝试从上游获取模型。
-- `maxMessages`：对话历史超过该条数时触发压缩；省略或设为 `0` 时不压缩。
-- `maxRequests`：控制何时更换会话标识；省略或设为 `0` 时不更换。
-- `enablePack`：控制是否启用最后一级的历史整理，默认开启。
+- `protocol`：接口类型，可选 `responses`、`chat`、`anthropic`。
+- `models`：模型列表和别名。省略时尝试从接口获取。
+- `maxMessages`：历史超过多少条时压缩。省略或设为 `0` 时不压缩。
+- `compactionTargetRatio`：压缩后希望保留的消息数占 `maxMessages` 的比例，大于 `0` 且不超过 `1`，默认 `0.5`。安全边界或必须保留的内容可能使实际结果高于目标。
+- `maxRetainedRatio`：可选，大于 `0` 且不超过 `1`。安全切分无法将保留项数降到 `maxMessages` 的此比例时，允许强制压缩、摘要或打包到最后一项，包括当前输入和未完成的工具调用。强制摘要与打包附加继续执行的提示。不透明上下文不能由摘要或打包处理；省略此项则不启用强制压缩。
+- `compactionNotice`：设为 `true` 时按实际使用的压缩方式及保留消息数显示提示；默认关闭。
+- `timeoutMs`：请求超时，默认 `120000` 毫秒（2 分钟）。
 
-配置文件是带注释的 JSONC，不能原样传给 Magpie；上面的命令会先解析配置再导入。不要在配置文件中保存真实密钥并提交到版本库。
+更多选项见[配置示例中的注释](examples/options.jsonc)。
+
+配置文件带有注释，请用上面的命令解析后导入。不要将真实密钥提交到版本库。
 
 ## 开发
 
-需要 Node.js 22.13 或更高版本。运行测试：
+需要 Node.js 22.13 或更高版本。
 
 ```sh
 npm test
 ```
 
-需要已安装 Magpie 才能运行集成测试：
+安装 Magpie 后，可运行集成测试：
 
 ```sh
 npm run test:integration

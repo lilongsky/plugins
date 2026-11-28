@@ -132,11 +132,20 @@ DeepSeek Harness 的父子会话可共用这条模型链路。开启 Agent Teams
 
 飞书可通过长连接向本机 DSH 派发任务，接收结果与审批。固定版本安装、独立 profile 配置和使用步骤见 [飞书接入指南](docs/dsh-feishu.md)。
 
+## 本机诊断
+
+在「设置 → 运行与数据」打开日志文件夹。macOS 默认位于 `~/Library/Logs/LoongPass/`，Windows 位于 `%LOCALAPPDATA%/LoongPass/Logs/`。每天一个 JSONL 操作文件，记录会话、页面、操作、后台任务起止和 Dart 异常栈。连续悬停、滚动和编辑按交互合并，输入内容、账号标识、剪贴板、请求正文及凭据均不写入。
+
+macOS 下次启动后从系统诊断报告提取本应用的故障线程、栈帧和模块 UUID。存在同一进程、同一启动时间范围的操作时，`crash-*.json` 中的 `lastOperation` 指向日志文件、会话及最后的序号。诊断文件只保留当天和前六个本地日，应用持续运行时跨日清理，退出期间到期的文件在下次启动时清理。
+
 ## 从源码构建
 
 使用`pubspec.yaml` 指定的 Flutter 和锁定依赖。macOS 还需 Xcode 与仓库指定的 Rust 工具链，Windows 还需 Visual Studio 2022 的 C++ 桌面开发工具、CMake、Python、NuGet CLI 与 PowerShell 7。
 
+macOS 构建使用稳定 SDK 的独立副本，包含 Flutter 官方的浮层和节点拆分修复。升级到包含这两项修复的稳定版后可移除回移补丁。[Flutter #193372](https://github.com/flutter/flutter/pull/193372) · [Flutter #195829](https://github.com/flutter/flutter/pull/195829)
+
 ```bash
+sdk_bin=$(python3 tool/macos_flutter.py) && export PATH="$sdk_bin:$PATH"
 flutter pub get --enforce-lockfile
 xcodebuild -resolvePackageDependencies -project macos/Runner.xcodeproj -scheme Runner -clonedSourcePackagesDirPath build/macos/SourcePackages
 python3 tool/check.py
